@@ -1,0 +1,10 @@
+[Server]
+Listen = ":9100"
+
+[Push]
+Endpoint = "http://localhost:8428/api/v1/import/prometheus"
+Interval = "10s"
+SpoolDir = "/tmp/topsrv-spool"
+
+[Postgres]
+DSN = "postgres://postgres:postgres@localhost:5432/appdb?sslmode=disable"

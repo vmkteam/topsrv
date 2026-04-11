@@ -1,0 +1,24 @@
+[Server]
+Listen = ":9100"
+
+[Push]
+Endpoint = ""        # e.g. "https://push.topsrv.io/v1/write" or VM direct
+Token    = ""        # Bearer token for auth
+Interval = "30s"
+SpoolDir = ""        # disk buffer for retries, e.g. "/var/lib/topsrv/spool"
+
+[Update]
+Enabled  = false         # set true to enable auto-update via control plane
+Interval = "15m"         # check interval
+Channel  = "stable"      # stable / beta
+
+# PostgreSQL (optional — auto-discovery detects the process, DSN needed for connection)
+# [Postgres]
+# DSN = "postgres://topsrv:pass@localhost:5432/postgres?sslmode=disable"
+
+# Nginx (optional — auto-discovery parses nginx.conf automatically)
+# [Nginx]
+# StubStatusURL = "http://127.0.0.1/stub_status"
+# LogFormat     = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time'
+# ExtraLabels   = ["server_name"]
+# AccessLogs    = ["/var/log/nginx/access.log"]

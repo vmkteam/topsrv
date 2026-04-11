@@ -1,0 +1,8 @@
+bin/
+dist/
+/topsrv
+cfg/local.toml
+cfg/local-pg.toml
+.idea/
+.DS_Store
+.playwright-cli/
