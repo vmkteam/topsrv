@@ -59,7 +59,7 @@ verify_checksum() {
     need_cmd sha256sum || need_cmd shasum
 
     local expected
-    expected=$(grep "${filename}" "$checksums" | awk '{print $1}')
+    expected=$(grep "  ${filename}$" "$checksums" | awk '{print $1}')
     if [ -z "$expected" ]; then
         err "Checksum not found for ${filename} in checksums.txt"
     fi
