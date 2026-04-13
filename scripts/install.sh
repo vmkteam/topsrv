@@ -150,7 +150,7 @@ StartLimitIntervalSec=120
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml
+ExecStart=${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml -verbose
 Restart=always
 RestartSec=5
 SuccessExitStatus=42
