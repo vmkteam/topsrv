@@ -145,6 +145,8 @@ if command -v systemctl >/dev/null 2>&1; then
 [Unit]
 Description=topsrv monitoring agent
 After=network.target
+StartLimitBurst=5
+StartLimitIntervalSec=120
 
 [Service]
 Type=simple
@@ -152,8 +154,6 @@ ExecStart=${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml
 Restart=always
 RestartSec=5
 SuccessExitStatus=42
-StartLimitBurst=5
-StartLimitIntervalSec=120
 
 [Install]
 WantedBy=multi-user.target
