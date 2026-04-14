@@ -18,6 +18,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -402,18 +403,51 @@ func (u *Updater) trimBackups() {
 		return
 	}
 
-	// Sort by name (version string), remove oldest.
+	// Sort by version (semantic), remove oldest.
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			names = append(names, e.Name())
 		}
 	}
-	sort.Strings(names)
+	sort.Slice(names, func(i, j int) bool {
+		return compareVersionedNames(names[i], names[j]) < 0
+	})
 
 	for _, name := range names[:len(names)-updateMaxBackups] {
 		os.Remove(filepath.Join(u.backupDir, name))
 	}
+}
+
+// compareVersionedNames compares backup filenames like "topsrv-0.0.9" and "topsrv-0.0.10"
+// using numeric segment comparison to ensure correct ordering.
+func compareVersionedNames(a, b string) int {
+	va := extractVersion(a)
+	vb := extractVersion(b)
+	if va == "" || vb == "" {
+		return strings.Compare(a, b)
+	}
+
+	partsA := strings.Split(va, ".")
+	partsB := strings.Split(vb, ".")
+
+	for i := 0; i < len(partsA) && i < len(partsB); i++ {
+		na, _ := strconv.Atoi(partsA[i])
+		nb, _ := strconv.Atoi(partsB[i])
+		if na != nb {
+			return na - nb
+		}
+	}
+	return len(partsA) - len(partsB)
+}
+
+// extractVersion extracts version string from backup filename like "topsrv-0.0.9" or "topsrv-v0.0.9".
+func extractVersion(name string) string {
+	_, after, ok := strings.Cut(name, "topsrv-")
+	if !ok {
+		return ""
+	}
+	return strings.TrimPrefix(after, "v")
 }
 
 // replace copies new binary to same filesystem, then atomic rename.

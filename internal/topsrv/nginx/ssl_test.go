@@ -208,6 +208,16 @@ func TestDiscoverSSLCertificates(t *testing.T) {
 			wantCerts: nil,
 		},
 		{
+			name: "nginx variable skipped",
+			conf: `http {
+    server {
+        ssl_certificate $acme_cert_example;
+        ssl_certificate_key $acme_cert_example_key;
+    }
+}`,
+			wantCerts: nil,
+		},
+		{
 			name: "quoted path",
 			conf: `http {
     server {

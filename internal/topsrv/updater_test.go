@@ -187,6 +187,58 @@ func TestStateLoadMissing(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestCompareVersionedNames(t *testing.T) {
+	tests := []struct {
+		a, b string
+		want int // -1, 0, 1
+	}{
+		{"topsrv-0.0.9", "topsrv-0.0.10", -1},
+		{"topsrv-0.0.10", "topsrv-0.0.9", 1},
+		{"topsrv-0.0.9", "topsrv-0.0.9", 0},
+		{"topsrv-1.0.0", "topsrv-0.9.99", 1},
+		{"topsrv-v0.0.9", "topsrv-v0.0.10", -1},
+	}
+	for _, tt := range tests {
+		got := compareVersionedNames(tt.a, tt.b)
+		switch {
+		case tt.want < 0:
+			assert.Negative(t, got, "%s vs %s", tt.a, tt.b)
+		case tt.want > 0:
+			assert.Positive(t, got, "%s vs %s", tt.a, tt.b)
+		default:
+			assert.Zero(t, got, "%s vs %s", tt.a, tt.b)
+		}
+	}
+}
+
+func TestTrimBackupsVersionOrder(t *testing.T) {
+	tmpDir := t.TempDir()
+	backupDir := filepath.Join(tmpDir, "backups")
+	require.NoError(t, os.MkdirAll(backupDir, 0o755))
+
+	// Create backups with versions that sort differently lexicographically vs semantically.
+	versions := []string{"0.0.8", "0.0.9", "0.0.10", "0.0.11", "0.0.12", "0.0.13"}
+	for _, v := range versions {
+		require.NoError(t, os.WriteFile(filepath.Join(backupDir, "topsrv-"+v), []byte(v), 0o755))
+	}
+
+	u := &Updater{backupDir: backupDir}
+	u.trimBackups()
+
+	entries, err := os.ReadDir(backupDir)
+	require.NoError(t, err)
+	assert.Len(t, entries, updateMaxBackups)
+
+	// The oldest (0.0.8) should be removed, newest (0.0.13) must remain.
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	assert.NotContains(t, names, "topsrv-0.0.8", "oldest version should be removed")
+	assert.Contains(t, names, "topsrv-0.0.13", "newest version must remain")
+	assert.Contains(t, names, "topsrv-0.0.12", "second newest must remain")
+}
+
 // createTestTarGz creates a tar.gz archive with a single file.
 func createTestTarGz(t *testing.T, tarPath, name string, content []byte) {
 	t.Helper()

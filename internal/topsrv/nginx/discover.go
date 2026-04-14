@@ -46,20 +46,10 @@ func DiscoverConfig(configPath string) (*DiscoverResult, error) {
 	}
 
 	dir := filepath.Dir(configPath)
-	if err := parseFile(configPath, dir, result); err != nil {
+	content, err := resolveIncludes(configPath, dir)
+	if err != nil {
 		return nil, err
 	}
-
-	return result, nil
-}
-
-func parseFile(path, baseDir string, result *DiscoverResult) error {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-
-	content := string(data)
 
 	extractLogFormats(content, result)
 	extractStubStatus(content, result)
@@ -76,8 +66,19 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 		result.AccessLogs = append(result.AccessLogs, AccessLogEntry{Path: logPath, FormatName: formatName})
 	}
 
-	// Follow includes. Relative paths are resolved against baseDir
-	// (the nginx prefix/conf directory), matching nginx behavior.
+	return result, nil
+}
+
+// resolveIncludes reads a config file and recursively inlines all include directives.
+func resolveIncludes(path, baseDir string) (string, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+
+	content := string(data)
+
+	// Replace each include directive with the contents of matched files.
 	for _, m := range includeRe.FindAllStringSubmatch(content, -1) {
 		pattern := m[1]
 		if !filepath.IsAbs(pattern) {
@@ -87,14 +88,20 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 		if err != nil {
 			continue
 		}
+		var included strings.Builder
 		for _, inc := range matches {
-			if err := parseFile(inc, baseDir, result); err != nil {
+			incContent, err := resolveIncludes(inc, baseDir)
+			if err != nil {
 				slog.Debug("nginx: failed to parse include", "path", inc, "error", err) //nolint:sloglint
+				continue
 			}
+			included.WriteString(incContent)
+			included.WriteByte('\n')
 		}
+		content = strings.Replace(content, m[0], included.String(), 1)
 	}
 
-	return nil
+	return content, nil
 }
 
 // directiveMatch holds the result of findDirective.
@@ -223,7 +230,7 @@ func extractSSLCertificates(content string, result *DiscoverResult) {
 		if path == "" {
 			path = m[2] // unquoted
 		}
-		if path == "" || seen[path] {
+		if path == "" || strings.HasPrefix(path, "$") || seen[path] {
 			continue
 		}
 		seen[path] = true

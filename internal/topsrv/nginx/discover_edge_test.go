@@ -148,11 +148,36 @@ func TestDiscoverAngieEdgeCases(t *testing.T) {
 		},
 	}
 
+	// Test: listen directive in included snippet should be resolved.
+	t.Run("listen in include snippet", func(t *testing.T) {
+		dir := t.TempDir()
+
+		snippetDir := filepath.Join(dir, "snippets")
+		require.NoError(t, os.MkdirAll(snippetDir, 0755))
+		require.NoError(t, os.WriteFile(filepath.Join(snippetDir, "listen-internal.conf"), []byte("listen 127.0.0.1:9113;\n"), 0644))
+
+		conf := `http {
+    server {
+        include ` + filepath.Join(snippetDir, "listen-internal.conf") + `;
+        location /status/ {
+            api /status/;
+        }
+    }
+}`
+		confPath := filepath.Join(dir, "angie.conf")
+		require.NoError(t, os.WriteFile(confPath, []byte(conf), 0644))
+
+		result, err := DiscoverConfig(confPath)
+		require.NoError(t, err)
+		assert.Equal(t, "/status/", result.APIStatusPath)
+		assert.Equal(t, 9113, result.APIStatusPort, "port should come from included snippet")
+	})
+
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
 			confPath := filepath.Join(dir, "angie.conf")
-			os.WriteFile(confPath, []byte(tc.conf), 0644)
+			require.NoError(t, os.WriteFile(confPath, []byte(tc.conf), 0644))
 
 			result, err := DiscoverConfig(confPath)
 			require.NoError(t, err)
