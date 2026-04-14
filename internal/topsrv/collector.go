@@ -9,6 +9,11 @@ type Collector interface {
 	Name() string
 }
 
+// QueryMetaProvider returns query metadata for push to gatesrv.
+type QueryMetaProvider interface {
+	QueryMeta() []QueryMeta
+}
+
 // Service is a discovered service on the host.
 type Service struct {
 	Type       string // "postgresql", "nginx", "angie", "redis", "php-fpm"

@@ -4,9 +4,11 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"sort"
@@ -38,11 +40,14 @@ type PushConfig struct {
 type Pusher struct {
 	embedlog.Logger
 
-	cfg      PushConfig
-	registry *prometheus.Registry
-	client   *http.Client
-	interval time.Duration
-	hostname string
+	cfg           PushConfig
+	registry      *prometheus.Registry
+	client        *http.Client
+	interval      time.Duration
+	hostname      string
+	metaProviders []QueryMetaProvider
+	metaEndpoint  string // derived: /v1/write → /v1/meta
+	pushCount     int
 }
 
 func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, registry *prometheus.Registry) *Pusher {
@@ -57,12 +62,13 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, 
 	}
 
 	return &Pusher{
-		Logger:   logger,
-		cfg:      cfg,
-		registry: registry,
-		client:   appkit.NewHTTPClient(appName, version, pushTimeout),
-		interval: interval,
-		hostname: hostname,
+		Logger:       logger,
+		cfg:          cfg,
+		registry:     registry,
+		client:       appkit.NewHTTPClient(appName, version, pushTimeout),
+		interval:     interval,
+		hostname:     hostname,
+		metaEndpoint: deriveMetaEndpoint(cfg.Endpoint),
 	}
 }
 
@@ -87,6 +93,11 @@ func (p *Pusher) Run(ctx context.Context) {
 	}
 }
 
+// AddMetaProvider registers a provider for query metadata push.
+func (p *Pusher) AddMetaProvider(mp QueryMetaProvider) {
+	p.metaProviders = append(p.metaProviders, mp)
+}
+
 func (p *Pusher) push(ctx context.Context) {
 	// Retry spooled data before new push.
 	p.retrySpool(ctx)
@@ -105,6 +116,12 @@ func (p *Pusher) push(ctx context.Context) {
 	} else {
 		totalMs := time.Since(start).Milliseconds()
 		p.Printf("push: ok, size=%d, gatherMs=%d, totalMs=%d", len(data), gatherMs, totalMs)
+	}
+
+	// Push query metadata every 10th cycle (~5 minutes at 30s interval).
+	p.pushCount++
+	if p.pushCount%10 == 0 && len(p.metaProviders) > 0 {
+		p.sendMeta(ctx)
 	}
 }
 
@@ -232,6 +249,67 @@ func (p *Pusher) retrySpool(ctx context.Context) {
 	}
 	if sent > 0 {
 		p.Printf("push: resent %d spooled payloads", sent)
+	}
+}
+
+// deriveMetaEndpoint replaces /v1/write with /v1/meta in the push endpoint URL.
+func deriveMetaEndpoint(pushEndpoint string) string {
+	u, err := url.Parse(pushEndpoint)
+	if err != nil {
+		return ""
+	}
+	u.Path = "/v1/meta"
+	return u.String()
+}
+
+type metaPayload struct {
+	Queries []QueryMeta `json:"queries"`
+}
+
+// sendMeta pushes query metadata from all providers to gatesrv.
+func (p *Pusher) sendMeta(ctx context.Context) {
+	if p.metaEndpoint == "" {
+		return
+	}
+
+	var all []QueryMeta
+	for _, mp := range p.metaProviders {
+		all = append(all, mp.QueryMeta()...)
+	}
+	if len(all) == 0 {
+		return
+	}
+
+	body, err := json.Marshal(metaPayload{Queries: all})
+	if err != nil {
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, pushTimeout)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, p.metaEndpoint, bytes.NewReader(body))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	if p.cfg.Token != "" {
+		req.Header.Set("Authorization", "Bearer "+p.cfg.Token)
+	}
+	if p.hostname != "" {
+		req.Header.Set("X-Hostname", p.hostname)
+	}
+
+	resp, err := p.client.Do(req)
+	if err != nil {
+		p.Errorf("meta: send failed: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	_, _ = io.Copy(io.Discard, resp.Body)
+
+	if resp.StatusCode >= 400 {
+		p.Errorf("meta: HTTP %d", resp.StatusCode)
 	}
 }
 

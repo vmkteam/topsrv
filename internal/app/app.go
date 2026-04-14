@@ -72,10 +72,14 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 // Run starts the HTTP server and push loop.
 func (a *App) Run(ctx context.Context) error {
 	services := topsrv.Discover(ctx, a.Logger)
-	a.registerCollectors(ctx, services)
 
 	if a.cfg.Push.Endpoint != "" {
 		a.pusher = topsrv.NewPusher(a.Logger, a.appName, a.version, a.cfg.Push, a.registry)
+	}
+
+	a.registerCollectors(ctx, services)
+
+	if a.pusher != nil {
 		go a.pusher.Run(ctx)
 
 		if a.cfg.Update.Enabled {
@@ -141,6 +145,9 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 		if pg, err := topsrv.NewPostgresCollector(a.Logger, a.cfg.Postgres.DSN); err == nil {
 			a.addCollector(pg)
 			a.closers = append(a.closers, pg)
+			if a.pusher != nil {
+				a.pusher.AddMetaProvider(pg)
+			}
 		} else {
 			a.Printf("postgres: failed to connect: %v", err)
 		}

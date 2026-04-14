@@ -109,6 +109,7 @@
 | `topsrv_pg_query_blk_write_time_seconds_total` | counter | queryid, query | Block write time |
 | `topsrv_pg_query_temp_blks_read_total` | counter | queryid, query | Temp blocks read |
 | `topsrv_pg_query_temp_blks_written_total` | counter | queryid, query | Temp blocks written |
+| `topsrv_pg_query_wal_bytes_total` | counter | queryid, query | WAL bytes generated |
 | `topsrv_pg_query_duration_seconds` | histogram | — | Per-query mean execution time distribution |
 | `topsrv_pg_table_size_bytes` | gauge | schema, table | Total table size |
 | `topsrv_pg_table_seq_scan_total` | counter | schema, table | Sequential scans |
@@ -135,3 +136,65 @@
 | `topsrv_nginx_4xx_requests_total` | counter | status, uri | 4xx errors with normalized URI |
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
 | `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI |
+
+## Angie (`topsrv_angie_*`)
+
+Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in Angie config.
+
+### Connections
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_up` | gauge | — | Angie API reachable (0/1) |
+| `topsrv_angie_connections_accepted_total` | counter | — | Total accepted connections |
+| `topsrv_angie_connections_dropped_total` | counter | — | Total dropped connections |
+| `topsrv_angie_connections_active` | gauge | — | Active connections |
+| `topsrv_angie_connections_idle` | gauge | — | Idle connections |
+
+### HTTP Server Zones
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_server_zone_requests_total` | counter | zone | Total requests |
+| `topsrv_angie_server_zone_requests_processing` | gauge | zone | Requests in processing |
+| `topsrv_angie_server_zone_requests_discarded_total` | counter | zone | Discarded requests |
+| `topsrv_angie_server_zone_responses_total` | counter | zone, code | Responses by HTTP status code |
+| `topsrv_angie_server_zone_received_bytes_total` | counter | zone | Bytes received |
+| `topsrv_angie_server_zone_sent_bytes_total` | counter | zone | Bytes sent |
+| `topsrv_angie_server_zone_ssl_handshakes_total` | counter | zone | Successful SSL handshakes |
+| `topsrv_angie_server_zone_ssl_failed_total` | counter | zone | Failed SSL handshakes |
+
+### HTTP Upstreams
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_upstream_peer_state` | gauge | upstream, peer | Peer state (1=up, 2=down, 3=unavailable, 4=recovering, 5=busy) |
+| `topsrv_angie_upstream_peer_requests_total` | counter | upstream, peer | Total requests to peer |
+| `topsrv_angie_upstream_peer_requests_current` | gauge | upstream, peer | Current requests to peer |
+| `topsrv_angie_upstream_peer_responses_total` | counter | upstream, peer, code | Responses by HTTP status code |
+| `topsrv_angie_upstream_peer_sent_bytes_total` | counter | upstream, peer | Bytes sent to peer |
+| `topsrv_angie_upstream_peer_received_bytes_total` | counter | upstream, peer | Bytes received from peer |
+| `topsrv_angie_upstream_peer_health_fails_total` | counter | upstream, peer | Health check failures |
+| `topsrv_angie_upstream_peer_health_downtime_seconds_total` | counter | upstream, peer | Total downtime |
+| `topsrv_angie_upstream_keepalive` | gauge | upstream | Keepalive connections |
+
+### HTTP Caches
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_cache_size_bytes` | gauge | zone | Current cache size |
+| `topsrv_angie_cache_responses_total` | counter | zone, status | Cache responses (hit/stale/updating/revalidated/miss/expired/bypass) |
+| `topsrv_angie_cache_bytes_total` | counter | zone, status | Cache bytes (hit/stale/updating/revalidated/miss/expired/bypass) |
+
+### Rate Limiting
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_limit_conns_total` | counter | zone, status | Connection limiting (passed/skipped/rejected/exhausted) |
+| `topsrv_angie_limit_reqs_total` | counter | zone, status | Request limiting (passed/skipped/delayed/rejected/exhausted) |
+
+### Shared Memory
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_slab_pages` | gauge | zone, state | Slab pages (used/free) |

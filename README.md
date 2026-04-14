@@ -56,6 +56,7 @@ That's it. System, disk, network, netstat, and process metrics are collected aut
 | **Process** | CPU, memory, disk IO, threads, FDs, worst_fd_ratio per process group | process-exporter |
 | **PostgreSQL** | Connections, transactions, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
+| **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
 
 ## Auto-discovery
 
@@ -64,7 +65,8 @@ On startup topsrv scans running processes and detects known services — no conf
 | Process | Type | Action |
 |---------|------|--------|
 | `postgres` / `postmaster` | postgresql | Logs hint to add DSN |
-| `nginx` / `angie` | nginx | Parses nginx.conf → finds log_format + access_log |
+| `nginx` | nginx | Parses nginx.conf → finds log_format + access_log |
+| `angie` | angie | Parses angie.conf → finds api /status/, log_format + access_log |
 | `redis-server` | redis | Detected |
 | `pgbouncer` | pgbouncer | Detected |
 | `php-fpm` | php-fpm | Detected |
@@ -123,6 +125,14 @@ Channel  = "stable"         # stable / beta
 # LogFormat     = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time'
 # ExtraLabels   = ["server_name"]
 # AccessLogs    = ["/var/log/nginx/access.log"]
+
+# Angie (optional — auto-discovery parses angie.conf automatically)
+# [Angie]
+# StatusURL     = "http://127.0.0.1:8080/status/"
+# StubStatusURL = "http://127.0.0.1/stub_status"
+# LogFormat     = '$remote_addr ...'
+# ExtraLabels   = ["server_name"]
+# AccessLogs    = ["/var/log/angie/access.log"]
 ```
 
 | Parameter | Default | Description |
@@ -140,6 +150,11 @@ Channel  = "stable"         # stable / beta
 | `Nginx.LogFormat` | — | nginx log_format string (gonx format) |
 | `Nginx.ExtraLabels` | `[]` | Log fields to add as metric labels |
 | `Nginx.AccessLogs` | `[]` | Paths to access log files |
+| `Angie.StatusURL` | — | Angie JSON API URL (e.g. `http://127.0.0.1:8080/status/`) |
+| `Angie.StubStatusURL` | — | Fallback stub_status URL |
+| `Angie.LogFormat` | — | angie log_format string (gonx format) |
+| `Angie.ExtraLabels` | `[]` | Log fields to add as metric labels |
+| `Angie.AccessLogs` | `[]` | Paths to access log files |
 
 ### Environment variables
 
@@ -163,7 +178,7 @@ Supports **PG15+** (PG17: `pg_stat_checkpointer`).
 - Database sizes
 - WAL (position, files count via `pg_ls_waldir()`)
 - Wraparound (xid_age vs freeze_max_age)
-- pg_stat_statements — top 20 queries + duration histogram (optional, skipped if extension absent)
+- pg_stat_statements — union of top 20 by time, calls, and blocks read (~40-60 unique queries), duration histogram, WAL bytes (optional, skipped if extension absent)
 - Tables — top 50 by size (seq/idx scans, tuple ops, dead tuples, autovacuum count)
 
 ### Setup
@@ -239,6 +254,50 @@ Two collectors:
 - `topsrv_nginx_response_bytes_total` — total response bytes
 - `topsrv_nginx_response_bytes_by_uri_total{uri}` — response bytes by normalized URI
 - **Custom labels** — `ExtraLabels` adds log fields as metric labels (server_name, http_platform, etc.)
+
+## Angie
+
+Angie (nginx fork) is supported with a dedicated JSON API collector providing detailed per-zone, per-upstream, SSL, cache, and rate limiting metrics — features not available in nginx free.
+
+Three collectors:
+
+**JSON API** (`/status/`) — connections, server zones, upstreams (per-peer state, health, requests), caches, rate limiting, shared memory slabs. Requires `api /status/;` directive in Angie config.
+
+**stub_status** — fallback when API is not configured (same 7 metrics as nginx).
+
+**access log** — same as nginx: request duration histogram, status codes, cache status, 4xx/5xx by URI, bytes by URI.
+
+Auto-discovery parses `angie.conf` and detects both `api /status/;` and `stub_status` directives. If Angie API is available, it takes priority over stub_status.
+
+### Angie config for monitoring
+
+```nginx
+http {
+    server {
+        listen 80;
+        server_name example.com;
+        status_zone http_main;        # enable per-zone metrics
+
+        location / {
+            proxy_pass http://backend;
+        }
+    }
+
+    upstream backend {
+        zone backend_zone 64k;        # required for upstream metrics
+        server 10.0.0.1:8080;
+    }
+
+    server {
+        listen 127.0.0.1:8080;
+        location /status/ {
+            api /status/;
+            allow 127.0.0.1;
+            deny all;
+        }
+    }
+}
+```
 
 ## Metrics reference
 

@@ -87,6 +87,20 @@ func TestIntegrationPostgres(t *testing.T) {
 	}
 
 	t.Logf("postgres integration: %d metric families", len(mfs))
+
+	// QueryMeta must return full query texts with database names.
+	meta := c.QueryMeta()
+	require.NotEmpty(t, meta, "QueryMeta returned no entries")
+
+	for _, m := range meta {
+		assert.NotEmpty(t, m.QueryID, "QueryMeta entry has empty queryid")
+		assert.NotEmpty(t, m.Database, "QueryMeta entry has empty database")
+		assert.NotEmpty(t, m.Query, "QueryMeta entry has empty query")
+		// Full text must be longer than the 100-char label truncation.
+		assert.True(t, len(m.Query) > 0, "QueryMeta query text is empty for queryid %s", m.QueryID)
+	}
+
+	t.Logf("QueryMeta: %d entries, first db=%s queryid=%s query_len=%d", len(meta), meta[0].Database, meta[0].QueryID, len(meta[0].Query))
 }
 
 func TestIntegrationNginxStub(t *testing.T) {
