@@ -50,6 +50,11 @@ func TestIntegrationPostgres(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(c)
 
+	// First gather seeds prevStmts for histogram delta computation.
+	_, err = reg.Gather()
+	require.NoError(t, err)
+
+	// Second gather produces histogram (needs prev values for deltas).
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	require.NotEmpty(t, mfs, "postgres collector returned no metrics")
@@ -67,6 +72,18 @@ func TestIntegrationPostgres(t *testing.T) {
 		"topsrv_pg_locks",
 	} {
 		assert.True(t, names[name], "missing metric: %s", name)
+	}
+
+	// pg_stat_statements metrics (PG17 uses shared_blk_read_time/shared_blk_write_time).
+	for _, name := range []string{
+		"topsrv_pg_query_time_seconds_total",
+		"topsrv_pg_query_calls_total",
+		"topsrv_pg_query_rows_total",
+		"topsrv_pg_query_blk_read_time_seconds_total",
+		"topsrv_pg_query_blk_write_time_seconds_total",
+		"topsrv_pg_query_duration_seconds",
+	} {
+		assert.True(t, names[name], "missing pg_stat_statements metric: %s", name)
 	}
 
 	t.Logf("postgres integration: %d metric families", len(mfs))

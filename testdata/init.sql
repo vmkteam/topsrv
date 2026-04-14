@@ -6,3 +6,4 @@ INSERT INTO test_table (data) SELECT md5(random()::text) FROM generate_series(1,
 -- Create monitoring role (same as production setup).
 CREATE ROLE topsrv LOGIN PASSWORD 'topsrv';
 GRANT pg_monitor TO topsrv;
+GRANT SELECT ON pg_stat_statements TO topsrv;

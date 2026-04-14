@@ -499,9 +499,15 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 		timeCol = c.statementsTimeCol
 	}
 
+	// PG17 (pg_stat_statements 1.11) renamed blk_read_time → shared_blk_read_time, blk_write_time → shared_blk_write_time
+	blkReadCol, blkWriteCol := "blk_read_time", "blk_write_time"
+	if c.versionNum >= pgVersionPG17 {
+		blkReadCol, blkWriteCol = "shared_blk_read_time", "shared_blk_write_time"
+	}
+
 	// Per-query metrics: top 20 by total time (limited to control cardinality).
-	// timeCol is set from code ("total_exec_time" or "total_time"), not from user input — safe to concatenate.
-	q := `SELECT queryid::text, left(query, 100), calls, ` + timeCol + `, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, blk_read_time, blk_write_time, temp_blks_read, temp_blks_written FROM pg_stat_statements WHERE userid != 0 ORDER BY ` + timeCol + ` DESC LIMIT 20`
+	// timeCol, blkReadCol, blkWriteCol are set from code, not from user input — safe to concatenate.
+	q := `SELECT queryid::text, left(query, 100), calls, ` + timeCol + `, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, ` + blkReadCol + `, ` + blkWriteCol + `, temp_blks_read, temp_blks_written FROM pg_stat_statements WHERE userid != 0 ORDER BY ` + timeCol + ` DESC LIMIT 20`
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
 		c.queryWarn("pg_stat_statements", err)

@@ -209,11 +209,16 @@ pg_stat_statements.track = top
 track_io_timing = on                               # recommended for block read/write time
 ```
 
-Restart PostgreSQL, then create the extension:
+Restart PostgreSQL, then create the extension **in the same database** that topsrv connects to (the one specified in `Postgres.DSN`):
 
 ```sql
+-- connect to the database from DSN (e.g. postgres)
+\c postgres
 CREATE EXTENSION IF NOT EXISTS pg_stat_statements;
+GRANT SELECT ON pg_stat_statements TO topsrv;
 ```
+
+> **Note:** `pg_stat_statements` view is only visible in the database where the extension is created. If your DSN points to `mydb`, run `CREATE EXTENSION` in `mydb`, not in `postgres`. The `topsrv` role also needs an explicit `SELECT` grant on the view — `pg_monitor` alone is not sufficient.
 
 If `pg_stat_statements` is not installed, topsrv silently skips query metrics — everything else works.
 
