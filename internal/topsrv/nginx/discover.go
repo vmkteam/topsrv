@@ -11,13 +11,14 @@ import (
 
 // DiscoverResult holds the result of parsing nginx configuration.
 type DiscoverResult struct {
-	LogFormats     map[string]string // name → format string
-	JSONFormats    map[string]bool   // name → true if format is JSON (escape=json)
-	AccessLogs     []AccessLogEntry
-	StubStatusPath string // e.g. "/stub_status", empty if not found
-	StubStatusPort int    // listen port of the server with stub_status
-	APIStatusPath  string // e.g. "/status/", empty if not found (Angie api directive)
-	APIStatusPort  int    // listen port of the server with api directive
+	LogFormats      map[string]string // name → format string
+	JSONFormats     map[string]bool   // name → true if format is JSON (escape=json)
+	AccessLogs      []AccessLogEntry
+	SSLCertificates []string // deduplicated ssl_certificate paths
+	StubStatusPath  string   // e.g. "/stub_status", empty if not found
+	StubStatusPort  int      // listen port of the server with stub_status
+	APIStatusPath   string   // e.g. "/status/", empty if not found (Angie api directive)
+	APIStatusPort   int      // listen port of the server with api directive
 }
 
 // AccessLogEntry represents a single access_log directive from nginx config.
@@ -34,6 +35,7 @@ var (
 	apiStatusRe    = regexp.MustCompile(`api\s+/\S+\s*;`)
 	locationRe     = regexp.MustCompile(`location\s+(?:=\s+)?(\S+)\s*\{`)
 	listenRe       = regexp.MustCompile(`listen\s+(?:\S+:)?(\d+)`)
+	sslCertRe      = regexp.MustCompile(`ssl_certificate\s+(?:"([^"]+)"|(\S+))\s*;`)
 )
 
 // DiscoverConfig parses nginx.conf and all includes, extracting log_format and access_log directives.
@@ -62,6 +64,7 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 	extractLogFormats(content, result)
 	extractStubStatus(content, result)
 	extractAPIStatus(content, result)
+	extractSSLCertificates(content, result)
 
 	// Extract access_log directives.
 	for _, m := range accessLogRe.FindAllStringSubmatch(content, -1) {
@@ -194,6 +197,37 @@ func extractLogFormats(content string, result *DiscoverResult) {
 				result.JSONFormats[name] = true
 			}
 		}
+	}
+}
+
+// extractSSLCertificates extracts ssl_certificate paths, deduplicating across server blocks.
+func extractSSLCertificates(content string, result *DiscoverResult) {
+	seen := make(map[string]bool, len(result.SSLCertificates))
+	for _, p := range result.SSLCertificates {
+		seen[p] = true
+	}
+
+	for _, line := range strings.Split(content, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
+		if strings.Contains(l, "ssl_certificate_key") {
+			continue
+		}
+		m := sslCertRe.FindStringSubmatch(l)
+		if m == nil {
+			continue
+		}
+		path := m[1] // quoted
+		if path == "" {
+			path = m[2] // unquoted
+		}
+		if path == "" || seen[path] {
+			continue
+		}
+		seen[path] = true
+		result.SSLCertificates = append(result.SSLCertificates, path)
 	}
 }
 

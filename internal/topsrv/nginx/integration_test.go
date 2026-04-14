@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -223,4 +224,92 @@ func TestIntegrationAngieJSONLogExtraLabels(t *testing.T) {
 	assert.True(t, foundHostLabel, "http_requests_total should have 'host' label from ExtraLabels")
 
 	t.Logf("angie JSON log extra labels: %d lines, %d tagged combos", lineCount, len(c.taggedCounts))
+}
+
+func TestIntegrationNginxSSLCertificate(t *testing.T) {
+	container := nginxContainerName()
+
+	// Read the generated cert from the container.
+	certData := readContainerFile(t, container, "/etc/nginx/ssl/test.pem")
+	require.NotEmpty(t, certData, "SSL cert not found — check that gen-test-cert.sh ran in container %s", container)
+
+	// Write cert to temp dir so SSLCollector can read it locally.
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "test.pem")
+	os.WriteFile(certPath, []byte(certData), 0644)
+
+	c := NewSSLCollector(embedlog.Logger{}, []string{certPath})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "topsrv_ssl_certificate_expiry_seconds" {
+			continue
+		}
+		found = true
+		require.NotEmpty(t, mf.GetMetric())
+		m := mf.GetMetric()[0]
+
+		assert.Greater(t, m.GetGauge().GetValue(), float64(time.Now().Unix()), "cert should not be expired")
+
+		labels := map[string]string{}
+		for _, l := range m.GetLabel() {
+			labels[l.GetName()] = l.GetValue()
+		}
+		assert.Equal(t, "test.example.com", labels["cn"])
+		assert.NotEmpty(t, labels["path"])
+		assert.NotEmpty(t, labels["issuer"])
+	}
+	assert.True(t, found, "topsrv_ssl_certificate_expiry_seconds not found")
+	t.Log("nginx SSL certificate integration: ok")
+}
+
+func TestIntegrationAngieSSLCertificate(t *testing.T) {
+	container := angieContainerName()
+
+	certData := readContainerFile(t, container, "/etc/angie/ssl/test.pem")
+	require.NotEmpty(t, certData, "SSL cert not found — check that gen-test-cert.sh ran in container %s", container)
+
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "test.pem")
+	os.WriteFile(certPath, []byte(certData), 0644)
+
+	c := NewSSLCollector(embedlog.Logger{}, []string{certPath})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	var found bool
+	for _, mf := range mfs {
+		if mf.GetName() != "topsrv_ssl_certificate_expiry_seconds" {
+			continue
+		}
+		found = true
+		m := mf.GetMetric()[0]
+		assert.Greater(t, m.GetGauge().GetValue(), float64(time.Now().Unix()), "cert should not be expired")
+	}
+	assert.True(t, found, "topsrv_ssl_certificate_expiry_seconds not found")
+	t.Log("angie SSL certificate integration: ok")
+}
+
+func TestIntegrationDiscoverNginxSSL(t *testing.T) {
+	container := nginxContainerName()
+	confData := readContainerFile(t, container, "/etc/nginx/nginx.conf")
+	require.NotEmpty(t, confData)
+
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "nginx.conf"), []byte(confData), 0644)
+
+	result, err := DiscoverConfig(filepath.Join(dir, "nginx.conf"))
+	require.NoError(t, err)
+
+	assert.NotEmpty(t, result.SSLCertificates, "should discover ssl_certificate paths from nginx.conf")
+	assert.Contains(t, result.SSLCertificates, "/etc/nginx/ssl/test.pem")
+	t.Logf("nginx SSL discover: %v", result.SSLCertificates)
 }

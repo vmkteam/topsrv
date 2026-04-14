@@ -286,6 +286,11 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 			a.Printf("nginx: auto-detected stub_status at %s", ngxCfg.StubStatusURL)
 		}
 
+		if len(discovered.SSLCertificates) > 0 {
+			a.addCollector(nginx.NewSSLCollector(a.Logger, discovered.SSLCertificates))
+			a.Printf("nginx: monitoring %d SSL certificates", len(discovered.SSLCertificates))
+		}
+
 		a.Printf("nginx: auto-discovered %d access logs with timing from %s", len(ngxCfg.AccessLogs), svc.ConfigPath)
 	} else {
 		ngxCfg.logCfg = nginx.LogConfig{
@@ -346,6 +351,11 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 		if discovered.StubStatusPath != "" && angieCfg.StubStatusURL == "" {
 			angieCfg.StubStatusURL = statusURL(discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Printf("angie: auto-detected stub_status at %s", angieCfg.StubStatusURL)
+		}
+
+		if len(discovered.SSLCertificates) > 0 {
+			a.addCollector(nginx.NewSSLCollector(a.Logger, discovered.SSLCertificates))
+			a.Printf("angie: monitoring %d SSL certificates", len(discovered.SSLCertificates))
 		}
 
 		a.Printf("angie: auto-discovered %d access logs with timing from %s", len(angieCfg.AccessLogs), svc.ConfigPath)

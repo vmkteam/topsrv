@@ -21,6 +21,7 @@ services:
       - "127.0.0.1:18080:80"
     volumes:
       - ./testdata/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./testdata/gen-test-cert.sh:/docker-entrypoint.d/10-gen-cert.sh:ro
       - nginx-json-logs:/var/log/nginx/json
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost/stub_status || exit 1"]
@@ -31,11 +32,13 @@ services:
 
   angie:
     image: docker.angie.software/angie:minimal
+    entrypoint: ["/bin/sh", "-c", "/gen-cert.sh /etc/angie/ssl && angie -g 'daemon off;'"]
     ports:
       - "127.0.0.1:18081:80"
       - "127.0.0.1:18082:8080"
     volumes:
       - ./testdata/angie.conf:/etc/angie/angie.conf:ro
+      - ./testdata/gen-test-cert.sh:/gen-cert.sh:ro
       - angie-json-logs:/var/log/angie/json
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/status/ >/dev/null || exit 1"]

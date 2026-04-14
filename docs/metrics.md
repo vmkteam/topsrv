@@ -137,6 +137,14 @@
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
 | `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI |
 
+## SSL Certificates (`topsrv_ssl_*`)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_ssl_certificate_expiry_seconds` | gauge | path, cn, issuer | Certificate NotAfter as Unix timestamp |
+
+Auto-discovered from `ssl_certificate` directives in nginx/angie config. Re-read every 5 minutes.
+
 ## Angie (`topsrv_angie_*`)
 
 Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in Angie config.

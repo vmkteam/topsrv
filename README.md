@@ -57,6 +57,7 @@ That's it. System, disk, network, netstat, and process metrics are collected aut
 | **PostgreSQL** | Connections, transactions, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
 | **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
+| **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
 
 ## Auto-discovery
 
@@ -254,6 +255,8 @@ Two collectors:
 - `topsrv_nginx_response_bytes_total` — total response bytes
 - `topsrv_nginx_response_bytes_by_uri_total{uri}` — response bytes by normalized URI
 - **Custom labels** — `ExtraLabels` adds log fields as metric labels (server_name, http_platform, etc.)
+
+**SSL certificates** — auto-discovered `ssl_certificate` paths from config, expiry as Unix timestamp gauge. Re-reads every 5 minutes to detect Let's Encrypt renewals.
 
 ## Angie
 
