@@ -313,6 +313,23 @@ func TestNormalizePath(t *testing.T) {
 		// shallow paths stay unchanged
 		{"/", "/"},
 		{"/view/123/", "/view/:id/"},
+
+		// XenForo-style: text.digits (threads, attachments, blogs, members)
+		{"/forum/threads/baldurs-gate.13472/", "/forum/threads/:slug/"},
+		{"/forum/attachments/dog_01-gif.346529/", "/forum/attachments/:slug/"},
+		{"/forum/attachments/color-png.260378/", "/forum/attachments/:slug/"},
+		{"/forum/blogs/soldatiki.1131/", "/forum/blogs/:slug/"},
+		{"/forum/members/augenblick.283242/", "/forum/members/:slug/"},
+		{"/forum/threads/baldurs-gate.13472/page-2", "/forum/threads/:slug/:rest"},
+
+		// base64 tokens (download links with = padding)
+		{"/get/Ff6tPA2V90mzyHp1QqNI3A==,1776358785/pc/zuma/files/file.rar", "/get/:token/pc/:rest"},
+		{"/get/HcMp5L-WV7ChJaTSCai08g==,1776358793/pc/game/files/game.rar", "/get/:token/pc/:rest"},
+		{"/get/sOrtv860L7CZHzUQMvV5Bw==,1776276144/pc/test/files/test.zip", "/get/:token/pc/:rest"},
+
+		// file numeric suffixes (media filenames like show_10778.jpeg)
+		{"/media/123/456_10778.jpeg", "/media/:id/:id_:id.jpeg"},
+		{"/media/123/456_4036.jpg", "/media/:id/:id_:id.jpg"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, normalizePath(tt.path), tt.path)

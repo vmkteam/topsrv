@@ -37,6 +37,12 @@ var (
 	slugWithID = regexp.MustCompile(`/[a-z][\w-]*-\d{4,}/`)
 	// longSlug matches long hyphenated slugs with 3+ hyphens (article/product URLs).
 	longSlug = regexp.MustCompile(`/[a-z][a-z0-9]*(?:-[a-z0-9]+){3,}`)
+	// xenForoSlug matches XenForo-style segments: text.digits (threads, attachments, blogs, members).
+	xenForoSlug = regexp.MustCompile(`/[\w][\w-]*\.\d+/`)
+	// base64Token matches base64-encoded tokens with padding (containing = or ==).
+	base64Token = regexp.MustCompile(`[A-Za-z0-9_+-]{6,}={1,2}[^/]*`)
+	// fileNumericSuffix matches _digits patterns in filenames (e.g. "_10778" in "show_10778.jpeg").
+	fileNumericSuffix = regexp.MustCompile(`_\d{3,}`)
 )
 
 // LogCollector parses nginx access logs and collects metrics.
@@ -456,10 +462,13 @@ func normalizeURI(request string) string {
 }
 
 func normalizePath(path string) string {
+	path = base64Token.ReplaceAllString(path, ":token")
+	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
 	path = numericSegment.ReplaceAllString(path, "/:id")
 	path = hexHash.ReplaceAllString(path, ":hash")
 	path = slugWithID.ReplaceAllString(path, "/:slug/")
 	path = longSlug.ReplaceAllString(path, "/:slug")
+	path = fileNumericSuffix.ReplaceAllString(path, "_:id")
 	return truncatePath(path, maxPathDepth)
 }
 
