@@ -146,6 +146,14 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 		a.Printf("discovered %s at %s", svc.Type, svc.Instance)
 	}
 
+	// Build info — always present, used as heartbeat.
+	buildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "topsrv_build_info",
+		Help: "Agent build information.",
+	}, []string{"version"})
+	buildInfo.WithLabelValues(a.version).Set(1)
+	a.registry.MustRegister(buildInfo)
+
 	// System collectors — always enabled.
 	a.addCollector(topsrv.NewSystemCollector(a.Logger))
 	a.addCollector(topsrv.NewDiskCollector(a.Logger))

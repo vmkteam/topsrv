@@ -1,5 +1,11 @@
 # Metrics reference
 
+## Agent
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_build_info` | gauge | version | Agent build info (always 1) |
+
 ## System (`topsrv_cpu_*`, `topsrv_memory_*`, `topsrv_load_*`, `topsrv_swap_*`)
 
 | Metric | Type | Labels | Description |
