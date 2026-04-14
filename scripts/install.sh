@@ -133,6 +133,9 @@ if [ ! -f "${CONFIG_DIR}/topsrv.toml" ]; then
 Endpoint = "${TOPSRV_ENDPOINT}"
 Token    = "${TOPSRV_TOKEN}"
 SpoolDir = "${SPOOL_DIR}"
+
+[Update]
+Enabled = true
 EOF
 else
     log "Config already exists: ${CONFIG_DIR}/topsrv.toml (not overwriting)"
