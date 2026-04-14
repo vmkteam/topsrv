@@ -44,7 +44,7 @@ type AngieConfig struct {
 	LogFormat     string   // nginx/angie log_format string, auto-detected if empty
 	ExtraLabels   []string // Log field names to add as metric labels
 
-	logFormats map[string]string // path → format (populated by discovery)
+	logCfg nginx.LogConfig // populated by discovery
 }
 
 type NginxConfig struct {
@@ -53,7 +53,7 @@ type NginxConfig struct {
 	LogFormat     string   // nginx log_format string, auto-detected if empty
 	ExtraLabels   []string // nginx variable names to add as metric labels
 
-	logFormats map[string]string // path → format (populated by discovery, not from config)
+	logCfg nginx.LogConfig // populated by discovery
 }
 
 // App is the main topsrv agent application.
@@ -84,6 +84,8 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 
 // Run starts the HTTP server and push loop.
 func (a *App) Run(ctx context.Context) error {
+	a.Printf("starting %s %s", a.appName, a.version)
+
 	services := topsrv.Discover(ctx, a.Logger)
 
 	if a.cfg.Push.Endpoint != "" {
@@ -146,16 +148,8 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 		a.Printf("discovered %s at %s", svc.Type, svc.Instance)
 	}
 
-	// Build info — always present, used as heartbeat.
-	buildInfo := prometheus.NewGaugeVec(prometheus.GaugeOpts{
-		Name: "topsrv_build_info",
-		Help: "Agent build information.",
-	}, []string{"version"})
-	buildInfo.WithLabelValues(a.version).Set(1)
-	a.registry.MustRegister(buildInfo)
-
 	// System collectors — always enabled.
-	a.addCollector(topsrv.NewSystemCollector(a.Logger))
+	a.addCollector(topsrv.NewSystemCollector(a.Logger, a.version))
 	a.addCollector(topsrv.NewDiskCollector(a.Logger))
 	a.addCollector(topsrv.NewNetworkCollector(a.Logger))
 	a.addCollector(topsrv.NewNetstatCollector(a.Logger))
@@ -175,39 +169,43 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 	}
 }
 
-// discoveredLogs holds access log discovery results shared by nginx and angie.
-type discoveredLogs struct {
-	accessLogs []string
-	logFormat  string
-	logFormats map[string]string // path → format
-}
-
-// discoverAccessLogs extracts access logs with $request_time from a DiscoverResult.
-func (a *App) discoverAccessLogs(label string, discovered *nginx.DiscoverResult) discoveredLogs {
+// discoverAccessLogs extracts access logs with $request_time from a DiscoverResult and returns a LogConfig.
+func (a *App) discoverAccessLogs(label string, discovered *nginx.DiscoverResult) nginx.LogConfig {
 	for name, format := range discovered.LogFormats {
-		hasTiming := strings.Contains(format, "$request_time")
-		a.Printf("%s: log_format %q (timing=%v)", label, name, hasTiming)
+		hasTiming := strings.Contains(format, "$request_time") || strings.Contains(format, "request_time")
+		isJSON := discovered.JSONFormats[name]
+		a.Printf("%s: log_format %q (timing=%v, json=%v)", label, name, hasTiming, isJSON)
 	}
 
-	var dl discoveredLogs
-	dl.logFormats = make(map[string]string)
+	cfg := nginx.LogConfig{
+		LogFormats: make(map[string]string),
+		JSONPaths:  make(map[string]bool),
+	}
 	seen := make(map[string]bool)
 	for _, entry := range discovered.AccessLogs {
 		if seen[entry.Path] {
 			continue
 		}
 		format, ok := discovered.LogFormats[entry.FormatName]
-		if !ok || !strings.Contains(format, "$request_time") {
+		if !ok {
+			continue
+		}
+		isJSON := discovered.JSONFormats[entry.FormatName]
+		hasTiming := strings.Contains(format, "$request_time") || (isJSON && strings.Contains(format, "request_time"))
+		if !hasTiming {
 			continue
 		}
 		seen[entry.Path] = true
-		dl.accessLogs = append(dl.accessLogs, entry.Path)
-		dl.logFormats[entry.Path] = format
-		if dl.logFormat == "" {
-			dl.logFormat = format
+		cfg.LogPaths = append(cfg.LogPaths, entry.Path)
+		cfg.LogFormats[entry.Path] = format
+		if isJSON {
+			cfg.JSONPaths[entry.Path] = true
+		}
+		if cfg.LogFormat == "" {
+			cfg.LogFormat = format
 		}
 	}
-	return dl
+	return cfg
 }
 
 // statusURL builds a localhost URL from a port and path, defaulting port to 80.
@@ -219,18 +217,13 @@ func statusURL(port int, path string) string {
 }
 
 // registerLogCollector creates and registers a log collector for the given config.
-func (a *App) registerLogCollector(ctx context.Context, accessLogs []string, logFormat string, logFormats map[string]string, extraLabels []string) {
-	if len(accessLogs) == 0 {
+func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
+	if len(cfg.LogPaths) == 0 {
 		return
 	}
-	logC := nginx.NewLogCollector(a.Logger, nginx.LogConfig{
-		LogPaths:    accessLogs,
-		LogFormat:   logFormat,
-		LogFormats:  logFormats,
-		ExtraLabels: extraLabels,
-	})
+	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
-	go logC.RunPaths(ctx, accessLogs)
+	go logC.RunPaths(ctx, cfg.LogPaths)
 }
 
 func (a *App) registerPostgres(services []topsrv.Service) {
@@ -259,8 +252,9 @@ func (a *App) registerPostgres(services []topsrv.Service) {
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 	ngxCfg := a.cfg.Nginx
 
-	// Auto-discover from nginx.conf if no explicit config.
-	if ngxCfg == nil { //nolint:nestif
+	// Auto-discover from nginx.conf if no explicit config or config has no AccessLogs.
+	needsDiscovery := ngxCfg == nil || len(ngxCfg.AccessLogs) == 0
+	if needsDiscovery { //nolint:nestif
 		svc := findService(services, "nginx")
 		if svc == nil {
 			return
@@ -276,11 +270,15 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 			return
 		}
 
-		dl := a.discoverAccessLogs("nginx", discovered)
+		logCfg := a.discoverAccessLogs("nginx", discovered)
+
+		// Preserve ExtraLabels from config when auto-discovering logs.
+		if ngxCfg != nil {
+			logCfg.ExtraLabels = ngxCfg.ExtraLabels
+		}
 		ngxCfg = &NginxConfig{
-			AccessLogs: dl.accessLogs,
-			LogFormat:  dl.logFormat,
-			logFormats: dl.logFormats,
+			AccessLogs: logCfg.LogPaths,
+			logCfg:     logCfg,
 		}
 
 		if discovered.StubStatusPath != "" {
@@ -289,20 +287,27 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 		}
 
 		a.Printf("nginx: auto-discovered %d access logs with timing from %s", len(ngxCfg.AccessLogs), svc.ConfigPath)
+	} else {
+		ngxCfg.logCfg = nginx.LogConfig{
+			LogPaths:    ngxCfg.AccessLogs,
+			LogFormat:   ngxCfg.LogFormat,
+			ExtraLabels: ngxCfg.ExtraLabels,
+		}
 	}
 
 	if ngxCfg.StubStatusURL != "" {
 		a.addCollector(nginx.NewStubCollector(a.Logger, ngxCfg.StubStatusURL))
 	}
 
-	a.registerLogCollector(ctx, ngxCfg.AccessLogs, ngxCfg.LogFormat, ngxCfg.logFormats, ngxCfg.ExtraLabels)
+	a.registerLogCollector(ctx, ngxCfg.logCfg)
 }
 
 func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 	angieCfg := a.cfg.Angie
 
-	// Auto-discover from angie.conf if no explicit config.
-	if angieCfg == nil { //nolint:nestif
+	// Auto-discover from angie.conf if no explicit config or config has no AccessLogs.
+	needsDiscovery := angieCfg == nil || len(angieCfg.AccessLogs) == 0
+	if needsDiscovery { //nolint:nestif
 		svc := findService(services, "angie")
 		if svc == nil {
 			return
@@ -318,23 +323,38 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 			return
 		}
 
-		dl := a.discoverAccessLogs("angie", discovered)
+		logCfg := a.discoverAccessLogs("angie", discovered)
+
+		// Preserve ExtraLabels and StatusURL from config when auto-discovering logs.
+		var cfgStatusURL, cfgStubStatusURL string
+		if angieCfg != nil {
+			logCfg.ExtraLabels = angieCfg.ExtraLabels
+			cfgStatusURL = angieCfg.StatusURL
+			cfgStubStatusURL = angieCfg.StubStatusURL
+		}
 		angieCfg = &AngieConfig{
-			AccessLogs: dl.accessLogs,
-			LogFormat:  dl.logFormat,
-			logFormats: dl.logFormats,
+			AccessLogs:    logCfg.LogPaths,
+			logCfg:        logCfg,
+			StatusURL:     cfgStatusURL,
+			StubStatusURL: cfgStubStatusURL,
 		}
 
-		if discovered.APIStatusPath != "" {
+		if discovered.APIStatusPath != "" && angieCfg.StatusURL == "" {
 			angieCfg.StatusURL = statusURL(discovered.APIStatusPort, discovered.APIStatusPath)
 			a.Printf("angie: auto-detected API at %s", angieCfg.StatusURL)
 		}
-		if discovered.StubStatusPath != "" {
+		if discovered.StubStatusPath != "" && angieCfg.StubStatusURL == "" {
 			angieCfg.StubStatusURL = statusURL(discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Printf("angie: auto-detected stub_status at %s", angieCfg.StubStatusURL)
 		}
 
 		a.Printf("angie: auto-discovered %d access logs with timing from %s", len(angieCfg.AccessLogs), svc.ConfigPath)
+	} else {
+		angieCfg.logCfg = nginx.LogConfig{
+			LogPaths:    angieCfg.AccessLogs,
+			LogFormat:   angieCfg.LogFormat,
+			ExtraLabels: angieCfg.ExtraLabels,
+		}
 	}
 
 	// Register API collector (preferred) or stub_status fallback.
@@ -344,7 +364,7 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 		a.addCollector(nginx.NewStubCollector(a.Logger, angieCfg.StubStatusURL))
 	}
 
-	a.registerLogCollector(ctx, angieCfg.AccessLogs, angieCfg.LogFormat, angieCfg.logFormats, angieCfg.ExtraLabels)
+	a.registerLogCollector(ctx, angieCfg.logCfg)
 }
 
 func findService(services []topsrv.Service, types ...string) *topsrv.Service {

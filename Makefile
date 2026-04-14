@@ -1,5 +1,6 @@
 APP_NAME = topsrv
 BUILD_DIR = bin
+export GOEXPERIMENT = jsonv2
 
 .PHONY: build run test test-integration fmt lint clean init demo demo-stop
 
@@ -17,7 +18,7 @@ test:
 
 test-integration:
 	docker compose -f docker-compose.test.yml up -d --wait
-	go test -tags=integration -count=1 -v ./internal/topsrv/
+	go test -tags=integration -count=1 -v ./internal/topsrv/...
 	docker compose -f docker-compose.test.yml down
 
 fmt:

@@ -21,6 +21,7 @@ services:
       - "127.0.0.1:18080:80"
     volumes:
       - ./testdata/nginx.conf:/etc/nginx/nginx.conf:ro
+      - nginx-json-logs:/var/log/nginx/json
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://localhost/stub_status || exit 1"]
       interval: 2s
@@ -35,6 +36,7 @@ services:
       - "127.0.0.1:18082:8080"
     volumes:
       - ./testdata/angie.conf:/etc/angie/angie.conf:ro
+      - angie-json-logs:/var/log/angie/json
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/status/ >/dev/null || exit 1"]
       interval: 2s
@@ -53,3 +55,7 @@ services:
       timeout: 2s
       retries: 10
       start_period: 5s
+
+volumes:
+  nginx-json-logs:
+  angie-json-logs:

@@ -10,7 +10,7 @@ import (
 )
 
 func TestSystemCollector(t *testing.T) {
-	c := NewSystemCollector(embedlog.Logger{})
+	c := NewSystemCollector(embedlog.Logger{}, "test")
 	assert.Equal(t, "system", c.Name())
 
 	n := collectAndLint(t, c)
@@ -19,7 +19,7 @@ func TestSystemCollector(t *testing.T) {
 
 func TestSystemCollectorKeyMetrics(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 
 	requireMetric(t, reg, "topsrv_cpu_seconds_total")
 	requireMetric(t, reg, "topsrv_cpu_cores")
@@ -34,7 +34,7 @@ func TestSystemCollectorKeyMetrics(t *testing.T) {
 
 func TestSystemCollectorCPULabels(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -71,7 +71,7 @@ func TestSystemCollectorCPULabels(t *testing.T) {
 
 func TestSystemCollectorMemoryTypes(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
@@ -98,7 +98,7 @@ func TestSystemCollectorMemoryTypes(t *testing.T) {
 
 func TestSystemCollectorSwapTypes(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)

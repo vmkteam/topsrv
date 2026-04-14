@@ -12,6 +12,7 @@ import (
 // DiscoverResult holds the result of parsing nginx configuration.
 type DiscoverResult struct {
 	LogFormats     map[string]string // name → format string
+	JSONFormats    map[string]bool   // name → true if format is JSON (escape=json)
 	AccessLogs     []AccessLogEntry
 	StubStatusPath string // e.g. "/stub_status", empty if not found
 	StubStatusPort int    // listen port of the server with stub_status
@@ -38,7 +39,8 @@ var (
 // DiscoverConfig parses nginx.conf and all includes, extracting log_format and access_log directives.
 func DiscoverConfig(configPath string) (*DiscoverResult, error) {
 	result := &DiscoverResult{
-		LogFormats: make(map[string]string),
+		LogFormats:  make(map[string]string),
+		JSONFormats: make(map[string]bool),
 	}
 
 	dir := filepath.Dir(configPath)
@@ -71,7 +73,8 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 		result.AccessLogs = append(result.AccessLogs, AccessLogEntry{Path: logPath, FormatName: formatName})
 	}
 
-	// Follow includes.
+	// Follow includes. Relative paths are resolved against baseDir
+	// (the nginx prefix/conf directory), matching nginx behavior.
 	for _, m := range includeRe.FindAllStringSubmatch(content, -1) {
 		pattern := m[1]
 		if !filepath.IsAbs(pattern) {
@@ -82,7 +85,7 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 			continue
 		}
 		for _, inc := range matches {
-			if err := parseFile(inc, filepath.Dir(inc), result); err != nil {
+			if err := parseFile(inc, baseDir, result); err != nil {
 				slog.Debug("nginx: failed to parse include", "path", inc, "error", err) //nolint:sloglint
 			}
 		}
@@ -185,7 +188,11 @@ func extractLogFormats(content string, result *DiscoverResult) {
 		}
 
 		if len(parts) > 0 {
-			result.LogFormats[name] = strings.Join(parts, "")
+			joined := strings.Join(parts, "")
+			result.LogFormats[name] = joined
+			if strings.HasPrefix(joined, "{") {
+				result.JSONFormats[name] = true
+			}
 		}
 	}
 }

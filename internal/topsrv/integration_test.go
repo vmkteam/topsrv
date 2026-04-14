@@ -190,7 +190,7 @@ func TestIntegrationPushToVM(t *testing.T) {
 
 	// Collect system metrics and push to VM.
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 
 	mfs, err := reg.Gather()
 	require.NoError(t, err)

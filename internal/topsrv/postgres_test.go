@@ -22,7 +22,7 @@ func TestPostgresCollectorDescribe(t *testing.T) {
 func TestPostgresCollectorNoConflicts(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	l := embedlog.Logger{}
-	reg.MustRegister(NewSystemCollector(l))
+	reg.MustRegister(NewSystemCollector(l, "test"))
 	reg.MustRegister(NewDiskCollector(l))
 	reg.MustRegister(NewNetworkCollector(l))
 	reg.MustRegister(NewNetstatCollector(l))

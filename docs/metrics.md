@@ -1,11 +1,5 @@
 # Metrics reference
 
-## Agent
-
-| Metric | Type | Labels | Description |
-|--------|------|--------|-------------|
-| `topsrv_build_info` | gauge | version | Agent build info (always 1) |
-
 ## System (`topsrv_cpu_*`, `topsrv_memory_*`, `topsrv_load_*`, `topsrv_swap_*`)
 
 | Metric | Type | Labels | Description |
@@ -18,7 +12,7 @@
 | `topsrv_swap_io_bytes_total` | counter | direction | Swap I/O (in/out) |
 | `topsrv_uptime_seconds` | gauge | — | System uptime |
 | `topsrv_boot_time_seconds` | gauge | — | Boot time as Unix timestamp |
-| `topsrv_host_info` | gauge | hostname, os, platform, platform_version, kernel_version, kernel_arch | Host metadata |
+| `topsrv_host_info` | gauge | hostname, os, platform, platform_version, kernel_version, kernel_arch, version | Host metadata + agent version |
 | `topsrv_context_switches_total` | counter | — | Context switches (Linux) |
 | `topsrv_procs` | gauge | state | Processes by state (running/blocked) |
 

@@ -11,14 +11,14 @@ import (
 
 func TestDiscoverAngieEdgeCases(t *testing.T) {
 	cases := []struct {
-		name       string
-		conf       string
-		wantAPI    string
-		wantAPIPort int
-		wantStub   string
+		name         string
+		conf         string
+		wantAPI      string
+		wantAPIPort  int
+		wantStub     string
 		wantStubPort int
-		wantLogs   int
-		wantFormats int
+		wantLogs     int
+		wantFormats  int
 	}{
 		{
 			name: "api on non-standard path",

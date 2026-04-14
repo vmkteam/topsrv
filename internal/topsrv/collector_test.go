@@ -46,7 +46,7 @@ func TestAllCollectorsInRegistry(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	l := embedlog.Logger{}
 	for _, c := range []Collector{
-		NewSystemCollector(l),
+		NewSystemCollector(l, "test"),
 		NewDiskCollector(l),
 		NewNetworkCollector(l),
 		NewNetstatCollector(l),

@@ -57,7 +57,7 @@ func TestProcessCollectorGroupLabel(t *testing.T) {
 
 func TestProcessCollectorNoConflicts(t *testing.T) {
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewSystemCollector(embedlog.Logger{}))
+	reg.MustRegister(NewSystemCollector(embedlog.Logger{}, "test"))
 	reg.MustRegister(NewDiskCollector(embedlog.Logger{}))
 	reg.MustRegister(NewNetworkCollector(embedlog.Logger{}))
 	reg.MustRegister(NewNetstatCollector(embedlog.Logger{}))

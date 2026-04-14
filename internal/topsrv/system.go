@@ -24,6 +24,7 @@ type SystemCollector struct {
 	uptime      *prometheus.Desc
 	bootTime    *prometheus.Desc
 	hostInfo    *prometheus.Desc
+	version     string
 	ctxSwitches *prometheus.Desc
 	procsState  *prometheus.Desc
 
@@ -33,7 +34,7 @@ type SystemCollector struct {
 	cachedHostInfo *host.InfoStat
 }
 
-func NewSystemCollector(logger embedlog.Logger) *SystemCollector {
+func NewSystemCollector(logger embedlog.Logger, version string) *SystemCollector {
 	cnt, _ := cpu.Counts(true)
 	cpuIDs := make([]string, cnt)
 	for i := range cpuIDs {
@@ -53,7 +54,8 @@ func NewSystemCollector(logger embedlog.Logger) *SystemCollector {
 		swapIO:      prometheus.NewDesc("topsrv_swap_io_bytes_total", "Swap I/O in bytes.", []string{"direction"}, nil),
 		uptime:      prometheus.NewDesc("topsrv_uptime_seconds", "System uptime in seconds.", nil, nil),
 		bootTime:    prometheus.NewDesc("topsrv_boot_time_seconds", "System boot time as Unix timestamp.", nil, nil),
-		hostInfo:    prometheus.NewDesc("topsrv_host_info", "Host information.", []string{"hostname", "os", "platform", "platform_version", "kernel_version", "kernel_arch"}, nil),
+		hostInfo:    prometheus.NewDesc("topsrv_host_info", "Host information.", []string{"hostname", "os", "platform", "platform_version", "kernel_version", "kernel_arch", "version"}, nil),
+		version:     version,
 		ctxSwitches: prometheus.NewDesc("topsrv_context_switches_total", "Total context switches.", nil, nil),
 		procsState:  prometheus.NewDesc("topsrv_procs", "Number of processes by state.", []string{"state"}, nil),
 
@@ -179,6 +181,6 @@ func (c *SystemCollector) collectHost(ch chan<- prometheus.Metric) {
 	if c.cachedHostInfo != nil {
 		ch <- prometheus.MustNewConstMetric(c.hostInfo, prometheus.GaugeValue, 1,
 			c.cachedHostInfo.Hostname, c.cachedHostInfo.OS, c.cachedHostInfo.Platform,
-			c.cachedHostInfo.PlatformVersion, c.cachedHostInfo.KernelVersion, c.cachedHostInfo.KernelArch)
+			c.cachedHostInfo.PlatformVersion, c.cachedHostInfo.KernelVersion, c.cachedHostInfo.KernelArch, c.version)
 	}
 }

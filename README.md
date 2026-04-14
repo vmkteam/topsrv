@@ -55,7 +55,7 @@ That's it. System, disk, network, netstat, and process metrics are collected aut
 | **Netstat** | TCP connections by state/direction/port, TCP retransmits, UDP/IP errors | node_exporter |
 | **Process** | CPU, memory, disk IO, threads, FDs, worst_fd_ratio per process group | process-exporter |
 | **PostgreSQL** | Connections, transactions, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
-| **Nginx** | stub_status, access log parsing (response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
+| **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
 | **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
 
 ## Auto-discovery
@@ -71,7 +71,7 @@ On startup topsrv scans running processes and detects known services — no conf
 | `pgbouncer` | pgbouncer | Detected |
 | `php-fpm` | php-fpm | Detected |
 
-For Nginx, auto-discovery parses `nginx.conf` including `include` directives, extracts `log_format` and `access_log` paths with `$request_time`.
+For Nginx, auto-discovery parses `nginx.conf` including `include` directives, extracts `log_format` and `access_log` paths with `$request_time`. Both text and JSON (`escape=json`) log formats are auto-detected.
 
 ## Configuration
 
@@ -244,7 +244,7 @@ Two collectors:
 
 **stub_status** — connections, requests, `nginx_up` (0/1).
 
-**access log** — tail + parsing via configurable `LogFormat` (gonx):
+**access log** — tail + parsing via configurable `LogFormat`. Supports both text (gonx) and JSON (`escape=json`) formats:
 - `topsrv_nginx_request_duration_seconds` — histogram (buckets: 5ms…10s)
 - `topsrv_nginx_upstream_duration_seconds` — upstream histogram
 - `topsrv_nginx_http_requests_total{status}` — by status code
@@ -304,6 +304,8 @@ http {
 Full list of all metrics: [docs/metrics.md](docs/metrics.md)
 
 ## Development
+
+Requires `GOEXPERIMENT=jsonv2` (set automatically by Makefile and goreleaser).
 
 ```bash
 make build              # Build binary

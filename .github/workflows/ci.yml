@@ -19,18 +19,26 @@ jobs:
 
       - name: Test
         run: go test -race ./...
+        env:
+          GOEXPERIMENT: jsonv2
 
       - name: Vet
         run: go vet ./...
+        env:
+          GOEXPERIMENT: jsonv2
 
       - name: Staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
           version: "latest"
           install-go: false
+        env:
+          GOEXPERIMENT: jsonv2
 
       - name: Build
         run: go build -o /dev/null ./cmd/topsrv
+        env:
+          GOEXPERIMENT: jsonv2
 
       - name: GoReleaser check
         uses: goreleaser/goreleaser-action@v6
@@ -65,3 +73,4 @@ jobs:
           args: release --clean
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GOEXPERIMENT: jsonv2

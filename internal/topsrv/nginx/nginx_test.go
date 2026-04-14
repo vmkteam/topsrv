@@ -138,6 +138,81 @@ func TestLogCollectorCustomFormat(t *testing.T) {
 	}
 }
 
+func TestLogCollectorJSONParseLine(t *testing.T) {
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:  []string{"/dev/null"},
+		JSONPaths: map[string]bool{"/dev/null": true},
+	})
+
+	lines := []string{
+		`{"time_local":"14/Apr/2026:18:18:52 +0300","remote_addr":"10.0.0.1","remote_user":"","host":"cdn.example.com","protocol":"HTTP/2.0","request_uri":"/files/abc123/archive.tar.gz","http_method":"GET","status": "200","body_bytes_sent":"10939722","request_time":"29.177","http_referrer":"https://example.com/","http_user_agent":"Mozilla/5.0","upstream_response_time":"","geoip_country_code":"US"}`,
+		`{"time_local":"14/Apr/2026:18:18:55 +0300","remote_addr":"10.0.0.2","remote_user":"","host":"cdn.example.com","protocol":"HTTP/2.0","request_uri":"/files/def456/document.pdf","http_method":"GET","status": "200","body_bytes_sent":"1043200","request_time":"0.217","http_referrer":"https://example.com/downloads","http_user_agent":"Mozilla/5.0","upstream_response_time":"","geoip_country_code":"DE"}`,
+		`{"time_local":"14/Apr/2026:18:19:02 +0300","remote_addr":"10.0.0.3","remote_user":"","host":"cdn.example.com","protocol":"HTTP/2.0","request_uri":"/files/ghi789/image.iso","http_method":"GET","status": "503","body_bytes_sent":"221239839","request_time":"301.437","http_referrer":"https://example.com/","http_user_agent":"Mozilla/5.0","upstream_response_time":"1.200","geoip_country_code":"FR"}`,
+		`{"time_local":"14/Apr/2026:18:19:10 +0300","remote_addr":"10.0.0.4","remote_user":"","host":"cdn.example.com","protocol":"HTTP/1.1","request_uri":"/missing","http_method":"GET","status":"404","body_bytes_sent":"162","request_time":"0.001","http_referrer":"","http_user_agent":"curl/7.68","upstream_response_time":"","geoip_country_code":""}`,
+	}
+	for _, l := range lines {
+		c.ParseJSONLine(l)
+	}
+
+	assert.EqualValues(t, 4, c.reqCount)
+	assert.EqualValues(t, 1, c.upCount, "only one line has non-empty upstream_response_time")
+	assert.EqualValues(t, 2, c.statusCounts["200"])
+	assert.EqualValues(t, 1, c.statusCounts["503"])
+	assert.EqualValues(t, 1, c.statusCounts["404"])
+	assert.Len(t, c.uri5xx, 1, "one 503 URI")
+	assert.Len(t, c.uri4xx, 1, "one 404 URI")
+	assert.Equal(t, int64(10939722+1043200+221239839+162), c.bytesTotal.Load())
+}
+
+func TestLogCollectorJSONExtraLabels(t *testing.T) {
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:    []string{"/dev/null"},
+		JSONPaths:   map[string]bool{"/dev/null": true},
+		ExtraLabels: []string{"host", "geoip_country_code"},
+	})
+
+	c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.010","request_uri":"/api","upstream_response_time":"","host":"example.com","geoip_country_code":"RU"}`)
+	c.ParseJSONLine(`{"status":"200","body_bytes_sent":"200","request_time":"0.020","request_uri":"/api","upstream_response_time":"","host":"other.com","geoip_country_code":"US"}`)
+
+	assert.Len(t, c.taggedCounts, 2, "two distinct host+country combos")
+	assert.Empty(t, c.statusCounts, "statusCounts should be empty when extraLabels used")
+}
+
+func TestLogCollectorJSONTail(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "access.json.log")
+	f, err := os.Create(logPath)
+	require.NoError(t, err)
+
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:  []string{logPath},
+		JSONPaths: map[string]bool{logPath: true},
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go c.RunPaths(ctx, []string{logPath})
+
+	time.Sleep(100 * time.Millisecond)
+	_, _ = f.WriteString(`{"status":"500","body_bytes_sent":"100","request_time":"1.500","request_uri":"/users/123","upstream_response_time":"1.200","http_method":"GET"}` + "\n")
+	_ = f.Sync()
+	time.Sleep(200 * time.Millisecond)
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	metrics := make(map[string]float64)
+	for _, mf := range mfs {
+		for _, m := range mf.GetMetric() {
+			metrics[mf.GetName()] += float64(m.GetHistogram().GetSampleCount()) + m.GetCounter().GetValue()
+		}
+	}
+	assert.Greater(t, metrics["topsrv_nginx_request_duration_seconds"], 0.0, "expected request duration histogram")
+	assert.Greater(t, metrics["topsrv_nginx_5xx_requests_total"], 0.0, "expected 5xx counter")
+}
+
 func TestLogCollectorTail(t *testing.T) {
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "access.log")
@@ -262,6 +337,43 @@ func TestTruncatePath(t *testing.T) {
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, truncatePath(tt.path, tt.maxDepth), tt.path)
 	}
+}
+
+func TestDiscoverJSONLogFormat(t *testing.T) {
+	dir := t.TempDir()
+
+	nginxConf := `
+http {
+    log_format json_combined escape=json
+        '{'
+        '"time_local":"$time_local",'
+        '"remote_addr":"$remote_addr",'
+        '"host":"$host",'
+        '"request_uri":"$request_uri",'
+        '"http_method":"$request_method",'
+        '"status":"$status",'
+        '"body_bytes_sent":"$body_bytes_sent",'
+        '"request_time":"$request_time",'
+        '"upstream_response_time":"$upstream_response_time"'
+        '}';
+
+    log_format main '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time';
+
+    access_log /var/log/nginx/json.log json_combined;
+    access_log /var/log/nginx/access.log main;
+}
+`
+	os.WriteFile(filepath.Join(dir, "nginx.conf"), []byte(nginxConf), 0644)
+
+	result, err := DiscoverConfig(filepath.Join(dir, "nginx.conf"))
+	require.NoError(t, err)
+
+	assert.Len(t, result.LogFormats, 2)
+	assert.True(t, result.JSONFormats["json_combined"], "json_combined should be detected as JSON")
+	assert.False(t, result.JSONFormats["main"], "main should not be JSON")
+
+	// Verify JSON format content starts with '{'.
+	assert.True(t, strings.HasPrefix(result.LogFormats["json_combined"], "{"))
 }
 
 func TestDiscoverAngieAPI(t *testing.T) {
