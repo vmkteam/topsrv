@@ -85,6 +85,7 @@ func (p *Pusher) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
+			p.Flush()
 			p.Printf("push: stopped")
 			return
 		case <-ticker.C:
@@ -96,6 +97,29 @@ func (p *Pusher) Run(ctx context.Context) {
 // AddMetaProvider registers a provider for query metadata push.
 func (p *Pusher) AddMetaProvider(mp QueryMetaProvider) {
 	p.metaProviders = append(p.metaProviders, mp)
+}
+
+// Flush performs a final gather and attempts to send metrics.
+// If the send fails, data is spooled to disk for retry on next startup.
+func (p *Pusher) Flush() {
+	ctx, cancel := context.WithTimeout(context.Background(), pushTimeout)
+	defer cancel()
+
+	// Drain any previously spooled data first.
+	p.retrySpool(ctx)
+
+	data, err := p.gather()
+	if err != nil {
+		p.Errorf("push: flush gather failed: %v", err)
+		return
+	}
+
+	if err := p.send(ctx, data); err != nil {
+		p.Printf("push: flush send failed, spooling: %v", err)
+		p.spool(data)
+	} else {
+		p.Printf("push: flush ok, size=%d", len(data))
+	}
 }
 
 func (p *Pusher) push(ctx context.Context) {

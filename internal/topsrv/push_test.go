@@ -95,9 +95,10 @@ func TestPusherSpool(t *testing.T) {
 	defer cancel()
 	p.Run(ctx)
 
-	// Spool should be drained after successful retries.
+	// Spool should have at most 1 file (the final flush snapshot).
+	// Previously spooled files from failed sends must be drained by retries.
 	files, _ := filepath.Glob(filepath.Join(dir, "*.gz"))
-	assert.Empty(t, files, "spool should be drained")
+	assert.LessOrEqual(t, len(files), 1, "spool should be drained except for final flush")
 }
 
 func TestPusherSpoolTrim(t *testing.T) {
