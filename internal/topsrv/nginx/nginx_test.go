@@ -330,6 +330,11 @@ func TestNormalizePath(t *testing.T) {
 		// file numeric suffixes (media filenames like show_10778.jpeg)
 		{"/media/123/456_10778.jpeg", "/media/:id/:id_:id.jpeg"},
 		{"/media/123/456_4036.jpg", "/media/:id/:id_:id.jpg"},
+
+		// hex hash before numeric: /preview/shows/<md5>.jpg must not be corrupted by numericSegment
+		{"/preview/shows/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/shows/:hash.jpg"},
+		{"/preview/shows/de51d412b8e4abcdef0123456789abcd.png", "/preview/shows/:hash.png"},
+		{"/preview/comments/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/comments/:hash.jpg"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, normalizePath(tt.path), tt.path)

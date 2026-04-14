@@ -464,8 +464,8 @@ func normalizeURI(request string) string {
 func normalizePath(path string) string {
 	path = base64Token.ReplaceAllString(path, ":token")
 	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
-	path = numericSegment.ReplaceAllString(path, "/:id")
 	path = hexHash.ReplaceAllString(path, ":hash")
+	path = numericSegment.ReplaceAllString(path, "/:id")
 	path = slugWithID.ReplaceAllString(path, "/:slug/")
 	path = longSlug.ReplaceAllString(path, "/:slug")
 	path = fileNumericSuffix.ReplaceAllString(path, "_:id")
