@@ -28,6 +28,20 @@ services:
       retries: 10
       start_period: 3s
 
+  angie:
+    image: docker.angie.software/angie:minimal
+    ports:
+      - "127.0.0.1:18081:80"
+      - "127.0.0.1:18082:8080"
+    volumes:
+      - ./testdata/angie.conf:/etc/angie/angie.conf:ro
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/status/ >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 10
+      start_period: 3s
+
   victoria-metrics:
     image: victoriametrics/victoria-metrics:latest
     command: ["-retentionPeriod=1d", "-httpListenAddr=:8428"]

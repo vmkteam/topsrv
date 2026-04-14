@@ -264,6 +264,65 @@ func TestTruncatePath(t *testing.T) {
 	}
 }
 
+func TestDiscoverAngieAPI(t *testing.T) {
+	dir := t.TempDir()
+
+	angieConf := `
+http {
+    server {
+        listen 8080;
+
+        location /status/ {
+            api /status/;
+            allow 127.0.0.1;
+            deny all;
+        }
+    }
+
+    server {
+        listen 80;
+        status_zone http_main;
+
+        location /stub_status {
+            stub_status;
+        }
+    }
+}
+`
+	os.WriteFile(filepath.Join(dir, "angie.conf"), []byte(angieConf), 0644)
+
+	result, err := DiscoverConfig(filepath.Join(dir, "angie.conf"))
+	require.NoError(t, err)
+
+	assert.Equal(t, "/status/", result.APIStatusPath)
+	assert.Equal(t, 8080, result.APIStatusPort)
+	assert.Equal(t, "/stub_status", result.StubStatusPath)
+	assert.Equal(t, 80, result.StubStatusPort)
+}
+
+func TestDiscoverConfigNoAPI(t *testing.T) {
+	dir := t.TempDir()
+
+	nginxConf := `
+http {
+    server {
+        listen 80;
+        location /stub_status {
+            stub_status;
+        }
+    }
+}
+`
+	os.WriteFile(filepath.Join(dir, "nginx.conf"), []byte(nginxConf), 0644)
+
+	result, err := DiscoverConfig(filepath.Join(dir, "nginx.conf"))
+	require.NoError(t, err)
+
+	assert.Empty(t, result.APIStatusPath)
+	assert.Equal(t, 0, result.APIStatusPort)
+	assert.Equal(t, "/stub_status", result.StubStatusPath)
+}
+
 func TestDiscoverConfig(t *testing.T) {
 	dir := t.TempDir()
 

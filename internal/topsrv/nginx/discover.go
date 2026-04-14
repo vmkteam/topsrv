@@ -15,6 +15,8 @@ type DiscoverResult struct {
 	AccessLogs     []AccessLogEntry
 	StubStatusPath string // e.g. "/stub_status", empty if not found
 	StubStatusPort int    // listen port of the server with stub_status
+	APIStatusPath  string // e.g. "/status/", empty if not found (Angie api directive)
+	APIStatusPort  int    // listen port of the server with api directive
 }
 
 // AccessLogEntry represents a single access_log directive from nginx config.
@@ -28,6 +30,7 @@ var (
 	accessLogRe    = regexp.MustCompile(`access_log\s+(\S+)\s+(\w+)`)
 	includeRe      = regexp.MustCompile(`include\s+(\S+)\s*;`)
 	stubStatusRe   = regexp.MustCompile(`stub_status\s*;`)
+	apiStatusRe    = regexp.MustCompile(`api\s+/\S+\s*;`)
 	locationRe     = regexp.MustCompile(`location\s+(?:=\s+)?(\S+)\s*\{`)
 	listenRe       = regexp.MustCompile(`listen\s+(?:\S+:)?(\d+)`)
 )
@@ -56,6 +59,7 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 
 	extractLogFormats(content, result)
 	extractStubStatus(content, result)
+	extractAPIStatus(content, result)
 
 	// Extract access_log directives.
 	for _, m := range accessLogRe.FindAllStringSubmatch(content, -1) {
@@ -87,13 +91,18 @@ func parseFile(path, baseDir string, result *DiscoverResult) error {
 	return nil
 }
 
-// extractStubStatus finds stub_status directive and its location path + listen port.
-func extractStubStatus(content string, result *DiscoverResult) {
-	if result.StubStatusPath != "" {
-		return // already found in another file
-	}
-	if !stubStatusRe.MatchString(content) {
-		return
+// directiveMatch holds the result of findDirective.
+type directiveMatch struct {
+	path string
+	port int
+}
+
+// findDirective scans content for a directive matching re, tracking the current
+// location and listen port. pathFn extracts the path from the matched line and
+// the current location context.
+func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentLocation string) string) *directiveMatch {
+	if !re.MatchString(content) {
+		return nil
 	}
 
 	lines := strings.Split(content, "\n")
@@ -102,6 +111,9 @@ func extractStubStatus(content string, result *DiscoverResult) {
 
 	for _, line := range lines {
 		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
 
 		if m := listenRe.FindStringSubmatch(l); m != nil {
 			if p, err := strconv.Atoi(m[1]); err == nil {
@@ -111,11 +123,41 @@ func extractStubStatus(content string, result *DiscoverResult) {
 		if m := locationRe.FindStringSubmatch(l); m != nil {
 			currentLocation = m[1]
 		}
-		if stubStatusRe.MatchString(l) {
-			result.StubStatusPath = currentLocation
-			result.StubStatusPort = currentPort
-			return
+		if re.MatchString(l) {
+			return &directiveMatch{
+				path: pathFn(l, currentLocation),
+				port: currentPort,
+			}
 		}
+	}
+	return nil
+}
+
+func extractStubStatus(content string, result *DiscoverResult) {
+	if result.StubStatusPath != "" {
+		return
+	}
+	if m := findDirective(content, stubStatusRe, func(_, loc string) string { return loc }); m != nil {
+		result.StubStatusPath = m.path
+		result.StubStatusPort = m.port
+	}
+}
+
+func extractAPIStatus(content string, result *DiscoverResult) {
+	if result.APIStatusPath != "" {
+		return
+	}
+	if m := findDirective(content, apiStatusRe, func(line, loc string) string {
+		parts := strings.Fields(line)
+		if len(parts) >= 2 {
+			if p := strings.TrimSuffix(parts[1], ";"); p != "" {
+				return p
+			}
+		}
+		return loc
+	}); m != nil {
+		result.APIStatusPath = m.path
+		result.APIStatusPort = m.port
 	}
 }
 
