@@ -325,7 +325,24 @@ func TestExtractSSLCertificatesDoesNotMatchKey(t *testing.T) {
 	}, "\n")
 
 	result := &DiscoverResult{}
-	extractSSLCertificates(content, result)
+	extractSSLCertificates(content, "/etc/nginx", result)
 
 	assert.Equal(t, []string{"/etc/ssl/cert.pem"}, result.SSLCertificates)
+}
+
+func TestDiscoverSSLRelativePath(t *testing.T) {
+	dir := t.TempDir()
+	conf := `http {
+    server {
+        ssl_certificate ssl/myshows.me.fullchain.cer;
+        ssl_certificate_key ssl/myshows.me.key;
+    }
+}`
+	os.WriteFile(filepath.Join(dir, "nginx.conf"), []byte(conf), 0644)
+
+	result, err := DiscoverConfig(filepath.Join(dir, "nginx.conf"))
+	require.NoError(t, err)
+
+	require.Len(t, result.SSLCertificates, 1)
+	assert.Equal(t, filepath.Join(dir, "ssl/myshows.me.fullchain.cer"), result.SSLCertificates[0])
 }

@@ -54,7 +54,7 @@ func DiscoverConfig(configPath string) (*DiscoverResult, error) {
 	extractLogFormats(content, result)
 	extractStubStatus(content, result)
 	extractAPIStatus(content, result)
-	extractSSLCertificates(content, result)
+	extractSSLCertificates(content, dir, result)
 
 	// Extract access_log directives.
 	for _, m := range accessLogRe.FindAllStringSubmatch(content, -1) {
@@ -208,7 +208,8 @@ func extractLogFormats(content string, result *DiscoverResult) {
 }
 
 // extractSSLCertificates extracts ssl_certificate paths, deduplicating across server blocks.
-func extractSSLCertificates(content string, result *DiscoverResult) {
+// Relative paths are resolved against baseDir (nginx prefix directory).
+func extractSSLCertificates(content, baseDir string, result *DiscoverResult) {
 	seen := make(map[string]bool, len(result.SSLCertificates))
 	for _, p := range result.SSLCertificates {
 		seen[p] = true
@@ -230,7 +231,13 @@ func extractSSLCertificates(content string, result *DiscoverResult) {
 		if path == "" {
 			path = m[2] // unquoted
 		}
-		if path == "" || strings.HasPrefix(path, "$") || seen[path] {
+		if path == "" || strings.HasPrefix(path, "$") {
+			continue
+		}
+		if !filepath.IsAbs(path) {
+			path = filepath.Join(baseDir, path)
+		}
+		if seen[path] {
 			continue
 		}
 		seen[path] = true
