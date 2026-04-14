@@ -13,7 +13,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
+	io_prometheus_client "github.com/prometheus/client_model/go"
 	"github.com/prometheus/common/expfmt"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -44,6 +46,11 @@ func vmURL() string {
 func TestIntegrationPostgres(t *testing.T) {
 	dsn := pgDSN()
 	logger := embedlog.Logger{}
+
+	// Seed pg_stat_statements: run the same query from different users and databases
+	// so that (userid, dbid, queryid) produces duplicate queryids that must be aggregated.
+	seedStatStatements(t)
+
 	c, err := NewPostgresCollector(logger, dsn)
 	require.NoError(t, err, "failed to create postgres collector with DSN: %s", dsn)
 
@@ -75,15 +82,36 @@ func TestIntegrationPostgres(t *testing.T) {
 	}
 
 	// pg_stat_statements metrics (PG17 uses shared_blk_read_time/shared_blk_write_time).
-	for _, name := range []string{
+	stmtMetrics := []string{
 		"topsrv_pg_query_time_seconds_total",
 		"topsrv_pg_query_calls_total",
 		"topsrv_pg_query_rows_total",
 		"topsrv_pg_query_blk_read_time_seconds_total",
 		"topsrv_pg_query_blk_write_time_seconds_total",
-		"topsrv_pg_query_duration_seconds",
-	} {
+	}
+	for _, name := range append(stmtMetrics, "topsrv_pg_query_duration_seconds") {
 		assert.True(t, names[name], "missing pg_stat_statements metric: %s", name)
+	}
+
+	// Verify that per-query metrics have the "database" label.
+	mfMap := map[string]*io_prometheus_client.MetricFamily{}
+	for _, mf := range mfs {
+		mfMap[mf.GetName()] = mf
+	}
+	for _, name := range stmtMetrics {
+		mf, ok := mfMap[name]
+		if !ok {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labelNames := map[string]bool{}
+			for _, lp := range m.GetLabel() {
+				labelNames[lp.GetName()] = true
+			}
+			assert.True(t, labelNames["database"], "%s metric missing 'database' label", name)
+			assert.True(t, labelNames["queryid"], "%s metric missing 'queryid' label", name)
+			assert.True(t, labelNames["query"], "%s metric missing 'query' label", name)
+		}
 	}
 
 	t.Logf("postgres integration: %d metric families", len(mfs))
@@ -96,11 +124,48 @@ func TestIntegrationPostgres(t *testing.T) {
 		assert.NotEmpty(t, m.QueryID, "QueryMeta entry has empty queryid")
 		assert.NotEmpty(t, m.Database, "QueryMeta entry has empty database")
 		assert.NotEmpty(t, m.Query, "QueryMeta entry has empty query")
-		// Full text must be longer than the 100-char label truncation.
-		assert.True(t, len(m.Query) > 0, "QueryMeta query text is empty for queryid %s", m.QueryID)
 	}
 
 	t.Logf("QueryMeta: %d entries, first db=%s queryid=%s query_len=%d", len(meta), meta[0].Database, meta[0].QueryID, len(meta[0].Query))
+}
+
+// seedStatStatements runs identical queries from different PG users and in different databases
+// to populate pg_stat_statements with rows sharing the same queryid but different (userid, dbid).
+// This exercises the GROUP BY (queryid, dbid) aggregation that prevents Prometheus duplicate errors.
+func seedStatStatements(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Identical query run by different users on testdb.
+	for _, dsn := range []string{
+		"postgres://postgres:test@127.0.0.1:15432/testdb?sslmode=disable",
+		"postgres://appuser:appuser@127.0.0.1:15432/testdb?sslmode=disable",
+	} {
+		pool, err := pgxpool.NewWithConfig(ctx, must(pgxpool.ParseConfig(dsn)))
+		require.NoError(t, err, "connect %s", dsn)
+		for range 5 {
+			_, _ = pool.Exec(ctx, "SELECT count(*) FROM test_table WHERE id > $1", 0)
+		}
+		pool.Close()
+	}
+
+	// Same query in a second database.
+	pool, err := pgxpool.NewWithConfig(ctx, must(pgxpool.ParseConfig("postgres://postgres:test@127.0.0.1:15432/testdb2?sslmode=disable")))
+	require.NoError(t, err)
+	for range 5 {
+		_, _ = pool.Exec(ctx, "SELECT count(*) FROM test_table WHERE id > $1", 0)
+	}
+	pool.Close()
+
+	t.Log("seeded pg_stat_statements with multi-user/multi-db entries")
+}
+
+func must[T any](v T, err error) T {
+	if err != nil {
+		panic(err)
+	}
+	return v
 }
 
 func TestIntegrationNginxStub(t *testing.T) {

@@ -44,7 +44,7 @@ services:
 
   victoria-metrics:
     image: victoriametrics/victoria-metrics:latest
-    command: ["-retentionPeriod=1d", "-httpListenAddr=:8428"]
+    command: ["-retentionPeriod=1d", "-httpListenAddr=:8428", "-search.latencyOffset=0s"]
     ports:
       - "127.0.0.1:18428:8428"
     healthcheck:
