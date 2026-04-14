@@ -42,6 +42,7 @@ type PostgresCollector struct {
 	pool              *pgxpool.Pool
 	versionNum        int    // server_version_num, cached
 	statementsTimeCol string // "total_exec_time" (PG13+) or "total_time" (PG12-)
+	hasWalBytes       bool   // pg_stat_statements has wal_bytes column
 
 	// query metadata for push to gatesrv (full query texts + database names)
 	queryMetaMu sync.RWMutex
@@ -135,12 +136,20 @@ func NewPostgresCollector(logger embedlog.Logger, dsn string) (*PostgresCollecto
 		logger.Printf("postgres: connected, version=%d", versionNum)
 	}
 
-	// pg_stat_statements: detect column name for total time
+	// pg_stat_statements: detect columns via pg_attribute (information_schema doesn't show extension views).
+	hasCol := func(col string) bool {
+		var ok int
+		err := pool.QueryRow(ctx,
+			"SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'pg_stat_statements' AND a.attname = $1", col).Scan(&ok)
+		return err == nil
+	}
+
 	statementsTimeCol := "total_exec_time" // PG13+ (pg_stat_statements 1.8+)
-	var colCheck int
-	if err := pool.QueryRow(ctx, "SELECT 1 FROM information_schema.columns WHERE table_name='pg_stat_statements' AND column_name='total_exec_time'").Scan(&colCheck); err != nil {
+	if !hasCol("total_exec_time") {
 		statementsTimeCol = "total_time" // PG12- (pg_stat_statements ≤1.7)
 	}
+
+	hasWalBytes := hasCol("wal_bytes")
 
 	histBuckets := make(map[float64]uint64, len(queryDurationBuckets))
 	for _, b := range queryDurationBuckets {
@@ -152,6 +161,7 @@ func NewPostgresCollector(logger embedlog.Logger, dsn string) (*PostgresCollecto
 		pool:              pool,
 		versionNum:        versionNum,
 		statementsTimeCol: statementsTimeCol,
+		hasWalBytes:       hasWalBytes,
 		prevStmts:         make(map[string]stmtPrev),
 		histBuckets:       histBuckets,
 
@@ -523,7 +533,10 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 	// Per-query metrics: union of top 20 by time, top 20 by calls, top 20 by blocks read.
 	// This ensures sorting by any dimension on the frontend shows the real top queries.
 	// timeCol, blkReadCol, blkWriteCol are set from code, not from user input — safe to concatenate.
-	cols := `queryid::text, left(query, 100), calls, ` + timeCol + `, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, ` + blkReadCol + `, ` + blkWriteCol + `, temp_blks_read, temp_blks_written, wal_bytes`
+	cols := `queryid::text, left(query, 100), calls, ` + timeCol + `, rows, shared_blks_hit, shared_blks_read, shared_blks_dirtied, ` + blkReadCol + `, ` + blkWriteCol + `, temp_blks_read, temp_blks_written`
+	if c.hasWalBytes {
+		cols += `, wal_bytes`
+	}
 	q := `WITH top_ids AS (` +
 		`(SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY ` + timeCol + ` DESC LIMIT 20) ` +
 		`UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY calls DESC LIMIT 20) ` +
@@ -540,7 +553,11 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 		var qid, query string
 		var calls, rowsN, blksHit, blksRead, blksDirtied, tempRead, tempWritten, walBytes int64
 		var totalTime, blkReadTime, blkWriteTime float64
-		if err := rows.Scan(&qid, &query, &calls, &totalTime, &rowsN, &blksHit, &blksRead, &blksDirtied, &blkReadTime, &blkWriteTime, &tempRead, &tempWritten, &walBytes); err != nil {
+		scanArgs := []any{&qid, &query, &calls, &totalTime, &rowsN, &blksHit, &blksRead, &blksDirtied, &blkReadTime, &blkWriteTime, &tempRead, &tempWritten}
+		if c.hasWalBytes {
+			scanArgs = append(scanArgs, &walBytes)
+		}
+		if err := rows.Scan(scanArgs...); err != nil {
 			continue
 		}
 		ch <- prometheus.MustNewConstMetric(c.queryTime, prometheus.CounterValue, totalTime*msToSec, qid, query)
@@ -553,7 +570,9 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 		ch <- prometheus.MustNewConstMetric(c.queryBlkWriteTime, prometheus.CounterValue, blkWriteTime*msToSec, qid, query)
 		ch <- prometheus.MustNewConstMetric(c.queryTempRead, prometheus.CounterValue, float64(tempRead), qid, query)
 		ch <- prometheus.MustNewConstMetric(c.queryTempWritten, prometheus.CounterValue, float64(tempWritten), qid, query)
-		ch <- prometheus.MustNewConstMetric(c.queryWalBytes, prometheus.CounterValue, float64(walBytes), qid, query)
+		if c.hasWalBytes {
+			ch <- prometheus.MustNewConstMetric(c.queryWalBytes, prometheus.CounterValue, float64(walBytes), qid, query)
+		}
 	}
 
 	// Collect full query texts for metadata push.
