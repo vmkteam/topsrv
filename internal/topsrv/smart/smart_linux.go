@@ -50,6 +50,10 @@ func discoverBlockDevices() []string {
 
 func (c *Collector) scan() {
 	devices := discoverBlockDevices()
+	if len(devices) == 0 {
+		c.Printf("smart: no block devices found")
+		return
+	}
 
 	var metrics []prometheus.Metric
 	scanned := 0
@@ -57,15 +61,14 @@ func (c *Collector) scan() {
 	for _, name := range devices {
 		m, err := c.collectFromDevice(name)
 		if err != nil {
+			c.Printf("smart: %s: %v", name, err)
 			continue
 		}
 		metrics = append(metrics, m...)
 		scanned++
 	}
 
-	if scanned > 0 {
-		c.Printf("smart: scanned %d devices, %d metrics", scanned, len(metrics))
-	}
+	c.Printf("smart: scanned %d/%d devices, %d metrics", scanned, len(devices), len(metrics))
 
 	c.mu.Lock()
 	c.cache = metrics
@@ -82,7 +85,11 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 	var metrics []prometheus.Metric
 
 	// Common metrics from generic attributes.
-	if ga, err := dev.ReadGenericAttributes(); err == nil {
+	ga, gaErr := dev.ReadGenericAttributes()
+	if gaErr != nil {
+		c.Printf("smart: %s: ReadGenericAttributes: %v", name, gaErr)
+	}
+	if gaErr == nil {
 		if ga.Temperature > 0 {
 			metrics = append(metrics, prometheus.MustNewConstMetric(c.temperature, prometheus.GaugeValue, float64(ga.Temperature), name))
 		}
@@ -103,9 +110,16 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 	// Type-specific metrics.
 	switch d := dev.(type) {
 	case *sm.SataDevice:
+		c.Printf("smart: %s: type=sata", name)
 		metrics = append(metrics, c.collectSata(name, d)...)
 	case *sm.NVMeDevice:
+		c.Printf("smart: %s: type=nvme", name)
 		metrics = append(metrics, c.collectNVMe(name, d)...)
+	case *sm.ScsiDevice:
+		c.Printf("smart: %s: type=scsi", name)
+		metrics = append(metrics, c.collectScsi(name, d)...)
+	default:
+		c.Printf("smart: %s: unsupported device type %T, skipping", name, dev)
 	}
 
 	return metrics, nil
@@ -184,6 +198,23 @@ func (c *Collector) collectNVMe(device string, dev *sm.NVMeDevice) []prometheus.
 		prometheus.MustNewConstMetric(c.nvmeWarnTempTime, prometheus.GaugeValue, float64(log.WarningTempTime), device),
 		prometheus.MustNewConstMetric(c.nvmeCritTempTime, prometheus.GaugeValue, float64(log.CritCompTime), device),
 	)
+
+	return metrics
+}
+
+func (c *Collector) collectScsi(device string, dev *sm.ScsiDevice) []prometheus.Metric {
+	var metrics []prometheus.Metric
+
+	var model, serial, firmware string
+	if inq, err := dev.Inquiry(); err == nil {
+		model = strings.TrimSpace(string(inq.VendorIdent[:]) + " " + string(inq.ProductIdent[:]))
+		firmware = strings.TrimSpace(string(inq.ProductRev[:]))
+	}
+	if sn, err := dev.SerialNumber(); err == nil {
+		serial = strings.TrimSpace(sn)
+	}
+	metrics = append(metrics, prometheus.MustNewConstMetric(c.deviceInfo, prometheus.GaugeValue, 1, device, "scsi", model, serial, firmware))
+	metrics = append(metrics, prometheus.MustNewConstMetric(c.healthy, prometheus.GaugeValue, 1, device))
 
 	return metrics
 }
