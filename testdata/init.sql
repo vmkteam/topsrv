@@ -8,6 +8,11 @@ CREATE ROLE topsrv LOGIN PASSWORD 'topsrv';
 GRANT pg_monitor TO topsrv;
 GRANT SELECT ON pg_stat_statements TO topsrv;
 
+-- Auto-discovery role: password = DerivePassword("test_token_for_ci") = SHA256("test_token_for_ci")[:32].
+CREATE ROLE topsrv_auto LOGIN PASSWORD 'ced34ab353b764ba0860c80113f75be7';
+GRANT pg_monitor TO topsrv_auto;
+GRANT SELECT ON pg_stat_statements TO topsrv_auto;
+
 -- Second user for testing userid aggregation (same queryid, same db, different user).
 CREATE ROLE appuser LOGIN PASSWORD 'appuser';
 GRANT SELECT ON test_table TO appuser;

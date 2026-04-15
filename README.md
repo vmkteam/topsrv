@@ -43,7 +43,7 @@ curl localhost:9100/metrics
 Listen = ":9100"
 ```
 
-That's it. System, disk, network, netstat, and process metrics are collected automatically. PostgreSQL and Nginx are auto-discovered if running.
+That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are collected automatically. PostgreSQL and Nginx are auto-discovered if running.
 
 ## Features
 
@@ -57,6 +57,7 @@ That's it. System, disk, network, netstat, and process metrics are collected aut
 | **PostgreSQL** | Connections (by state/addr/app), transactions, longest transaction age, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
 | **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
+| **S.M.A.R.T.** | Disk health (ATA attributes, NVMe health log, temperature, wear, errors) | smartctl_exporter |
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
 
 ## Auto-discovery
@@ -134,6 +135,11 @@ Channel  = "stable"         # stable / beta
 # LogFormat     = '$remote_addr ...'
 # ExtraLabels   = ["server_name"]
 # AccessLogs    = ["/var/log/angie/access.log"]
+
+# S.M.A.R.T. disk health (always enabled, requires CAP_SYS_RAWIO + CAP_SYS_ADMIN)
+# [Smart]
+# Disabled = true    # set to disable
+# Interval = "5m"
 ```
 
 | Parameter | Default | Description |
@@ -156,6 +162,8 @@ Channel  = "stable"         # stable / beta
 | `Angie.LogFormat` | — | angie log_format string (gonx format) |
 | `Angie.ExtraLabels` | `[]` | Log fields to add as metric labels |
 | `Angie.AccessLogs` | `[]` | Paths to access log files |
+| `Smart.Disabled` | `false` | Disable S.M.A.R.T. collector |
+| `Smart.Interval` | `5m` | S.M.A.R.T. polling interval |
 
 ### Environment variables
 

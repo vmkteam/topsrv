@@ -14,6 +14,7 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv"
 	"github.com/vmkteam/topsrv/internal/topsrv/angie"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
+	"github.com/vmkteam/topsrv/internal/topsrv/smart"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -28,6 +29,7 @@ type Config struct {
 	Postgres *PostgresConfig     `toml:"Postgres,omitempty"`
 	Nginx    *NginxConfig        `toml:"Nginx,omitempty"`
 	Angie    *AngieConfig        `toml:"Angie,omitempty"`
+	Smart    *smart.Config       `toml:"Smart,omitempty"`
 }
 
 type ServerConfig struct {
@@ -169,6 +171,9 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 	} else {
 		a.registerNginx(ctx, services)
 	}
+
+	// S.M.A.R.T. disk monitoring — always enabled, [Smart] overrides interval.
+	a.registerSmart(ctx)
 }
 
 // discoverAccessLogs extracts access logs with $request_time from a DiscoverResult and returns a LogConfig.
@@ -233,16 +238,22 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 }
 
 func (a *App) registerPostgres(services []topsrv.Service) {
-	if a.cfg.Postgres == nil {
-		if svc := findService(services, "postgresql"); svc != nil {
-			a.Printf("postgres: found at %s but no [Postgres] DSN in config — add DSN to enable monitoring", svc.Instance)
-		} else {
+	var dsn string
+
+	if a.cfg.Postgres != nil {
+		dsn = a.cfg.Postgres.DSN
+	} else {
+		// Auto-discovery: build DSN from discovered instance + Push token.
+		svc := findService(services, "postgresql")
+		if svc == nil {
 			a.Printf("postgres: not found")
+			return
 		}
-		return
+		dsn = topsrv.BuildDSN(svc.Instance, a.cfg.Push.Token)
+		a.Printf("postgres: found at %s, trying auto-connect", svc.Instance)
 	}
 
-	pg, err := topsrv.NewPostgresCollector(a.Logger, a.cfg.Postgres.DSN)
+	pg, err := topsrv.NewPostgresCollector(a.Logger, dsn)
 	if err != nil {
 		a.Printf("postgres: failed to connect: %v", err)
 		return
@@ -253,6 +264,19 @@ func (a *App) registerPostgres(services []topsrv.Service) {
 	if a.pusher != nil {
 		a.pusher.AddMetaProvider(pg)
 	}
+}
+
+func (a *App) registerSmart(ctx context.Context) {
+	if a.cfg.Smart != nil && a.cfg.Smart.Disabled {
+		return
+	}
+	var interval string
+	if a.cfg.Smart != nil {
+		interval = a.cfg.Smart.Interval
+	}
+	c := smart.NewCollector(a.Logger, interval)
+	a.addCollector(c)
+	go c.Run(ctx)
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

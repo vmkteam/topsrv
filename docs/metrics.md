@@ -139,6 +139,45 @@
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
 | `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI |
 
+## S.M.A.R.T. (`topsrv_smart_*`)
+
+Opt-in via `[Smart]` config section. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` or root. Devices auto-discovered from `/sys/block/`. Default polling interval: 5 minutes.
+
+### Common (all device types)
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_smart_device_info` | gauge | device, type, model, serial, firmware | Device metadata (value=1) |
+| `topsrv_smart_device_healthy` | gauge | device | Overall health: 1=healthy, 0=unhealthy |
+| `topsrv_smart_device_temperature_celsius` | gauge | device | Device temperature |
+| `topsrv_smart_device_power_on_hours` | gauge | device | Total power-on hours |
+| `topsrv_smart_device_power_cycles_total` | gauge | device | Total power cycle count |
+| `topsrv_smart_device_bytes_read_total` | gauge | device | Total bytes read |
+| `topsrv_smart_device_bytes_written_total` | gauge | device | Total bytes written |
+
+### ATA/SATA attributes
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_smart_attr_value` | gauge | device, id, name | Normalized value (0-253) |
+| `topsrv_smart_attr_raw_value` | gauge | device, id, name | Raw value |
+| `topsrv_smart_attr_worst` | gauge | device, id, name | Worst recorded value |
+
+Key attributes for alerting: 5 (Reallocated Sectors), 187 (Reported Uncorrectable Errors), 188 (Command Timeout), 197 (Current Pending Sector), 198 (Offline Uncorrectable).
+
+### NVMe
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_smart_nvme_critical_warning` | gauge | device | Critical warning bitmask |
+| `topsrv_smart_nvme_available_spare_percent` | gauge | device | Available spare capacity % |
+| `topsrv_smart_nvme_available_spare_threshold_percent` | gauge | device | Available spare threshold % |
+| `topsrv_smart_nvme_percentage_used` | gauge | device | Estimated % of life used (can exceed 100) |
+| `topsrv_smart_nvme_media_errors_total` | gauge | device | Media and data integrity errors |
+| `topsrv_smart_nvme_unsafe_shutdowns_total` | gauge | device | Unsafe shutdown count |
+| `topsrv_smart_nvme_warning_temp_time_minutes` | gauge | device | Minutes above warning temp |
+| `topsrv_smart_nvme_critical_temp_time_minutes` | gauge | device | Minutes above critical temp |
+
 ## SSL Certificates (`topsrv_ssl_*`)
 
 | Metric | Type | Labels | Description |

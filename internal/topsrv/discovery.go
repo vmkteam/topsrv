@@ -60,6 +60,11 @@ func Discover(ctx context.Context, logger embedlog.Logger) []Service {
 			svc.ConfigPath = findConfigPath(svcType, args)
 		}
 
+		// Override default port from postgresql.conf if available.
+		if svcType == "postgresql" && svc.ConfigPath != "" {
+			svc.Instance = updatePostgresInstance(svc.Instance, svc.ConfigPath)
+		}
+
 		services = append(services, svc)
 	}
 

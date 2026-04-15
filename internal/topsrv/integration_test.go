@@ -10,6 +10,8 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"os/exec"
+	"strings"
 	"testing"
 	"time"
 
@@ -203,6 +205,97 @@ func must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// TestIntegrationBuildDSN verifies that BuildDSN with a token produces a working DSN.
+// The test token "test_token_for_ci" derives password = SHA256("test_token_for_ci")[:32]
+// which matches the topsrv_auto role created in testdata/init.sql.
+func TestIntegrationBuildDSN(t *testing.T) {
+	const testToken = "test_token_for_ci"
+
+	dsn := BuildDSN("127.0.0.1:15432", testToken)
+	// BuildDSN uses "topsrv" as login, but our test role is "topsrv_auto".
+	// Replace to match the test role.
+	dsn = strings.Replace(dsn, "://topsrv:", "://topsrv_auto:", 1)
+
+	c, err := NewPostgresCollector(embedlog.Logger{}, dsn)
+	require.NoError(t, err, "BuildDSN should produce a valid DSN that connects; dsn=%s", dsn)
+	defer c.Close()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	require.NotEmpty(t, mfs, "auto-discovered collector should return metrics")
+
+	t.Logf("BuildDSN auto-connect: OK, %d metric families", len(mfs))
+}
+
+// TestIntegrationBuildDSNNoToken verifies that BuildDSN without a token (trust/peer auth) builds a valid DSN format.
+func TestIntegrationBuildDSNNoToken(t *testing.T) {
+	dsn := BuildDSN("127.0.0.1:15432", "")
+
+	// DSN should not contain a password.
+	assert.Contains(t, dsn, "://topsrv@", "DSN without token should have no password")
+	assert.NotContains(t, dsn, "://topsrv:", "DSN without token should not have colon after user")
+	assert.Contains(t, dsn, "sslmode=disable")
+
+	t.Logf("BuildDSN no-token: %s", dsn)
+}
+
+// TestIntegrationDerivePassword verifies the derived password matches the one stored in PostgreSQL.
+func TestIntegrationDerivePassword(t *testing.T) {
+	const testToken = "test_token_for_ci"
+	derived := DerivePassword(testToken)
+
+	// Connect as topsrv_auto using the derived password directly via pgx.
+	dsn := fmt.Sprintf("postgres://topsrv_auto:%s@127.0.0.1:15432/testdb?sslmode=disable", derived)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	pool, err := pgxpool.NewWithConfig(ctx, must(pgxpool.ParseConfig(dsn)))
+	require.NoError(t, err, "derived password should authenticate; derived=%s", derived)
+	defer pool.Close()
+
+	var result int
+	err = pool.QueryRow(ctx, "SELECT 1").Scan(&result)
+	require.NoError(t, err)
+	assert.Equal(t, 1, result)
+
+	t.Logf("DerivePassword auth: OK (password=%s)", derived)
+}
+
+// TestIntegrationParsePostgresPort reads postgresql.conf from the running container
+// and verifies parsePostgresPort extracts the correct port.
+func TestIntegrationParsePostgresPort(t *testing.T) {
+	container := "vmkteam-topsrv-postgres-1"
+	if v := os.Getenv("TEST_PG_CONTAINER"); v != "" {
+		container = v
+	}
+
+	// Read postgresql.conf from the container.
+	out, err := exec.Command("docker", "exec", container, "cat", "/var/lib/postgresql/data/postgresql.conf").Output()
+	if err != nil {
+		t.Skipf("cannot read postgresql.conf from container %s: %v", container, err)
+	}
+
+	dir := t.TempDir()
+	confPath := dir + "/postgresql.conf"
+	require.NoError(t, os.WriteFile(confPath, out, 0644))
+
+	port := parsePostgresPort(confPath)
+	// Default postgresql.conf has port commented out — parsePostgresPort returns 0.
+	// If port is explicitly set, it should be 5432.
+	if port != 0 {
+		assert.Equal(t, 5432, port, "postgresql.conf explicit port should be 5432")
+	}
+
+	// Verify updatePostgresInstance keeps default when port is 0.
+	instance := updatePostgresInstance("127.0.0.1:5432", confPath)
+	assert.Equal(t, "127.0.0.1:5432", instance, "instance should stay default when port is commented out")
+
+	t.Logf("parsePostgresPort from container: %d, instance: %s", port, instance)
 }
 
 func TestIntegrationNginxStub(t *testing.T) {
