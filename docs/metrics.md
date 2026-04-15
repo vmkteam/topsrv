@@ -39,6 +39,7 @@
 | `topsrv_network_packets_total` | counter | interface, direction | Packets (rx/tx) |
 | `topsrv_network_errors_total` | counter | interface, direction | Errors (rx/tx) |
 | `topsrv_network_drops_total` | counter | interface, direction | Drops (rx/tx) |
+| `topsrv_network_speed_bytes` | gauge | interface | Link speed in bytes/sec (from `/sys/class/net/*/speed`) |
 | `topsrv_network_info` | gauge | interface, mac, address, mtu, operstate | Interface metadata |
 
 ## Netstat (`topsrv_netstat_*`)

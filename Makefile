@@ -1,14 +1,15 @@
 APP_NAME = topsrv
 BUILD_DIR = bin
 export GOEXPERIMENT = jsonv2
+export CGO_ENABLED = 0
 
 .PHONY: build run test test-integration fmt lint clean init demo demo-stop
 
 build:
-	CGO_ENABLED=0 go build -o $(BUILD_DIR)/$(APP_NAME) ./cmd/$(APP_NAME)
+	go build -o $(BUILD_DIR)/$(APP_NAME) ./cmd/$(APP_NAME)
 
 build-linux:
-	GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64 ./cmd/$(APP_NAME)
+	GOOS=linux GOARCH=amd64 go build -o $(BUILD_DIR)/$(APP_NAME)-linux-amd64 ./cmd/$(APP_NAME)
 
 run:
 	go run ./cmd/$(APP_NAME) -config cfg/local.toml -verbose
