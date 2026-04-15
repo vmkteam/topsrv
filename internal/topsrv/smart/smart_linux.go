@@ -12,6 +12,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// criticalAttrIDs lists ATA SMART attribute IDs worth monitoring.
+// "Big 5" HDD/SSD degradation + SSD wear indicators.
+var criticalAttrIDs = map[uint8]bool{
+	5: true, 187: true, 188: true, 197: true, 198: true, // Big 5
+	171: true, 172: true, 173: true, 177: true, 202: true, 233: true, // SSD wear
+}
+
 // skipBlockPrefixes lists /sys/block/ device prefixes to ignore (virtual, RAID, etc.).
 var skipBlockPrefixes = [...]string{"loop", "dm-", "ram", "zram", "sr", "fd", "nbd", "md"}
 
@@ -68,10 +75,13 @@ func (c *Collector) scan() {
 		scanned++
 	}
 
-	c.Printf("smart: scanned %d/%d devices, %d metrics", scanned, len(devices), len(metrics))
+	if !c.scanned {
+		c.Printf("smart: scanned %d/%d devices, %d metrics", scanned, len(devices), len(metrics))
+	}
 
 	c.mu.Lock()
 	c.cache = metrics
+	c.scanned = true
 	c.mu.Unlock()
 }
 
@@ -86,7 +96,7 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 
 	// Common metrics from generic attributes.
 	ga, gaErr := dev.ReadGenericAttributes()
-	if gaErr != nil {
+	if gaErr != nil && !c.scanned {
 		c.Printf("smart: %s: ReadGenericAttributes: %v", name, gaErr)
 	}
 	if gaErr == nil {
@@ -96,12 +106,6 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 		if ga.PowerOnHours > 0 {
 			metrics = append(metrics, prometheus.MustNewConstMetric(c.powerOnHours, prometheus.GaugeValue, float64(ga.PowerOnHours), name))
 		}
-		if ga.PowerCycles > 0 {
-			metrics = append(metrics, prometheus.MustNewConstMetric(c.powerCycles, prometheus.GaugeValue, float64(ga.PowerCycles), name))
-		}
-		if ga.Read > 0 {
-			metrics = append(metrics, prometheus.MustNewConstMetric(c.bytesRead, prometheus.GaugeValue, float64(ga.Read), name))
-		}
 		if ga.Written > 0 {
 			metrics = append(metrics, prometheus.MustNewConstMetric(c.bytesWritten, prometheus.GaugeValue, float64(ga.Written), name))
 		}
@@ -110,13 +114,19 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 	// Type-specific metrics.
 	switch d := dev.(type) {
 	case *sm.SataDevice:
-		c.Printf("smart: %s: type=sata", name)
+		if !c.scanned {
+			c.Printf("smart: %s: type=sata", name)
+		}
 		metrics = append(metrics, c.collectSata(name, d)...)
 	case *sm.NVMeDevice:
-		c.Printf("smart: %s: type=nvme", name)
+		if !c.scanned {
+			c.Printf("smart: %s: type=nvme", name)
+		}
 		metrics = append(metrics, c.collectNVMe(name, d)...)
 	case *sm.ScsiDevice:
-		c.Printf("smart: %s: type=scsi", name)
+		if !c.scanned {
+			c.Printf("smart: %s: type=scsi", name)
+		}
 		metrics = append(metrics, c.collectScsi(name, d)...)
 	default:
 		c.Printf("smart: %s: unsupported device type %T, skipping", name, dev)
@@ -145,15 +155,16 @@ func (c *Collector) collectSata(device string, dev *sm.SataDevice) []prometheus.
 	}
 
 	for _, attr := range page.Attrs {
+		if !criticalAttrIDs[attr.Id] {
+			continue
+		}
 		idStr := strconv.Itoa(int(attr.Id))
 		attrName := attr.Name
 		if attrName == "" {
 			attrName = "attr_" + idStr
 		}
 		metrics = append(metrics,
-			prometheus.MustNewConstMetric(c.attrValue, prometheus.GaugeValue, float64(attr.Current), device, idStr, attrName),
 			prometheus.MustNewConstMetric(c.attrRawValue, prometheus.GaugeValue, float64(attr.ValueRaw), device, idStr, attrName),
-			prometheus.MustNewConstMetric(c.attrWorst, prometheus.GaugeValue, float64(attr.Worst), device, idStr, attrName),
 		)
 	}
 

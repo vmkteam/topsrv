@@ -141,7 +141,7 @@
 
 ## S.M.A.R.T. (`topsrv_smart_*`)
 
-Opt-in via `[Smart]` config section. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` or root. Devices auto-discovered from `/sys/block/`. Default polling interval: 5 minutes.
+Always enabled. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` or root. Devices auto-discovered from `/sys/block/`. Default polling interval: 5 minutes. Disable with `[Smart] Disabled = true`.
 
 ### Common (all device types)
 
@@ -151,19 +151,15 @@ Opt-in via `[Smart]` config section. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` 
 | `topsrv_smart_device_healthy` | gauge | device | Overall health: 1=healthy, 0=unhealthy |
 | `topsrv_smart_device_temperature_celsius` | gauge | device | Device temperature |
 | `topsrv_smart_device_power_on_hours` | gauge | device | Total power-on hours |
-| `topsrv_smart_device_power_cycles_total` | gauge | device | Total power cycle count |
-| `topsrv_smart_device_bytes_read_total` | gauge | device | Total bytes read |
 | `topsrv_smart_device_bytes_written_total` | gauge | device | Total bytes written |
 
-### ATA/SATA attributes
+### ATA/SATA critical attributes
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `topsrv_smart_attr_value` | gauge | device, id, name | Normalized value (0-253) |
-| `topsrv_smart_attr_raw_value` | gauge | device, id, name | Raw value |
-| `topsrv_smart_attr_worst` | gauge | device, id, name | Worst recorded value |
+| `topsrv_smart_attr_raw_value` | gauge | device, id, name | Critical attribute raw value |
 
-Key attributes for alerting: 5 (Reallocated Sectors), 187 (Reported Uncorrectable Errors), 188 (Command Timeout), 197 (Current Pending Sector), 198 (Offline Uncorrectable).
+Only critical attribute IDs are exported: 5 (Reallocated Sectors), 187 (Reported Uncorrectable), 188 (Command Timeout), 197 (Pending Sector), 198 (Offline Uncorrectable), 171 (Program Fail), 172 (Erase Fail), 173/177 (Wear Leveling), 202/233 (Lifetime Remain / Media Wearout).
 
 ### NVMe
 

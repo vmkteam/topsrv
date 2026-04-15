@@ -30,14 +30,10 @@ type Collector struct {
 	healthy      *prometheus.Desc
 	temperature  *prometheus.Desc
 	powerOnHours *prometheus.Desc
-	powerCycles  *prometheus.Desc
-	bytesRead    *prometheus.Desc
 	bytesWritten *prometheus.Desc
 
-	// ATA SMART attributes
-	attrValue    *prometheus.Desc
+	// ATA SMART attributes (critical only)
 	attrRawValue *prometheus.Desc
-	attrWorst    *prometheus.Desc
 
 	// NVMe
 	nvmeCritWarn        *prometheus.Desc
@@ -49,8 +45,9 @@ type Collector struct {
 	nvmeWarnTempTime    *prometheus.Desc
 	nvmeCritTempTime    *prometheus.Desc
 
-	mu    sync.Mutex
-	cache []prometheus.Metric
+	mu      sync.Mutex
+	cache   []prometheus.Metric
+	scanned bool //nolint:unused // used in smart_linux.go (build-tagged)
 }
 
 // NewCollector creates a new S.M.A.R.T. collector.
@@ -68,13 +65,9 @@ func NewCollector(logger embedlog.Logger, interval string) *Collector {
 		healthy:      prometheus.NewDesc("topsrv_smart_device_healthy", "S.M.A.R.T. overall health: 1=healthy, 0=unhealthy.", []string{"device"}, nil),
 		temperature:  prometheus.NewDesc("topsrv_smart_device_temperature_celsius", "Device temperature in Celsius.", []string{"device"}, nil),
 		powerOnHours: prometheus.NewDesc("topsrv_smart_device_power_on_hours", "Total power-on hours.", []string{"device"}, nil),
-		powerCycles:  prometheus.NewDesc("topsrv_smart_device_power_cycles_total", "Total power cycle count.", []string{"device"}, nil),
-		bytesRead:    prometheus.NewDesc("topsrv_smart_device_bytes_read_total", "Total bytes read from device.", []string{"device"}, nil),
 		bytesWritten: prometheus.NewDesc("topsrv_smart_device_bytes_written_total", "Total bytes written to device.", []string{"device"}, nil),
 
-		attrValue:    prometheus.NewDesc("topsrv_smart_attr_value", "ATA S.M.A.R.T. attribute normalized value (0-253).", []string{"device", "id", "name"}, nil),
-		attrRawValue: prometheus.NewDesc("topsrv_smart_attr_raw_value", "ATA S.M.A.R.T. attribute raw value.", []string{"device", "id", "name"}, nil),
-		attrWorst:    prometheus.NewDesc("topsrv_smart_attr_worst", "ATA S.M.A.R.T. attribute worst recorded value.", []string{"device", "id", "name"}, nil),
+		attrRawValue: prometheus.NewDesc("topsrv_smart_attr_raw_value", "ATA S.M.A.R.T. critical attribute raw value.", []string{"device", "id", "name"}, nil),
 
 		nvmeCritWarn:        prometheus.NewDesc("topsrv_smart_nvme_critical_warning", "NVMe critical warning bitmask.", []string{"device"}, nil),
 		nvmeAvailSpare:      prometheus.NewDesc("topsrv_smart_nvme_available_spare_percent", "NVMe available spare capacity percentage.", []string{"device"}, nil),
@@ -94,12 +87,8 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.healthy
 	ch <- c.temperature
 	ch <- c.powerOnHours
-	ch <- c.powerCycles
-	ch <- c.bytesRead
 	ch <- c.bytesWritten
-	ch <- c.attrValue
 	ch <- c.attrRawValue
-	ch <- c.attrWorst
 	ch <- c.nvmeCritWarn
 	ch <- c.nvmeAvailSpare
 	ch <- c.nvmeSpareThresh
