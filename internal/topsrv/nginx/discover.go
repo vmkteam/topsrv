@@ -17,8 +17,10 @@ type DiscoverResult struct {
 	SSLCertificates []string // deduplicated ssl_certificate paths
 	StubStatusPath  string   // e.g. "/stub_status", empty if not found
 	StubStatusPort  int      // listen port of the server with stub_status
+	StubStatusHost  string   // listen host of the server with stub_status (empty = 127.0.0.1)
 	APIStatusPath   string   // e.g. "/status/", empty if not found (Angie api directive)
 	APIStatusPort   int      // listen port of the server with api directive
+	APIStatusHost   string   // listen host of the server with api directive (empty = 127.0.0.1)
 }
 
 // AccessLogEntry represents a single access_log directive from nginx config.
@@ -34,7 +36,7 @@ var (
 	stubStatusRe   = regexp.MustCompile(`stub_status\s*;`)
 	apiStatusRe    = regexp.MustCompile(`api\s+/\S+\s*;`)
 	locationRe     = regexp.MustCompile(`location\s+(?:=\s+)?(\S+)\s*\{`)
-	listenRe       = regexp.MustCompile(`listen\s+(?:\S+:)?(\d+)`)
+	listenRe       = regexp.MustCompile(`listen\s+(?:(\S+):)?(\d+)`)
 	sslCertRe      = regexp.MustCompile(`ssl_certificate\s+(?:"([^"]+)"|(\S+))\s*;`)
 )
 
@@ -108,6 +110,7 @@ func resolveIncludes(path, baseDir string) (string, error) {
 type directiveMatch struct {
 	path string
 	port int
+	host string // IP from listen directive (e.g. "10.10.1.1"), empty when listen has port only
 }
 
 // findDirective scans content for a directive matching re, tracking the current
@@ -121,6 +124,7 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 	lines := strings.Split(content, "\n")
 	var currentLocation string
 	var currentPort int
+	var currentHost string
 
 	for _, line := range lines {
 		l := strings.TrimSpace(line)
@@ -129,8 +133,9 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 		}
 
 		if m := listenRe.FindStringSubmatch(l); m != nil {
-			if p, err := strconv.Atoi(m[1]); err == nil {
+			if p, err := strconv.Atoi(m[2]); err == nil {
 				currentPort = p
+				currentHost = m[1] // IP or empty when listen has port only
 			}
 		}
 		if m := locationRe.FindStringSubmatch(l); m != nil {
@@ -140,6 +145,7 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 			return &directiveMatch{
 				path: pathFn(l, currentLocation),
 				port: currentPort,
+				host: currentHost,
 			}
 		}
 	}
@@ -153,6 +159,7 @@ func extractStubStatus(content string, result *DiscoverResult) {
 	if m := findDirective(content, stubStatusRe, func(_, loc string) string { return loc }); m != nil {
 		result.StubStatusPath = m.path
 		result.StubStatusPort = m.port
+		result.StubStatusHost = m.host
 	}
 }
 
@@ -171,6 +178,7 @@ func extractAPIStatus(content string, result *DiscoverResult) {
 	}); m != nil {
 		result.APIStatusPath = m.path
 		result.APIStatusPort = m.port
+		result.APIStatusHost = m.host
 	}
 }
 

@@ -5,7 +5,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -208,12 +210,16 @@ func (a *App) discoverAccessLogs(label string, discovered *nginx.DiscoverResult)
 	return cfg
 }
 
-// statusURL builds a localhost URL from a port and path, defaulting port to 80.
-func statusURL(port int, path string) string {
+// statusURL builds a URL from host, port and path.
+// Host defaults to 127.0.0.1, port defaults to 80.
+func statusURL(host string, port int, path string) string {
+	if host == "" {
+		host = "127.0.0.1"
+	}
 	if port == 0 {
 		port = 80
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d%s", port, path)
+	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(port)), path)
 }
 
 // registerLogCollector creates and registers a log collector for the given config.
@@ -282,7 +288,7 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 		}
 
 		if discovered.StubStatusPath != "" {
-			ngxCfg.StubStatusURL = statusURL(discovered.StubStatusPort, discovered.StubStatusPath)
+			ngxCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Printf("nginx: auto-detected stub_status at %s", ngxCfg.StubStatusURL)
 		}
 
@@ -345,11 +351,11 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 		}
 
 		if discovered.APIStatusPath != "" && angieCfg.StatusURL == "" {
-			angieCfg.StatusURL = statusURL(discovered.APIStatusPort, discovered.APIStatusPath)
+			angieCfg.StatusURL = statusURL(discovered.APIStatusHost, discovered.APIStatusPort, discovered.APIStatusPath)
 			a.Printf("angie: auto-detected API at %s", angieCfg.StatusURL)
 		}
 		if discovered.StubStatusPath != "" && angieCfg.StubStatusURL == "" {
-			angieCfg.StubStatusURL = statusURL(discovered.StubStatusPort, discovered.StubStatusPath)
+			angieCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Printf("angie: auto-detected stub_status at %s", angieCfg.StubStatusURL)
 		}
 
