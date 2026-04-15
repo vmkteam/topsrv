@@ -66,7 +66,7 @@ On startup topsrv scans running processes and detects known services — no conf
 
 | Process | Type | Action |
 |---------|------|--------|
-| `postgres` / `postmaster` | postgresql | Logs hint to add DSN |
+| `postgres` / `postmaster` | postgresql | Auto-connects as `topsrv` user (password derived from Push.Token); falls back to hint if no token |
 | `nginx` | nginx | Parses nginx.conf → finds log_format + access_log |
 | `angie` | angie | Parses angie.conf → finds api /status/, log_format + access_log |
 | `redis-server` | redis | Detected |

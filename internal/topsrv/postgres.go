@@ -133,11 +133,17 @@ func NewPostgresCollector(logger embedlog.Logger, dsn string) (*PostgresCollecto
 	// Detect PG version (SHOW returns text, not int).
 	var versionStr string
 	var versionNum int
-	if err := pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionStr); err != nil {
-		logger.Printf("postgres: failed to detect version: %v", err)
+	if vErr := pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionStr); vErr != nil {
+		logger.Printf("postgres: failed to detect version: %v", vErr)
 	} else {
 		versionNum, _ = strconv.Atoi(versionStr)
 		logger.Printf("postgres: connected, version=%d", versionNum)
+	}
+
+	// Auto-switch to the largest non-template database for table-level metrics.
+	pool, err = switchToLargestDB(ctx, logger, pool, cfg)
+	if err != nil {
+		return nil, err
 	}
 
 	// pg_stat_statements: detect columns via pg_attribute (information_schema doesn't show extension views).
@@ -761,6 +767,28 @@ func (c *PostgresCollector) collectTables(ctx context.Context, ch chan<- prometh
 
 func (c *PostgresCollector) queryWarn(query string, err error) {
 	c.Printf("postgres: query failed: %s: %v", query, err)
+}
+
+// switchToLargestDB reconnects to the largest non-template database if it differs from current.
+// This allows table-level metrics (pg_stat_user_tables) to see application tables.
+func switchToLargestDB(ctx context.Context, logger embedlog.Logger, pool *pgxpool.Pool, cfg *pgxpool.Config) (*pgxpool.Pool, error) {
+	var largestDB string
+	_ = pool.QueryRow(ctx,
+		"SELECT datname FROM pg_database WHERE NOT datistemplate AND datallowconn ORDER BY pg_database_size(datname) DESC LIMIT 1",
+	).Scan(&largestDB)
+	if largestDB == "" || largestDB == cfg.ConnConfig.Database {
+		return pool, nil
+	}
+
+	logger.Printf("postgres: largest database is %q, reconnecting (was %q)", largestDB, cfg.ConnConfig.Database)
+	pool.Close()
+
+	cfg.ConnConfig.Database = largestDB
+	newPool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("reconnect to %s: %w", largestDB, err)
+	}
+	return newPool, nil
 }
 
 // Close closes the connection pool. Implements io.Closer.
