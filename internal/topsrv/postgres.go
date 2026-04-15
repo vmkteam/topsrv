@@ -643,12 +643,16 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 // collectQueryMeta fetches full query texts and database names for metadata push to gatesrv.
 func (c *PostgresCollector) collectQueryMeta(ctx context.Context, timeCol string) {
 	q := strings.NewReplacer("{time_col}", timeCol).Replace(
-		`SELECT s.queryid::text, d.datname, s.query
+		`WITH top_ids AS (
+			(SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY {time_col} DESC LIMIT 20)
+			UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY calls DESC LIMIT 20)
+			UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY shared_blks_read DESC LIMIT 20)
+		)
+		SELECT s.queryid::text, d.datname, s.query
 		FROM pg_stat_statements s
 			JOIN pg_database d ON d.oid = s.dbid
-		WHERE s.userid != 0
-		ORDER BY s.{time_col} DESC
-		LIMIT 100`)
+		WHERE s.userid != 0 AND s.queryid IN (SELECT queryid FROM top_ids)
+		ORDER BY s.{time_col} DESC`)
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
 		// Silently skip — metadata is best-effort.
@@ -679,9 +683,10 @@ func (c *PostgresCollector) QueryMeta() []QueryMeta {
 
 func (c *PostgresCollector) collectStatementsHistogram(ctx context.Context, ch chan<- prometheus.Metric, timeCol string) {
 	q := strings.NewReplacer("{time_col}", timeCol).Replace(
-		`SELECT dbid::text || ':' || queryid::text, calls, {time_col}
+		`SELECT dbid::text || ':' || queryid::text, sum(calls), sum({time_col})
 		FROM pg_stat_statements
-		WHERE userid != 0`)
+		WHERE userid != 0
+		GROUP BY dbid, queryid`)
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
 		return
