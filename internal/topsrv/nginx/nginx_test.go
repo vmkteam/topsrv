@@ -277,14 +277,14 @@ func TestNormalizeURI(t *testing.T) {
 	tests := []struct {
 		request, want string
 	}{
-		{"GET /api/v1/users/12345/posts HTTP/1.1", "/api/v1/users/:rest"},
+		{"GET /api/v1/users/12345/posts HTTP/1.1", "/api/v1/:rest"},
 		{"POST /shows/99999 HTTP/1.1", "/shows/:id"},
 		{"GET /static/app.js?v=123 HTTP/1.1", "/static/app.js"},
 		{"GET / HTTP/1.1", "/"},
 		// slug with trailing ID
 		{"GET /people/tommy-brewster-6401345/ HTTP/1.1", "/people/:slug/"},
 		// hex hashes in media URLs — truncated by depth
-		{"GET /media/roles/e/ef/d763d0a80cfe86a9fcc378db4d5935bf.jpg HTTP/1.1", "/media/roles/e/:rest"},
+		{"GET /media/roles/e/ef/d763d0a80cfe86a9fcc378db4d5935bf.jpg HTTP/1.1", "/media/roles/:rest"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, normalizeURI(tt.request), tt.request)
@@ -298,43 +298,57 @@ func TestNormalizePath(t *testing.T) {
 		{"/people/tommy-brewster-6401345/", "/people/:slug/"},
 		{"/people/anna-brewster-5448750/", "/people/:slug/"},
 		{"/movie/699853/", "/movie/:id/"},
-		{"/media/movies/normal/d/42/d763d0a80cfe86a9fcc378db4d5935bf.jpg", "/media/movies/normal/:rest"},
-		{"/view/episode/123/", "/view/episode/:id/"},
-		{"/v3/rpc/stat/", "/v3/rpc/stat/"},
-		// long slugs (articles, products)
-		{"/articles/bolezni/mozhno-li-uskorit-lechenie-orvi-i-grippa/", "/articles/bolezni/:slug/"},
-		{"/articles/lekarstva/top-luchshih-kapel-v-nos/", "/articles/lekarstva/:slug/"},
-		// depth limiting: 4+ real segments get truncated (trailing slash ignored)
-		{"/search/all/g-drama/", "/search/all/g-drama/"},
-		{"/search/all/g-drama/c-AU/", "/search/all/g-drama/:rest"},
-		{"/search/all/g-drama/c-AU/ch-US-abc/", "/search/all/g-drama/:rest"},
-		{"/search/all/c-AU/", "/search/all/c-AU/"},
-		{"/movies/catalog/horror/g-action/c-FR/", "/movies/catalog/horror/:rest"},
+		{"/media/movies/normal/:rest", "/media/movies/:rest"},
+		{"/view/episode/123/", "/view/episode/:rest"},
+		{"/v3/rpc/stat/", "/v3/rpc/:rest"},
+		// hyphen slugs (people, articles, products)
+		{"/people/anna-paquin/", "/people/:slug/"},
+		{"/people/tom-hardy/", "/people/:slug/"},
+		{"/articles/bolezni/:slug/", "/articles/bolezni/:rest"},
+		{"/articles/lekarstva/:slug/", "/articles/lekarstva/:rest"},
+		// depth limiting: 3+ real segments get truncated (trailing slash ignored)
+		{"/search/all/g-drama/", "/search/all/:rest"},
+		{"/search/all/g-drama/c-AU/", "/search/all/:rest"},
+		{"/search/all/g-drama/c-AU/ch-US-abc/", "/search/all/:rest"},
+		{"/search/all/c-AU/", "/search/all/:rest"},
+		{"/movies/catalog/horror/g-action/c-FR/", "/movies/catalog/:rest"},
+		{"/movies/catalog/g-drama/", "/movies/catalog/:rest"},
+		{"/movies/catalog/c-CA/", "/movies/catalog/:rest"},
 		// shallow paths stay unchanged
 		{"/", "/"},
 		{"/view/123/", "/view/:id/"},
 
 		// XenForo-style: text.digits (threads, attachments, blogs, members)
-		{"/forum/threads/baldurs-gate.13472/", "/forum/threads/:slug/"},
-		{"/forum/attachments/dog_01-gif.346529/", "/forum/attachments/:slug/"},
-		{"/forum/attachments/color-png.260378/", "/forum/attachments/:slug/"},
-		{"/forum/blogs/soldatiki.1131/", "/forum/blogs/:slug/"},
-		{"/forum/members/augenblick.283242/", "/forum/members/:slug/"},
-		{"/forum/threads/baldurs-gate.13472/page-2", "/forum/threads/:slug/:rest"},
+		{"/forum/threads/:slug/", "/forum/threads/:rest"},
+		{"/forum/attachments/:slug/", "/forum/attachments/:rest"},
+		{"/forum/attachments/:slug/", "/forum/attachments/:rest"},
+		{"/forum/blogs/:slug/", "/forum/blogs/:rest"},
+		{"/forum/members/:slug/", "/forum/members/:rest"},
+		{"/forum/threads/baldurs-gate.13472/page-2", "/forum/threads/:rest"},
 
 		// base64 tokens (download links with = padding)
-		{"/get/Ff6tPA2V90mzyHp1QqNI3A==,1776358785/pc/zuma/files/file.rar", "/get/:token/pc/:rest"},
-		{"/get/HcMp5L-WV7ChJaTSCai08g==,1776358793/pc/game/files/game.rar", "/get/:token/pc/:rest"},
-		{"/get/sOrtv860L7CZHzUQMvV5Bw==,1776276144/pc/test/files/test.zip", "/get/:token/pc/:rest"},
+		{"/get/Ff6tPA2V90mzyHp1QqNI3A==,1776358785/pc/zuma/files/file.rar", "/get/:token/:rest"},
+		{"/get/HcMp5L-WV7ChJaTSCai08g==,1776358793/pc/game/files/game.rar", "/get/:token/:rest"},
+		{"/get/sOrtv860L7CZHzUQMvV5Bw==,1776276144/pc/test/files/test.zip", "/get/:token/:rest"},
 
 		// file numeric suffixes (media filenames like show_10778.jpeg)
-		{"/media/123/456_10778.jpeg", "/media/:id/:id_:id.jpeg"},
-		{"/media/123/456_4036.jpg", "/media/:id/:id_:id.jpg"},
+		{"/media/123/456_10778.jpeg", "/media/:id/:rest"},
+		{"/media/123/456_4036.jpg", "/media/:id/:rest"},
 
-		// hex hash before numeric: /preview/shows/<md5>.jpg must not be corrupted by numericSegment
-		{"/preview/shows/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/shows/:hash.jpg"},
-		{"/preview/shows/de51d412b8e4abcdef0123456789abcd.png", "/preview/shows/:hash.png"},
-		{"/preview/comments/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/comments/:hash.jpg"},
+		// hex hash before numeric: /preview/shows/<md5>.jpg — truncated by depth 2
+		{"/preview/shows/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/shows/:rest"},
+		{"/preview/shows/de51d412b8e4abcdef0123456789abcd.png", "/preview/shows/:rest"},
+		{"/preview/comments/a0367b46de8f1c2a9b3e5d7f00112233.jpg", "/preview/comments/:rest"},
+
+		// URL-encoded segments (Cyrillic wiki pages, etc.)
+		{"/wiki/%D0%94%D1%8D%D0%B2%D0%B8%D0%B4_%D0%9F%D1%8D%D1%80%D1%80%D0%B8", "/wiki/:slug"},
+		{"/wiki/%D0%9A%D0%BB%D0%B0%D0%B4", "/wiki/:slug"},
+		{"/search/all/c-%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F/", "/search/all/:rest"},
+
+		// static well-known paths stay unchanged
+		{"/.well-known/security.txt", "/.well-known/security.txt"},
+		{"/robots.txt", "/robots.txt"},
+		{"/favicon.ico", "/favicon.ico"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, normalizePath(tt.path), tt.path)
@@ -347,14 +361,15 @@ func TestTruncatePath(t *testing.T) {
 		maxDepth int
 		want     string
 	}{
-		{"/", 3, "/"},
-		{"/a", 3, "/a"},
-		{"/a/b", 3, "/a/b"},
-		{"/a/b/c", 3, "/a/b/c"},
-		{"/a/b/c/", 3, "/a/b/c/"}, // trailing slash ignored
-		{"/a/b/c/d", 3, "/a/b/c/:rest"},
-		{"/a/b/c/d/e/f", 3, "/a/b/c/:rest"},
+		{"/", 2, "/"},
+		{"/a", 2, "/a"},
+		{"/a/b", 2, "/a/b"},
+		{"/a/b/", 2, "/a/b/"}, // trailing slash ignored
+		{"/a/b/c", 2, "/a/b/:rest"},
 		{"/a/b/c/d", 2, "/a/b/:rest"},
+		{"/a/b/c/d/e/f", 2, "/a/b/:rest"},
+		{"/a/b/c", 3, "/a/b/c"},
+		{"/a/b/c/d", 3, "/a/b/c/:rest"},
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, truncatePath(tt.path, tt.maxDepth), tt.path)

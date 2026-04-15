@@ -26,7 +26,7 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
 const maxCardinalityURI = 1000 // cap uri5xx map to prevent unbounded growth
-const maxPathDepth = 3         // collapse URI segments beyond this depth to :rest
+const maxPathDepth = 2         // collapse URI segments beyond this depth to :rest
 
 var (
 	// numericSegment matches path segments that are pure digits.
@@ -35,8 +35,10 @@ var (
 	hexHash = regexp.MustCompile(`[a-f0-9]{32}`)
 	// slugWithID matches slug-style segments ending with digits (e.g. "tommy-brewster-6401345").
 	slugWithID = regexp.MustCompile(`/[a-z][\w-]*-\d{4,}/`)
-	// longSlug matches long hyphenated slugs with 3+ hyphens (article/product URLs).
-	longSlug = regexp.MustCompile(`/[a-z][a-z0-9]*(?:-[a-z0-9]+){3,}`)
+	// hyphenSlug matches hyphenated slugs with 1+ hyphens (people, articles, products).
+	hyphenSlug = regexp.MustCompile(`/[a-z][a-z0-9]*(?:-[a-z0-9]+)+`)
+	// urlEncodedSegment matches path segments containing percent-encoded characters.
+	urlEncodedSegment = regexp.MustCompile(`/[^/]*%[0-9A-Fa-f]{2}[^/]*`)
 	// xenForoSlug matches XenForo-style segments: text.digits (threads, attachments, blogs, members).
 	xenForoSlug = regexp.MustCompile(`/[\w][\w-]*\.\d+/`)
 	// base64Token matches base64-encoded tokens with padding (containing = or ==).
@@ -464,10 +466,11 @@ func normalizeURI(request string) string {
 func normalizePath(path string) string {
 	path = base64Token.ReplaceAllString(path, ":token")
 	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
+	path = urlEncodedSegment.ReplaceAllString(path, "/:slug")
 	path = hexHash.ReplaceAllString(path, ":hash")
 	path = numericSegment.ReplaceAllString(path, "/:id")
 	path = slugWithID.ReplaceAllString(path, "/:slug/")
-	path = longSlug.ReplaceAllString(path, "/:slug")
+	path = hyphenSlug.ReplaceAllString(path, "/:slug")
 	path = fileNumericSuffix.ReplaceAllString(path, "_:id")
 	return truncatePath(path, maxPathDepth)
 }
