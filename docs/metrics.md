@@ -78,6 +78,7 @@
 | `topsrv_pg_up` | gauge | — | PostgreSQL is reachable (0/1) |
 | `topsrv_pg_connections` | gauge | state | Connections by state |
 | `topsrv_pg_connections_by_addr` | gauge | client_addr, state | Connections by client address and state |
+| `topsrv_pg_connections_by_app` | gauge | application_name, state | Connections by application name and state |
 | `topsrv_pg_max_connections` | gauge | — | max_connections setting |
 | `topsrv_pg_xact_total` | counter | database, type | Commits/rollbacks per database |
 | `topsrv_pg_deadlocks_total` | counter | database | Deadlocks per database |
@@ -99,6 +100,7 @@
 | `topsrv_pg_wal_files` | gauge | — | WAL file count |
 | `topsrv_pg_wraparound_xid_age` | gauge | database | Transaction ID age |
 | `topsrv_pg_wraparound_max_age` | gauge | — | Autovacuum freeze max age |
+| `topsrv_pg_longest_transaction_seconds` | gauge | database, usename | Age of longest running transactions (top 5) |
 | `topsrv_pg_query_time_seconds_total` | counter | queryid, query, database | Total query execution time |
 | `topsrv_pg_query_calls_total` | counter | queryid, query, database | Query call count |
 | `topsrv_pg_query_rows_total` | counter | queryid, query, database | Rows returned by query |

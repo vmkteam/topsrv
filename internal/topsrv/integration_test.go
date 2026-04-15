@@ -67,18 +67,59 @@ func TestIntegrationPostgres(t *testing.T) {
 	require.NotEmpty(t, mfs, "postgres collector returned no metrics")
 
 	names := map[string]bool{}
+	mfMap := map[string]*io_prometheus_client.MetricFamily{}
 	for _, mf := range mfs {
 		names[mf.GetName()] = true
+		mfMap[mf.GetName()] = mf
 	}
 
 	// Core PG metrics must be present.
 	for _, name := range []string{
 		"topsrv_pg_connections",
+		"topsrv_pg_connections_by_app",
+		"topsrv_pg_longest_transaction_seconds",
 		"topsrv_pg_database_size_bytes",
 		"topsrv_pg_xact_total",
 		"topsrv_pg_locks",
 	} {
 		assert.True(t, names[name], "missing metric: %s", name)
+	}
+
+	// Verify connections_by_app has application_name and state labels.
+	if mf, ok := mfMap["topsrv_pg_connections_by_app"]; ok {
+		for _, m := range mf.GetMetric() {
+			labelNames := map[string]bool{}
+			for _, lp := range m.GetLabel() {
+				labelNames[lp.GetName()] = true
+			}
+			assert.True(t, labelNames["application_name"], "connections_by_app missing 'application_name' label")
+			assert.True(t, labelNames["state"], "connections_by_app missing 'state' label")
+		}
+	}
+
+	// Verify longest_transaction_seconds has database and usename labels.
+	if mf, ok := mfMap["topsrv_pg_longest_transaction_seconds"]; ok {
+		for _, m := range mf.GetMetric() {
+			labelNames := map[string]bool{}
+			for _, lp := range m.GetLabel() {
+				labelNames[lp.GetName()] = true
+			}
+			assert.True(t, labelNames["database"], "longest_transaction_seconds missing 'database' label")
+			assert.True(t, labelNames["usename"], "longest_transaction_seconds missing 'usename' label")
+		}
+	}
+
+	// Verify connections includes background worker state.
+	if mf, ok := mfMap["topsrv_pg_connections"]; ok {
+		hasBgWorker := false
+		for _, m := range mf.GetMetric() {
+			for _, lp := range m.GetLabel() {
+				if lp.GetName() == "state" && lp.GetValue() == "background worker" {
+					hasBgWorker = true
+				}
+			}
+		}
+		assert.True(t, hasBgWorker, "connections missing 'background worker' state")
 	}
 
 	// pg_stat_statements metrics (PG17 uses shared_blk_read_time/shared_blk_write_time).
@@ -94,10 +135,6 @@ func TestIntegrationPostgres(t *testing.T) {
 	}
 
 	// Verify that per-query metrics have the "database" label.
-	mfMap := map[string]*io_prometheus_client.MetricFamily{}
-	for _, mf := range mfs {
-		mfMap[mf.GetName()] = mf
-	}
 	for _, name := range stmtMetrics {
 		mf, ok := mfMap[name]
 		if !ok {

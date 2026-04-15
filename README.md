@@ -54,7 +54,7 @@ That's it. System, disk, network, netstat, and process metrics are collected aut
 | **Network** | IO per interface, interface info (MAC/IP/MTU/status) | node_exporter |
 | **Netstat** | TCP connections by state/direction/port, TCP retransmits, UDP/IP errors | node_exporter |
 | **Process** | CPU, memory, disk IO, threads, FDs, worst_fd_ratio per process group | process-exporter |
-| **PostgreSQL** | Connections, transactions, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
+| **PostgreSQL** | Connections (by state/addr/app), transactions, longest transaction age, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
 | **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
