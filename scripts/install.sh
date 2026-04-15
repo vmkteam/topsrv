@@ -15,6 +15,7 @@ REPO="vmkteam/topsrv"
 INSTALL_DIR="${INSTALL_DIR:-/usr/local/bin}"
 CONFIG_DIR="/etc/topsrv"
 SPOOL_DIR="/var/lib/topsrv/spool"
+LOG_DIR="/var/log/topsrv"
 SERVICE_NAME="topsrv"
 
 # Defaults.
@@ -123,8 +124,8 @@ install -m 0755 "${TMPDIR}/topsrv" "${INSTALL_DIR}/topsrv"
 INSTALLED_VERSION=$("${INSTALL_DIR}/topsrv" -version 2>&1 || true)
 log "Installed: ${INSTALLED_VERSION}"
 
-# Create config (only if not exists).
-mkdir -p "$CONFIG_DIR" "$SPOOL_DIR"
+# Create directories.
+mkdir -p "$CONFIG_DIR" "$SPOOL_DIR" "$LOG_DIR"
 
 if [ ! -f "${CONFIG_DIR}/topsrv.toml" ]; then
     log "Creating config: ${CONFIG_DIR}/topsrv.toml"
@@ -153,7 +154,10 @@ StartLimitIntervalSec=120
 
 [Service]
 Type=simple
-ExecStart=${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml -verbose
+ExecStartPre=/bin/mkdir -p ${LOG_DIR}
+ExecStart=${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml -verbose -json
+StandardOutput=append:${LOG_DIR}/topsrv.log
+StandardError=append:${LOG_DIR}/topsrv.log
 Restart=always
 RestartSec=5
 SuccessExitStatus=42
@@ -166,6 +170,21 @@ EOF
     systemctl enable "$SERVICE_NAME"
     systemctl restart "$SERVICE_NAME"
     log "Service started: systemctl status ${SERVICE_NAME}"
+
+    # Logrotate.
+    log "Installing logrotate config"
+    cat > /etc/logrotate.d/${SERVICE_NAME} <<LEOF
+${LOG_DIR}/topsrv.log {
+    daily
+    rotate 14
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+    su root root
+}
+LEOF
 else
     log "No systemd — skipping service install"
     log "Start manually: ${INSTALL_DIR}/topsrv -config ${CONFIG_DIR}/topsrv.toml"
