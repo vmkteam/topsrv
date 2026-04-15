@@ -298,7 +298,7 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line string) {
 	if req, err := entry.Field("request"); err == nil {
 		p.uri = normalizeURI(req)
 	} else if u, err := entry.Field("uri"); err == nil {
-		p.uri = normalizeURI(u)
+		p.uri = normalizePath(u)
 	}
 
 	for i, f := range c.extraFields {
