@@ -1,8 +1,10 @@
 package topsrv
 
 import (
+	"cmp"
 	"context"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -24,15 +26,48 @@ var queryDurationBuckets = []float64{0.0001, 0.0005, 0.001, 0.005, 0.01, 0.05, 0
 
 // stmtPrev stores previous pg_stat_statements values for delta computation.
 type stmtPrev struct {
-	calls     int64
-	totalTime float64 // milliseconds (as reported by PG)
+	calls        int64
+	totalTime    float64 // milliseconds (as reported by PG)
+	rows         int64
+	blksHit      int64
+	blksRead     int64
+	blksDirtied  int64
+	blkReadTime  float64
+	blkWriteTime float64
+	tempRead     int64
+	tempWritten  int64
+	walBytes     int64
+}
+
+// stmtCurrent holds current snapshot + computed delta for a single pg_stat_statements entry.
+type stmtCurrent struct {
+	key      string // "dbid:queryid"
+	queryID  string
+	query    string
+	database string
+	cur      stmtPrev
+	// deltas (current - previous); negative means reset, skip
+	deltaTime  float64
+	deltaCalls int64
+	deltaBlks  int64 // blksRead delta, for top-N sorting
+}
+
+const topStatementsN = 20 // top-N per dimension (time, calls, blks_read)
+
+func newHistBuckets() map[float64]uint64 {
+	m := make(map[float64]uint64, len(queryDurationBuckets))
+	for _, b := range queryDurationBuckets {
+		m[b] = 0
+	}
+	return m
 }
 
 // QueryMeta holds full query text metadata for push to gatesrv.
 type QueryMeta struct {
-	QueryID  string `json:"queryid"`
-	Database string `json:"database"`
-	Query    string `json:"query"`
+	QueryID         string `json:"queryid"`
+	Database        string `json:"database"`
+	Query           string `json:"query"`
+	ApplicationName string `json:"application_name,omitempty"`
 }
 
 // PostgresCollector collects PostgreSQL metrics via SQL queries.
@@ -48,6 +83,10 @@ type PostgresCollector struct {
 	// query metadata for push to gatesrv (full query texts + database names)
 	queryMetaMu sync.RWMutex
 	queryMeta   []QueryMeta
+
+	// queryid → set of application_names (accumulated from pg_stat_activity samples)
+	appNames      map[int64]map[string]bool
+	appNamesAvail bool // false after first query failure (compute_query_id off)
 
 	// histogram state — cumulative counters for query duration distribution
 	prevStmts   map[string]stmtPrev
@@ -161,19 +200,16 @@ func NewPostgresCollector(logger embedlog.Logger, dsn string) (*PostgresCollecto
 
 	hasWalBytes := hasCol("wal_bytes")
 
-	histBuckets := make(map[float64]uint64, len(queryDurationBuckets))
-	for _, b := range queryDurationBuckets {
-		histBuckets[b] = 0
-	}
-
 	return &PostgresCollector{
 		Logger:            logger,
 		pool:              pool,
 		versionNum:        versionNum,
 		statementsTimeCol: statementsTimeCol,
 		hasWalBytes:       hasWalBytes,
+		appNames:          make(map[int64]map[string]bool),
+		appNamesAvail:     true,
 		prevStmts:         make(map[string]stmtPrev),
-		histBuckets:       histBuckets,
+		histBuckets:       newHistBuckets(),
 
 		up:                prometheus.NewDesc("topsrv_pg_up", "PostgreSQL is reachable (1=yes, 0=no).", nil, nil),
 		connections:       prometheus.NewDesc("topsrv_pg_connections", "PostgreSQL connections by state.", []string{"state"}, nil),
@@ -568,6 +604,9 @@ func (c *PostgresCollector) collectTxAge(ctx context.Context, ch chan<- promethe
 }
 
 func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- prometheus.Metric) {
+	// Sample pg_stat_activity for queryid → application_name mapping.
+	c.sampleAppNames(ctx)
+
 	// pg_stat_statements 1.8+ (PG13+) renamed total_time → total_exec_time
 	timeCol := "total_exec_time"
 	if c.statementsTimeCol != "" {
@@ -580,10 +619,6 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 		blkReadCol, blkWriteCol = "shared_blk_read_time", "shared_blk_write_time"
 	}
 
-	// Per-query metrics: union of top 20 by time, top 20 by calls, top 20 by blocks read.
-	// This ensures sorting by any dimension on the frontend shows the real top queries.
-	// JOIN pg_database for database label. GROUP BY (queryid, dbid) aggregates across userids
-	// to avoid duplicate Prometheus label sets when multiple PG users run the same query.
 	r := strings.NewReplacer("{time_col}", timeCol, "{blk_read_col}", blkReadCol, "{blk_write_col}", blkWriteCol)
 
 	walBytesCol := ""
@@ -591,21 +626,18 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 		walBytesCol = `, sum(s.wal_bytes)`
 	}
 
-	q := r.Replace(`WITH top_ids AS (
-		(SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY {time_col} DESC LIMIT 20)
-		UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY calls DESC LIMIT 20)
-		UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY shared_blks_read DESC LIMIT 20)
-	)
-	SELECT s.queryid::text, left(min(s.query), 100), d.datname,
+	// Single query: read ALL entries from pg_stat_statements (no LIMIT).
+	// GROUP BY (queryid, dbid) aggregates across userids.
+	q := r.Replace(`SELECT s.dbid::text || ':' || s.queryid::text,
+		s.queryid::text, left(min(s.query), 100), d.datname,
 		sum(s.calls), sum(s.{time_col}), sum(s.rows),
 		sum(s.shared_blks_hit), sum(s.shared_blks_read), sum(s.shared_blks_dirtied),
 		sum(s.{blk_read_col}), sum(s.{blk_write_col}),
 		sum(s.temp_blks_read), sum(s.temp_blks_written)` + walBytesCol + `
 	FROM pg_stat_statements s
 		JOIN pg_database d ON d.oid = s.dbid
-	WHERE s.userid != 0 AND s.queryid IN (SELECT queryid FROM top_ids)
-	GROUP BY s.queryid, d.datname
-	ORDER BY sum(s.{time_col}) DESC`)
+	WHERE s.userid != 0
+	GROUP BY s.dbid, s.queryid, d.datname`)
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
 		c.queryWarn("pg_stat_statements", err)
@@ -613,66 +645,118 @@ func (c *PostgresCollector) collectStatements(ctx context.Context, ch chan<- pro
 	}
 	defer rows.Close()
 
+	all := c.scanStatements(rows)
+
+	// Emit histogram.
+	if c.histCount > 0 {
+		ch <- prometheus.MustNewConstHistogram(c.queryDuration, c.histCount, c.histSum, c.histBuckets)
+	}
+
+	// Select top-N by delta (time, calls, blks_read) and emit per-query counters.
+	topSet := c.selectTopStatements(all)
+	for _, sc := range all {
+		if topSet[sc.key] {
+			c.emitStatementMetrics(ch, sc)
+		}
+	}
+
+	// Fetch full query texts for top queries (push to gatesrv).
+	c.collectQueryMeta(ctx, topSet, timeCol)
+}
+
+// scanStatements reads all pg_stat_statements rows, computes deltas against previous snapshot,
+// feeds histogram buckets, and returns current entries with metadata.
+func (c *PostgresCollector) scanStatements(rows interface {
+	Next() bool
+	Scan(...any) error
+},
+) []stmtCurrent {
+	var all []stmtCurrent
+	seen := make(map[string]struct{}, len(c.prevStmts))
+
 	for rows.Next() {
-		var qid, query, database string
-		var calls, rowsN, blksHit, blksRead, blksDirtied, tempRead, tempWritten, walBytes int64
-		var totalTime, blkReadTime, blkWriteTime float64
-		scanArgs := []any{&qid, &query, &database, &calls, &totalTime, &rowsN, &blksHit, &blksRead, &blksDirtied, &blkReadTime, &blkWriteTime, &tempRead, &tempWritten}
+		var sc stmtCurrent
+		scanArgs := []any{&sc.key, &sc.queryID, &sc.query, &sc.database,
+			&sc.cur.calls, &sc.cur.totalTime, &sc.cur.rows,
+			&sc.cur.blksHit, &sc.cur.blksRead, &sc.cur.blksDirtied,
+			&sc.cur.blkReadTime, &sc.cur.blkWriteTime,
+			&sc.cur.tempRead, &sc.cur.tempWritten}
 		if c.hasWalBytes {
-			scanArgs = append(scanArgs, &walBytes)
+			scanArgs = append(scanArgs, &sc.cur.walBytes)
 		}
 		if err := rows.Scan(scanArgs...); err != nil {
 			continue
 		}
-		ch <- prometheus.MustNewConstMetric(c.queryTime, prometheus.CounterValue, totalTime*msToSec, qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryCalls, prometheus.CounterValue, float64(calls), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryRows, prometheus.CounterValue, float64(rowsN), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryBlksHit, prometheus.CounterValue, float64(blksHit), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryBlksRead, prometheus.CounterValue, float64(blksRead), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryBlksDirtied, prometheus.CounterValue, float64(blksDirtied), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryBlkReadTime, prometheus.CounterValue, blkReadTime*msToSec, qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryBlkWriteTime, prometheus.CounterValue, blkWriteTime*msToSec, qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryTempRead, prometheus.CounterValue, float64(tempRead), qid, query, database)
-		ch <- prometheus.MustNewConstMetric(c.queryTempWritten, prometheus.CounterValue, float64(tempWritten), qid, query, database)
-		if c.hasWalBytes {
-			ch <- prometheus.MustNewConstMetric(c.queryWalBytes, prometheus.CounterValue, float64(walBytes), qid, query, database)
+
+		seen[sc.key] = struct{}{}
+
+		// Compute deltas for top-N selection and histogram.
+		if prev, ok := c.prevStmts[sc.key]; ok {
+			sc.deltaCalls = sc.cur.calls - prev.calls
+			sc.deltaTime = sc.cur.totalTime - prev.totalTime
+			sc.deltaBlks = sc.cur.blksRead - prev.blksRead
+
+			// Feed histogram from deltas.
+			if sc.deltaCalls > 0 && sc.deltaTime >= 0 {
+				meanSec := (sc.deltaTime * msToSec) / float64(sc.deltaCalls)
+				for _, le := range queryDurationBuckets {
+					if meanSec <= le {
+						c.histBuckets[le] += uint64(sc.deltaCalls)
+					}
+				}
+				c.histCount += uint64(sc.deltaCalls)
+				c.histSum += sc.deltaTime * msToSec
+			}
+		}
+
+		c.prevStmts[sc.key] = sc.cur
+		all = append(all, sc)
+	}
+
+	// Cleanup stale entries.
+	for key := range c.prevStmts {
+		if _, ok := seen[key]; !ok {
+			delete(c.prevStmts, key)
 		}
 	}
 
-	// Collect full query texts for metadata push.
-	c.collectQueryMeta(ctx, timeCol)
-
-	// Histogram: ALL queries (no LIMIT) — aggregated into buckets without per-query labels
-	c.collectStatementsHistogram(ctx, ch, timeCol)
+	return all
 }
 
-// collectQueryMeta fetches full query texts and database names for metadata push to gatesrv.
-func (c *PostgresCollector) collectQueryMeta(ctx context.Context, timeCol string) {
+// collectQueryMeta fetches full query texts for top queries and stores them for push to gatesrv.
+func (c *PostgresCollector) collectQueryMeta(ctx context.Context, topSet map[string]bool, timeCol string) {
+	if len(topSet) == 0 {
+		return
+	}
+
 	q := strings.NewReplacer("{time_col}", timeCol).Replace(
-		`WITH top_ids AS (
-			(SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY {time_col} DESC LIMIT 20)
-			UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY calls DESC LIMIT 20)
-			UNION (SELECT queryid FROM pg_stat_statements WHERE userid != 0 ORDER BY shared_blks_read DESC LIMIT 20)
-		)
-		SELECT s.queryid::text, d.datname, s.query
+		`SELECT s.dbid::text || ':' || s.queryid::text,
+			s.queryid::text, d.datname, s.query
 		FROM pg_stat_statements s
 			JOIN pg_database d ON d.oid = s.dbid
-		WHERE s.userid != 0 AND s.queryid IN (SELECT queryid FROM top_ids)
+		WHERE s.userid != 0
 		ORDER BY s.{time_col} DESC`)
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
-		// Silently skip — metadata is best-effort.
-		return
+		return // best-effort
 	}
 	defer rows.Close()
 
+	seen := make(map[string]bool, len(topSet))
 	var meta []QueryMeta
 	for rows.Next() {
-		var qid, db, query string
-		if err := rows.Scan(&qid, &db, &query); err != nil {
+		var key, qid, db, query string
+		if rows.Scan(&key, &qid, &db, &query) != nil {
 			continue
 		}
-		meta = append(meta, QueryMeta{QueryID: qid, Database: db, Query: query})
+		if !topSet[key] && !seen[qid] {
+			continue
+		}
+		if seen[qid] {
+			continue
+		}
+		seen[qid] = true
+		meta = append(meta, QueryMeta{QueryID: qid, Database: db, Query: query, ApplicationName: c.appNamesByQueryID(qid)})
 	}
 
 	c.queryMetaMu.Lock()
@@ -680,62 +764,98 @@ func (c *PostgresCollector) collectQueryMeta(ctx context.Context, timeCol string
 	c.queryMetaMu.Unlock()
 }
 
+// sampleAppNames samples pg_stat_activity to accumulate queryid → application_name mapping.
+// PG14+ exposes query_id in pg_stat_activity when compute_query_id is enabled.
+func (c *PostgresCollector) sampleAppNames(ctx context.Context) {
+	if !c.appNamesAvail {
+		return
+	}
+	rows, err := c.pool.Query(ctx,
+		`SELECT query_id, (string_to_array(application_name, '-'))[1] FROM pg_stat_activity WHERE query_id IS NOT NULL AND query_id != 0 AND application_name != ''`)
+	if err != nil {
+		c.appNamesAvail = false
+		c.Printf("postgres: pg_stat_activity query_id not available (compute_query_id off?), skipping app name sampling")
+		return
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var qid int64
+		var app string
+		if rows.Scan(&qid, &app) != nil {
+			continue
+		}
+		if c.appNames[qid] == nil {
+			c.appNames[qid] = make(map[string]bool)
+		}
+		c.appNames[qid][app] = true
+	}
+}
+
+// appNamesByQueryID returns comma-separated application names for a queryid string, or empty.
+func (c *PostgresCollector) appNamesByQueryID(queryID string) string {
+	qid, err := strconv.ParseInt(queryID, 10, 64)
+	if err != nil {
+		return ""
+	}
+	apps := c.appNames[qid]
+	if len(apps) == 0 {
+		return ""
+	}
+	names := make([]string, 0, len(apps))
+	for name := range apps {
+		names = append(names, name)
+	}
+	slices.Sort(names)
+	return strings.Join(names, ", ")
+}
+
+func (c *PostgresCollector) emitStatementMetrics(ch chan<- prometheus.Metric, sc stmtCurrent) {
+	cur := sc.cur
+	ch <- prometheus.MustNewConstMetric(c.queryTime, prometheus.CounterValue, cur.totalTime*msToSec, sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryCalls, prometheus.CounterValue, float64(cur.calls), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryRows, prometheus.CounterValue, float64(cur.rows), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryBlksHit, prometheus.CounterValue, float64(cur.blksHit), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryBlksRead, prometheus.CounterValue, float64(cur.blksRead), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryBlksDirtied, prometheus.CounterValue, float64(cur.blksDirtied), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryBlkReadTime, prometheus.CounterValue, cur.blkReadTime*msToSec, sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryBlkWriteTime, prometheus.CounterValue, cur.blkWriteTime*msToSec, sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryTempRead, prometheus.CounterValue, float64(cur.tempRead), sc.queryID, sc.query, sc.database)
+	ch <- prometheus.MustNewConstMetric(c.queryTempWritten, prometheus.CounterValue, float64(cur.tempWritten), sc.queryID, sc.query, sc.database)
+	if c.hasWalBytes {
+		ch <- prometheus.MustNewConstMetric(c.queryWalBytes, prometheus.CounterValue, float64(cur.walBytes), sc.queryID, sc.query, sc.database)
+	}
+}
+
+// selectTopStatements returns a set of keys for the top-N statements by delta time, delta calls, and delta blks_read.
+// On the first scrape (no previous snapshot), falls back to cumulative values.
+func (c *PostgresCollector) selectTopStatements(all []stmtCurrent) map[string]bool {
+	result := make(map[string]bool, topStatementsN*3)
+
+	addTopN := func(lessFunc func(a, b stmtCurrent) int) {
+		sorted := make([]stmtCurrent, len(all))
+		copy(sorted, all)
+		slices.SortFunc(sorted, lessFunc)
+		for i := range min(topStatementsN, len(sorted)) {
+			result[sorted[i].key] = true
+		}
+	}
+
+	// Top by delta time (or cumulative if first scrape).
+	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaTime, a.deltaTime) })
+	// Top by delta calls.
+	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaCalls, a.deltaCalls) })
+	// Top by delta blks_read.
+	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlks, a.deltaBlks) })
+
+	return result
+}
+
 // QueryMeta returns the latest collected query metadata (thread-safe).
 func (c *PostgresCollector) QueryMeta() []QueryMeta {
 	c.queryMetaMu.RLock()
 	defer c.queryMetaMu.RUnlock()
 	return c.queryMeta
-}
-
-func (c *PostgresCollector) collectStatementsHistogram(ctx context.Context, ch chan<- prometheus.Metric, timeCol string) {
-	q := strings.NewReplacer("{time_col}", timeCol).Replace(
-		`SELECT dbid::text || ':' || queryid::text, sum(calls), sum({time_col})
-		FROM pg_stat_statements
-		WHERE userid != 0
-		GROUP BY dbid, queryid`)
-	rows, err := c.pool.Query(ctx, q)
-	if err != nil {
-		return
-	}
-	defer rows.Close()
-
-	seen := make(map[string]struct{}, 64)
-	for rows.Next() {
-		var qid string
-		var calls int64
-		var totalTime float64
-		if rows.Scan(&qid, &calls, &totalTime) != nil {
-			continue
-		}
-
-		seen[qid] = struct{}{}
-		if prev, ok := c.prevStmts[qid]; ok {
-			deltaCalls := calls - prev.calls
-			deltaTime := totalTime - prev.totalTime
-			if deltaCalls > 0 && deltaTime >= 0 {
-				meanSec := (deltaTime * msToSec) / float64(deltaCalls)
-				for _, le := range queryDurationBuckets {
-					if meanSec <= le {
-						c.histBuckets[le] += uint64(deltaCalls)
-					}
-				}
-				c.histCount += uint64(deltaCalls)
-				c.histSum += deltaTime * msToSec
-			}
-		}
-		c.prevStmts[qid] = stmtPrev{calls: calls, totalTime: totalTime}
-	}
-
-	// Clean up prevStmts for queries no longer in pg_stat_statements
-	for qid := range c.prevStmts {
-		if _, ok := seen[qid]; !ok {
-			delete(c.prevStmts, qid)
-		}
-	}
-
-	if c.histCount > 0 {
-		ch <- prometheus.MustNewConstHistogram(c.queryDuration, c.histCount, c.histSum, c.histBuckets)
-	}
 }
 
 func (c *PostgresCollector) collectTables(ctx context.Context, ch chan<- prometheus.Metric) {

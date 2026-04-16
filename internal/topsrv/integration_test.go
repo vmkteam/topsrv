@@ -166,6 +166,63 @@ func TestIntegrationPostgres(t *testing.T) {
 	}
 
 	t.Logf("QueryMeta: %d entries, first db=%s queryid=%s query_len=%d", len(meta), meta[0].Database, meta[0].QueryID, len(meta[0].Query))
+
+	// ApplicationName: run a long query with a known application_name so it appears in pg_stat_activity,
+	// then gather again to sample app names and verify they end up in QueryMeta.
+	testAppName(t, c, reg)
+}
+
+// testAppName verifies that application_name from pg_stat_activity is captured in QueryMeta.
+func testAppName(t *testing.T, c *PostgresCollector, reg *prometheus.Registry) {
+	t.Helper()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// Open a separate connection with a known application_name and run a slow query.
+	appDSN := pgDSN() + "&application_name=test_app_ci"
+	appPool, err := pgxpool.New(ctx, appDSN)
+	require.NoError(t, err)
+	defer appPool.Close()
+
+	// Run pg_sleep in background so it's visible in pg_stat_activity during gather.
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = appPool.Exec(ctx, "SELECT pg_sleep(2)")
+	}()
+
+	// Give PG a moment to register the query in pg_stat_activity.
+	time.Sleep(200 * time.Millisecond)
+
+	// Gather triggers sampleAppNames → should pick up "test_app_ci" → truncated to "test_app_ci".
+	// Note: string_to_array('test_app_ci', '-') = {'test_app_ci'} (no dash) → returns full name.
+	_, err = reg.Gather()
+	require.NoError(t, err)
+
+	<-done
+
+	// Verify the appNames dictionary captured "test_app_ci".
+	var found bool
+	for _, apps := range c.appNames {
+		if apps["test_app_ci"] {
+			found = true
+			break
+		}
+	}
+	assert.True(t, found, "expected appNames to contain 'test_app_ci'")
+	t.Logf("appNames map: %d queryids sampled", len(c.appNames))
+
+	// Verify appNamesByQueryID returns the captured name.
+	// pg_sleep's queryid should be in the map; find it.
+	for qid, apps := range c.appNames {
+		if apps["test_app_ci"] {
+			result := c.appNamesByQueryID(fmt.Sprintf("%d", qid))
+			assert.Contains(t, result, "test_app_ci")
+			t.Logf("appNamesByQueryID(%d) = %q", qid, result)
+			break
+		}
+	}
 }
 
 // seedStatStatements runs identical queries from different PG users and in different databases

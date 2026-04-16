@@ -26,12 +26,15 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 // DefaultLogFormat — combined + request_time + upstream_response_time.
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
-const maxCardinalityURI = 1000 // cap uri5xx map to prevent unbounded growth
-const maxPathDepth = 2         // collapse URI segments beyond this depth to :rest
+const maxCardinalityURI = 1000   // cap uri5xx map to prevent unbounded growth
+const maxCardinalityTagged = 500 // cap taggedCounts (status × extra labels) to prevent unbounded growth
+const maxPathDepth = 2           // collapse URI segments beyond this depth to :rest
 
 var (
 	// numericSegment matches path segments that are pure digits.
 	numericSegment = regexp.MustCompile(`/\d+`)
+	// uuidSegment matches UUID v4 format (8-4-4-4-12 hex, case-insensitive).
+	uuidSegment = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
 	// hexHash matches 32-char hex strings (md5 hashes in media URLs).
 	hexHash = regexp.MustCompile(`[a-f0-9]{32}`)
 	// slugWithID matches slug-style segments ending with digits (e.g. "tommy-brewster-6401345").
@@ -406,7 +409,9 @@ func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
 				}
 				key.extra[i] = v
 			}
-			c.taggedCounts[key]++
+			if _, ok := c.taggedCounts[key]; ok || len(c.taggedCounts) < maxCardinalityTagged {
+				c.taggedCounts[key]++
+			}
 		}
 
 		uri := p.uri
@@ -491,6 +496,7 @@ func normalizePath(path string) string {
 	// Normalize .php filenames: /foo/bar.php → /foo/:file.php
 	path = phpFile.ReplaceAllString(path, "/:file.php")
 
+	path = uuidSegment.ReplaceAllString(path, ":uuid")
 	path = base64Token.ReplaceAllString(path, ":token")
 	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
 	path = urlEncodedSegment.ReplaceAllString(path, "/:slug")
