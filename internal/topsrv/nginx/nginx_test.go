@@ -345,6 +345,25 @@ func TestNormalizePath(t *testing.T) {
 		{"/wiki/%D0%9A%D0%BB%D0%B0%D0%B4", "/wiki/:slug"},
 		{"/search/all/c-%D0%A0%D0%BE%D1%81%D1%81%D0%B8%D1%8F/", "/search/all/:rest"},
 
+		// non-printable / TLS garbage → /:invalid
+		{"\x16\x03\x01\x00{\x01", "/:invalid"},
+		{"/page\x00inject", "/:invalid"},
+
+		// scanner probe suffixes → /:bot-scanners
+		{"/.env", "/:bot-scanners"},
+		{"/.git/config", "/:bot-scanners"},
+		{"/.aws/credentials", "/:bot-scanners"},
+		{"/backup.sql", "/:bot-scanners"},
+		{"/dump.bak", "/:bot-scanners"},
+		{"/.ssh/id_rsa", "/:bot-scanners"},
+		{"/.svn/entries", "/:bot-scanners"},
+
+		// .php normalization → :file.php
+		{"/shell.php", "/:file.php"},
+		{"/wp-login.php", "/:file.php"},
+		{"/wiki/index.php", "/wiki/:file.php"},
+		{"/forum/proxy.php", "/forum/:file.php"},
+
 		// static well-known paths stay unchanged
 		{"/.well-known/security.txt", "/.well-known/security.txt"},
 		{"/robots.txt", "/robots.txt"},

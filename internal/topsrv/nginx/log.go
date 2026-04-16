@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
+	"unicode/utf8"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
 
@@ -45,7 +46,12 @@ var (
 	base64Token = regexp.MustCompile(`[A-Za-z0-9_+-]{6,}={1,2}[^/]*`)
 	// fileNumericSuffix matches _digits patterns in filenames (e.g. "_10778" in "show_10778.jpeg").
 	fileNumericSuffix = regexp.MustCompile(`_\d{3,}`)
+	// phpFile matches .php filename in the last path segment.
+	phpFile = regexp.MustCompile(`/[^/]+\.php$`)
 )
+
+// scannerSuffixes are path suffixes that indicate bot/scanner probes and never appear in legitimate traffic.
+var scannerSuffixes = [...]string{".env", ".git", ".aws", ".ssh", ".svn", ".bak", ".sql"}
 
 // LogCollector parses nginx access logs and collects metrics.
 // Supports custom labels from log fields via ExtraLabels.
@@ -464,6 +470,27 @@ func normalizeURI(request string) string {
 }
 
 func normalizePath(path string) string {
+	// Non-printable / invalid UTF-8 — TLS handshake garbage, SSH probes, etc.
+	if !utf8.ValidString(path) {
+		return "/:invalid"
+	}
+	for i := range len(path) {
+		if path[i] < 0x20 {
+			return "/:invalid"
+		}
+	}
+
+	// Scanner probe suffixes (.env, .git, .aws, etc.)
+	lower := strings.ToLower(path)
+	for _, suffix := range scannerSuffixes {
+		if strings.Contains(lower, suffix) {
+			return "/:bot-scanners"
+		}
+	}
+
+	// Normalize .php filenames: /foo/bar.php → /foo/:file.php
+	path = phpFile.ReplaceAllString(path, "/:file.php")
+
 	path = base64Token.ReplaceAllString(path, ":token")
 	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
 	path = urlEncodedSegment.ReplaceAllString(path, "/:slug")
