@@ -1,10 +1,24 @@
 package topsrv
 
 import (
+	"cmp"
+	"slices"
+	"strings"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shirou/gopsutil/v4/process"
 	"github.com/vmkteam/embedlog"
 )
+
+const maxProcessGroups = 100 // top-N groups by CPU+RSS; rest aggregated into ~other
+
+// kernelPrefixes — kernel thread name prefixes to exclude from metrics.
+var kernelPrefixes = [...]string{
+	"kworker/", "ksoftirqd/", "migration/", "rcu_", "watchdog/",
+	"cpuhp/", "idle_inject/", "netns", "kdevtmpfs", "khungtaskd",
+	"kcompactd", "kswapd", "irq/", "scsi_", "xfs", "jbd2/",
+	"dm_bufio", "kdmflush", "bioset", "crypto",
+}
 
 // ProcessCollector collects per-process-group metrics (grouped by name).
 type ProcessCollector struct {
@@ -72,6 +86,9 @@ func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		if err != nil || name == "" {
 			continue
 		}
+		if isKernelThread(name) {
+			continue
+		}
 
 		g, ok := groups[name]
 		if !ok {
@@ -83,27 +100,91 @@ func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 		c.collectProcess(p, g)
 	}
 
-	for name, g := range groups {
-		ch <- prometheus.MustNewConstMetric(c.cpuSeconds, prometheus.CounterValue, g.cpuUser+g.cpuSystem, name)
-		ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.rss), name, "rss")
-		ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.vms), name, "vms")
-		ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.swap), name, "swap")
-		ch <- prometheus.MustNewConstMetric(c.procCount, prometheus.GaugeValue, float64(g.count), name)
-		ch <- prometheus.MustNewConstMetric(c.threads, prometheus.GaugeValue, float64(g.threads), name)
-		ch <- prometheus.MustNewConstMetric(c.majorFaults, prometheus.CounterValue, float64(g.majorFaults), name)
+	// Top N by CPU+RSS; rest aggregated into ~other.
+	top := c.topGroups(groups)
+	for _, entry := range top {
+		c.emitGroup(ch, entry.name, entry.group)
+	}
+}
 
-		// Linux only — emit only when data was collected.
-		if g.hasDiskIO {
-			ch <- prometheus.MustNewConstMetric(c.diskReadBytes, prometheus.CounterValue, float64(g.readBytes), name)
-			ch <- prometheus.MustNewConstMetric(c.diskWriteBytes, prometheus.CounterValue, float64(g.writeBytes), name)
-			ch <- prometheus.MustNewConstMetric(c.diskReadOps, prometheus.CounterValue, float64(g.readOps), name)
-			ch <- prometheus.MustNewConstMetric(c.diskWriteOps, prometheus.CounterValue, float64(g.writeOps), name)
-		}
-		if g.hasFDs {
-			ch <- prometheus.MustNewConstMetric(c.openFDs, prometheus.GaugeValue, float64(g.openFDs), name)
-			ch <- prometheus.MustNewConstMetric(c.worstFDRatio, prometheus.GaugeValue, g.worstFDRatio, name)
+func (c *ProcessCollector) emitGroup(ch chan<- prometheus.Metric, name string, g *procGroup) {
+	ch <- prometheus.MustNewConstMetric(c.cpuSeconds, prometheus.CounterValue, g.cpuUser+g.cpuSystem, name)
+	ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.rss), name, "rss")
+	ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.vms), name, "vms")
+	ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(g.swap), name, "swap")
+	ch <- prometheus.MustNewConstMetric(c.procCount, prometheus.GaugeValue, float64(g.count), name)
+	ch <- prometheus.MustNewConstMetric(c.threads, prometheus.GaugeValue, float64(g.threads), name)
+	ch <- prometheus.MustNewConstMetric(c.majorFaults, prometheus.CounterValue, float64(g.majorFaults), name)
+
+	if g.hasDiskIO {
+		ch <- prometheus.MustNewConstMetric(c.diskReadBytes, prometheus.CounterValue, float64(g.readBytes), name)
+		ch <- prometheus.MustNewConstMetric(c.diskWriteBytes, prometheus.CounterValue, float64(g.writeBytes), name)
+		ch <- prometheus.MustNewConstMetric(c.diskReadOps, prometheus.CounterValue, float64(g.readOps), name)
+		ch <- prometheus.MustNewConstMetric(c.diskWriteOps, prometheus.CounterValue, float64(g.writeOps), name)
+	}
+	if g.hasFDs {
+		ch <- prometheus.MustNewConstMetric(c.openFDs, prometheus.GaugeValue, float64(g.openFDs), name)
+		ch <- prometheus.MustNewConstMetric(c.worstFDRatio, prometheus.GaugeValue, g.worstFDRatio, name)
+	}
+}
+
+// isKernelThread returns true for Linux kernel thread names that are not useful for monitoring.
+func isKernelThread(name string) bool {
+	for _, prefix := range kernelPrefixes {
+		if strings.HasPrefix(name, prefix) {
+			return true
 		}
 	}
+	return false
+}
+
+type namedGroup struct {
+	name  string
+	group *procGroup
+	score float64 // cpuSeconds + rss (bytes as fraction of GB for balanced sorting)
+}
+
+// topGroups returns top N process groups by CPU+RSS score, with the rest merged into ~other.
+func (c *ProcessCollector) topGroups(groups map[string]*procGroup) []namedGroup {
+	all := make([]namedGroup, 0, len(groups))
+	for name, g := range groups {
+		all = append(all, namedGroup{
+			name:  name,
+			group: g,
+			score: (g.cpuUser + g.cpuSystem) + float64(g.rss)/(1<<30), // CPU seconds + RSS in GB
+		})
+	}
+
+	if len(all) <= maxProcessGroups {
+		return all
+	}
+
+	slices.SortFunc(all, func(a, b namedGroup) int { return cmp.Compare(b.score, a.score) })
+
+	top := all[:maxProcessGroups]
+
+	// Aggregate the rest into ~other.
+	other := &procGroup{}
+	for _, entry := range all[maxProcessGroups:] {
+		g := entry.group
+		other.cpuUser += g.cpuUser
+		other.cpuSystem += g.cpuSystem
+		other.rss += g.rss
+		other.vms += g.vms
+		other.swap += g.swap
+		other.readBytes += g.readBytes
+		other.writeBytes += g.writeBytes
+		other.readOps += g.readOps
+		other.writeOps += g.writeOps
+		other.majorFaults += g.majorFaults
+		other.count += g.count
+		other.threads += g.threads
+		other.openFDs += g.openFDs
+		other.hasDiskIO = other.hasDiskIO || g.hasDiskIO
+		other.hasFDs = other.hasFDs || g.hasFDs
+	}
+
+	return append(top, namedGroup{name: "~other", group: other})
 }
 
 // collectProcess accumulates metrics from a single process into its group.
