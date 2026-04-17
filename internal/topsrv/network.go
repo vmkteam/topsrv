@@ -1,6 +1,7 @@
 package topsrv
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -59,7 +60,7 @@ func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
 func (c *NetworkCollector) collectIO(ch chan<- prometheus.Metric) {
 	counters, err := net.IOCounters(true)
 	if err != nil {
-		c.Printf("network: IOCounters failed: %v", err)
+		c.Print(context.Background(), "network: IOCounters failed", "error", err)
 		return
 	}
 	for _, io := range counters {
@@ -77,7 +78,7 @@ func (c *NetworkCollector) collectIO(ch chan<- prometheus.Metric) {
 func (c *NetworkCollector) collectInterfaces(ch chan<- prometheus.Metric) {
 	ifaces, err := net.Interfaces()
 	if err != nil {
-		c.Printf("network: Interfaces failed: %v", err)
+		c.Print(context.Background(), "network: Interfaces failed", "error", err)
 		return
 	}
 	for _, iface := range ifaces {

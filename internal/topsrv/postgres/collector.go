@@ -159,10 +159,10 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	var versionStr string
 	var versionNum int
 	if vErr := pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionStr); vErr != nil {
-		logger.Printf("postgres: failed to detect version: %v", vErr)
+		logger.Error(ctx, "postgres: failed to detect version", "error", vErr)
 	} else {
 		versionNum, _ = strconv.Atoi(versionStr)
-		logger.Printf("postgres: connected, version=%d", versionNum)
+		logger.Print(ctx, "postgres: connected", "version", versionNum)
 	}
 
 	// Auto-switch to the largest non-template database for table-level metrics.
@@ -190,7 +190,7 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	hasWalBytes := hasCol("wal_bytes")
 	hasToplevel := hasCol("toplevel")
 	if hasToplevel {
-		logger.Printf("postgres: pg_stat_statements toplevel filter enabled")
+		logger.Print(ctx, "postgres: pg_stat_statements toplevel filter enabled")
 	}
 
 	// Detect archive_mode once at startup. 'on' and 'always' both produce archiver stats.
@@ -199,7 +199,7 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	if err := pool.QueryRow(ctx, "SHOW archive_mode").Scan(&archiveMode); err == nil {
 		archiveEnabled = archiveMode == "on" || archiveMode == "always"
 		if archiveEnabled {
-			logger.Printf("postgres: archive_mode=%s, pg_stat_archiver collection enabled", archiveMode)
+			logger.Print(ctx, "postgres: pg_stat_archiver collection enabled", "archive_mode", archiveMode)
 		}
 	}
 
@@ -250,7 +250,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 	if err := c.pool.Ping(ctx); err != nil {
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 0)
-		c.Errorf("postgres: ping failed: %v", err)
+		c.Error(ctx, "postgres: ping failed", "error", err)
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 1)
@@ -284,13 +284,13 @@ func (c *Collector) Close() error {
 	}
 	if c.pool != nil {
 		c.pool.Close()
-		c.Printf("postgres: connection pool closed")
+		c.Print(context.Background(), "postgres: connection pool closed")
 	}
 	return nil
 }
 
 func (c *Collector) queryWarn(query string, err error) {
-	c.Printf("postgres: query failed: %s: %v", query, err)
+	c.Error(context.Background(), "postgres: query failed", "query", query, "error", err)
 }
 
 // switchToLargestDB reconnects to the largest non-template database if it differs from current.
@@ -304,7 +304,7 @@ func switchToLargestDB(ctx context.Context, logger embedlog.Logger, pool *pgxpoo
 		return pool, nil
 	}
 
-	logger.Printf("postgres: largest database is %q, reconnecting (was %q)", largestDB, cfg.ConnConfig.Database)
+	logger.Print(ctx, "postgres: reconnecting to largest database", "largest", largestDB, "previous", cfg.ConnConfig.Database)
 	pool.Close()
 
 	cfg.ConnConfig.Database = largestDB

@@ -1,6 +1,7 @@
 package nginx
 
 import (
+	"context"
 	"crypto/x509"
 	"encoding/pem"
 	"fmt"
@@ -78,7 +79,7 @@ func (c *SSLCollector) refresh() {
 	for _, path := range c.certPaths {
 		cert, err := readCertificate(path)
 		if err != nil {
-			c.Printf("ssl: failed to read %s: %v", path, err)
+			c.Error(context.Background(), "ssl: failed to read certificate", "path", path, "error", err)
 			continue
 		}
 		certs = append(certs, certInfo{
@@ -90,7 +91,7 @@ func (c *SSLCollector) refresh() {
 	}
 	c.cached = certs
 	c.lastRefresh = time.Now()
-	c.Printf("ssl: refreshed %d certificates", len(certs))
+	c.Print(context.Background(), "ssl: refreshed certificates", "count", len(certs))
 }
 
 // readCertificate reads and parses the first certificate from a PEM file.

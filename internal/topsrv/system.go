@@ -1,6 +1,7 @@
 package topsrv
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -94,7 +95,7 @@ func (c *SystemCollector) Collect(ch chan<- prometheus.Metric) {
 func (c *SystemCollector) collectCPU(ch chan<- prometheus.Metric) {
 	times, err := cpu.Times(true)
 	if err != nil {
-		c.Printf("system: cpu.Times failed: %v", err)
+		c.Print(context.Background(), "system: cpu.Times failed", "error", err)
 		return
 	}
 	if len(times) == 0 {
@@ -126,7 +127,7 @@ func (c *SystemCollector) collectCPU(ch chan<- prometheus.Metric) {
 func (c *SystemCollector) collectMemory(ch chan<- prometheus.Metric) {
 	v, err := mem.VirtualMemory()
 	if err != nil {
-		c.Printf("system: VirtualMemory failed: %v", err)
+		c.Print(context.Background(), "system: VirtualMemory failed", "error", err)
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.memBytes, prometheus.GaugeValue, float64(v.Total), "total")
@@ -140,7 +141,7 @@ func (c *SystemCollector) collectMemory(ch chan<- prometheus.Metric) {
 func (c *SystemCollector) collectLoad(ch chan<- prometheus.Metric) {
 	l, err := load.Avg()
 	if err != nil {
-		c.Printf("system: load.Avg failed: %v", err)
+		c.Print(context.Background(), "system: load.Avg failed", "error", err)
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.loadAvg, prometheus.GaugeValue, l.Load1, "1m")
@@ -158,7 +159,7 @@ func (c *SystemCollector) collectLoad(ch chan<- prometheus.Metric) {
 func (c *SystemCollector) collectSwap(ch chan<- prometheus.Metric) {
 	s, err := mem.SwapMemory()
 	if err != nil {
-		c.Printf("system: SwapMemory failed: %v", err)
+		c.Print(context.Background(), "system: SwapMemory failed", "error", err)
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.swapBytes, prometheus.GaugeValue, float64(s.Total), "total")

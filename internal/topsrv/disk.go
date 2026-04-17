@@ -1,6 +1,8 @@
 package topsrv
 
 import (
+	"context"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shirou/gopsutil/v4/disk"
 	"github.com/vmkteam/embedlog"
@@ -65,7 +67,7 @@ func (c *DiskCollector) Collect(ch chan<- prometheus.Metric) {
 func (c *DiskCollector) collectIO(ch chan<- prometheus.Metric) {
 	counters, err := disk.IOCounters()
 	if err != nil {
-		c.Printf("disk: IOCounters failed: %v", err)
+		c.Print(context.Background(), "disk: IOCounters failed", "error", err)
 		return
 	}
 	for dev, io := range counters {
@@ -83,7 +85,7 @@ func (c *DiskCollector) collectIO(ch chan<- prometheus.Metric) {
 func (c *DiskCollector) collectFilesystems(ch chan<- prometheus.Metric) {
 	partitions, err := disk.Partitions(false)
 	if err != nil {
-		c.Printf("disk: Partitions failed: %v", err)
+		c.Print(context.Background(), "disk: Partitions failed", "error", err)
 		return
 	}
 	for _, p := range partitions {

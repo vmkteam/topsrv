@@ -75,7 +75,7 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, 
 
 // Run starts the push loop. Blocks until the context is cancelled.
 func (p *Pusher) Run(ctx context.Context) {
-	p.Printf("push: started, endpoint=%s, interval=%s", p.cfg.Endpoint, p.interval)
+	p.Print(ctx, "push: started", "endpoint", p.cfg.Endpoint, "interval", p.interval)
 
 	// Send spooled data first.
 	p.retrySpool(ctx)
@@ -87,7 +87,7 @@ func (p *Pusher) Run(ctx context.Context) {
 		select {
 		case <-ctx.Done():
 			p.Flush()
-			p.Printf("push: stopped")
+			p.Print(ctx, "push: stopped")
 			return
 		case <-ticker.C:
 			p.push(ctx)
@@ -111,15 +111,15 @@ func (p *Pusher) Flush() {
 
 	data, err := p.gather()
 	if err != nil {
-		p.Errorf("push: flush gather failed: %v", err)
+		p.Error(ctx, "push: flush gather failed", "error", err)
 		return
 	}
 
 	if err := p.send(ctx, data); err != nil {
-		p.Printf("push: flush send failed, spooling: %v", err)
-		p.spool(data)
+		p.Print(ctx, "push: flush send failed, spooling", "error", err)
+		p.spool(ctx, data)
 	} else {
-		p.Printf("push: flush ok, size=%d", len(data))
+		p.Print(ctx, "push: flush ok", "size", len(data))
 	}
 }
 
@@ -131,16 +131,16 @@ func (p *Pusher) push(ctx context.Context) {
 	data, err := p.gather()
 	gatherMs := time.Since(start).Milliseconds()
 	if err != nil {
-		p.Errorf("push: gather failed: %v", err)
+		p.Error(ctx, "push: gather failed", "error", err)
 		return
 	}
 
 	if err := p.send(ctx, data); err != nil {
-		p.Errorf("push: send failed: %v", err)
-		p.spool(data)
+		p.Error(ctx, "push: send failed", "error", err)
+		p.spool(ctx, data)
 	} else {
 		totalMs := time.Since(start).Milliseconds()
-		p.Printf("push: ok, size=%d, gatherMs=%d, totalMs=%d", len(data), gatherMs, totalMs)
+		p.Print(ctx, "push: ok", "size", len(data), "gatherMs", gatherMs, "totalMs", totalMs)
 	}
 
 	if len(p.metaProviders) > 0 {
@@ -222,24 +222,24 @@ func (p *Pusher) send(ctx context.Context, data []byte) error {
 }
 
 // spool saves failed payload to disk for later retry.
-func (p *Pusher) spool(data []byte) {
+func (p *Pusher) spool(ctx context.Context, data []byte) {
 	if p.cfg.SpoolDir == "" {
 		return
 	}
 	if err := os.MkdirAll(p.cfg.SpoolDir, 0o750); err != nil {
-		p.Errorf("push: spool mkdir failed: %v", err)
+		p.Error(ctx, "push: spool mkdir failed", "error", err)
 		return
 	}
 
 	name := fmt.Sprintf("%d.gz", time.Now().UnixMilli())
 	path := filepath.Join(p.cfg.SpoolDir, name)
 	if err := os.WriteFile(path, data, 0o640); err != nil {
-		p.Errorf("push: spool write failed: %v", err)
+		p.Error(ctx, "push: spool write failed", "error", err)
 		return
 	}
 
 	files, _ := filepath.Glob(filepath.Join(p.cfg.SpoolDir, "*.gz"))
-	p.Printf("push: spooled %s, pending=%d", name, len(files))
+	p.Print(ctx, "push: spooled", "name", name, "pending", len(files))
 
 	// Trim old files if spool is too large.
 	p.trimSpool()
@@ -271,7 +271,7 @@ func (p *Pusher) retrySpool(ctx context.Context) {
 		sent++
 	}
 	if sent > 0 {
-		p.Printf("push: resent %d spooled payloads", sent)
+		p.Print(ctx, "push: resent spooled payloads", "count", sent)
 	}
 }
 
@@ -325,14 +325,14 @@ func (p *Pusher) sendMeta(ctx context.Context) {
 
 	resp, err := p.client.Do(req)
 	if err != nil {
-		p.Errorf("meta: send failed: %v", err)
+		p.Error(ctx, "meta: send failed", "error", err)
 		return
 	}
 	defer resp.Body.Close()
 	_, _ = io.Copy(io.Discard, resp.Body)
 
 	if resp.StatusCode >= 400 {
-		p.Errorf("meta: HTTP %d", resp.StatusCode)
+		p.Error(ctx, "meta: HTTP error", "status", resp.StatusCode)
 	}
 }
 
