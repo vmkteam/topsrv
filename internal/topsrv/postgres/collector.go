@@ -130,6 +130,15 @@ type Collector struct {
 	// indexes
 	indexScans *prometheus.Desc
 	indexSize  *prometheus.Desc
+	// bloat (ioguix heuristic, refreshed every bloatRefreshInterval)
+	tableBloatSize   *prometheus.Desc
+	tableBloatPct    *prometheus.Desc
+	indexBloatSize   *prometheus.Desc
+	indexBloatPct    *prometheus.Desc
+	bloatMu          sync.RWMutex
+	bloatLastRefresh time.Time
+	bloatTables      []tableBloatEntry
+	bloatIndexes     []indexBloatEntry
 	// settings + stats_reset
 	settingGauge        *prometheus.Desc
 	statsResetGauge     *prometheus.Desc
@@ -303,6 +312,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	c.collectIndexes(ctx, ch)
 	c.collectSettings(ctx, ch)
 	c.collectStatsReset(ctx, ch)
+	c.collectBloat(ctx, ch)
 }
 
 // Close stops the background sampler and closes the connection pool. Implements io.Closer.

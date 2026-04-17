@@ -278,6 +278,36 @@ func TestIntegrationPostgres(t *testing.T) {
 	t.Logf("QueryMeta: %d entries, first db=%s queryid=%s query_len=%d", len(meta), meta[0].Database, meta[0].QueryID, len(meta[0].Query))
 
 	testAppName(t, c, reg)
+	testBloatQueries(t, c)
+}
+
+// testBloatQueries verifies both ioguix heuristic queries execute cleanly against
+// the real Postgres without SQL errors. The testdb seed data is clean (no bloat),
+// so we don't assert on row count — just that the scan doesn't error and the
+// returned rows have sane shape.
+func testBloatQueries(t *testing.T, c *Collector) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	tables, err := c.scanTableBloat(ctx)
+	require.NoError(t, err, "scanTableBloat must not error on real PG")
+	for _, e := range tables {
+		assert.NotEmpty(t, e.schema, "bloat entry missing schema")
+		assert.NotEmpty(t, e.table, "bloat entry missing table")
+		assert.GreaterOrEqual(t, e.size, int64(0))
+	}
+
+	indexes, err := c.scanIndexBloat(ctx)
+	require.NoError(t, err, "scanIndexBloat must not error on real PG")
+	for _, e := range indexes {
+		assert.NotEmpty(t, e.schema)
+		assert.NotEmpty(t, e.table)
+		assert.NotEmpty(t, e.index)
+		assert.GreaterOrEqual(t, e.size, int64(0))
+	}
+
+	t.Logf("bloat: %d tables, %d indexes (clean testdb expected ≈ 0 rows)", len(tables), len(indexes))
 }
 
 // testAppName verifies that application_name from pg_stat_activity is captured in QueryMeta.
