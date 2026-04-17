@@ -15,6 +15,7 @@ Channel  = "stable"      # stable / beta
 # PostgreSQL (optional — auto-discovery detects the process, DSN needed for connection)
 # [Postgres]
 # DSN = "postgres://topsrv:pass@localhost:5432/postgres?sslmode=disable"
+# Disabled = true  # skip PG monitoring even if discovery finds a local postgres process
 
 # Nginx (optional — auto-discovery parses nginx.conf automatically)
 # [Nginx]

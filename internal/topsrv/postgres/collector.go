@@ -39,11 +39,11 @@ type Collector struct {
 
 	// queryid → set of application_names (accumulated from pg_stat_activity samples).
 	// Sampled by a background ticker independent of Prometheus scrape to capture short queries.
-	appNamesMu      sync.RWMutex
-	appNames        map[int64]map[string]bool
-	appNamesAvail   bool // false after first query failure (compute_query_id off)
-	appSampleCancel context.CancelFunc
-	appSampleDone   chan struct{}
+	appNamesMu       sync.RWMutex
+	appNames         map[int64]map[string]bool
+	appSampleLastErr time.Time // rate-limit sampler error logs to 1/minute
+	appSampleCancel  context.CancelFunc
+	appSampleDone    chan struct{}
 
 	// histogram state — cumulative counters for query duration distribution
 	prevStmts   map[string]stmtPrev
@@ -203,6 +203,13 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 		}
 	}
 
+	// Detect pg_stat_activity.query_id column (PG14+). Without it the app-name sampler has nothing to join on.
+	// Probe via pg_attribute so we avoid a real SELECT that could fail for unrelated reasons (permissions etc.).
+	var hasActivityQueryID bool
+	_ = pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+			WHERE c.relname = 'pg_stat_activity' AND a.attname = 'query_id')`).Scan(&hasActivityQueryID)
+
 	c := &Collector{
 		Logger:            logger,
 		pool:              pool,
@@ -213,13 +220,16 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 		hasToplevel:       hasToplevel,
 		archiveEnabled:    archiveEnabled,
 		appNames:          make(map[int64]map[string]bool),
-		appNamesAvail:     true,
 		prevStmts:         make(map[string]stmtPrev),
 		histBuckets:       newHistBuckets(),
 		settingsCache:     map[string]float64{},
 	}
 	c.initDescriptors()
-	c.startAppNamesSampler(1 * time.Second)
+	if hasActivityQueryID {
+		c.startAppNamesSampler(1 * time.Second)
+	} else {
+		logger.Print(ctx, "postgres: app-name sampling disabled", "reason", "pg_stat_activity.query_id not present (PG<14)")
+	}
 	return c, nil
 }
 

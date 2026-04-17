@@ -119,7 +119,8 @@ Channel  = "stable"         # stable / beta
 
 # PostgreSQL (optional — auto-discovery detects the process, DSN needed for connection)
 # [Postgres]
-# DSN = "postgres://topsrv:pass@localhost:5432/postgres?sslmode=disable"
+# DSN      = "postgres://topsrv:pass@localhost:5432/postgres?sslmode=disable"
+# Disabled = true    # set to skip PG monitoring even if discovery finds postgres
 
 # Nginx (optional — auto-discovery parses nginx.conf automatically)
 # [Nginx]
@@ -153,6 +154,7 @@ Channel  = "stable"         # stable / beta
 | `Update.Interval` | `15m` | Update check interval |
 | `Update.Channel` | `stable` | Update channel (stable/beta) |
 | `Postgres.DSN` | — | PostgreSQL connection string |
+| `Postgres.Disabled` | `false` | Skip PostgreSQL monitoring even if discovery finds a local postgres process |
 | `Nginx.StubStatusURL` | — | nginx stub_status URL |
 | `Nginx.LogFormat` | — | nginx log_format string (gonx format) |
 | `Nginx.ExtraLabels` | `[]` | Log fields to add as metric labels |

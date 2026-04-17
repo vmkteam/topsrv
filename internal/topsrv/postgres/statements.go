@@ -290,21 +290,18 @@ func (c *Collector) collectQueryMeta(ctx context.Context, topSet map[string]bool
 }
 
 // sampleAppNames samples pg_stat_activity to accumulate queryid → application_name mapping.
-// PG14+ exposes query_id in pg_stat_activity when compute_query_id is enabled.
+// PG14+ exposes query_id in pg_stat_activity when compute_query_id is enabled (default `auto` when pg_stat_statements is loaded).
+// Errors here are transient (pool disconnects, compute_query_id temporarily off) — log rate-limited and keep retrying.
 func (c *Collector) sampleAppNames(ctx context.Context) {
-	c.appNamesMu.RLock()
-	avail := c.appNamesAvail
-	c.appNamesMu.RUnlock()
-	if !avail {
-		return
-	}
 	rows, err := c.pool.Query(ctx,
 		`SELECT query_id, (string_to_array(application_name, '-'))[1] FROM pg_stat_activity WHERE query_id IS NOT NULL AND query_id != 0 AND application_name != ''`)
 	if err != nil {
 		c.appNamesMu.Lock()
-		c.appNamesAvail = false
+		if time.Since(c.appSampleLastErr) > time.Minute {
+			c.appSampleLastErr = time.Now()
+			c.Error(ctx, "postgres: app name sampling failed (will retry)", "error", err)
+		}
 		c.appNamesMu.Unlock()
-		c.Printf("postgres: pg_stat_activity query_id not available (compute_query_id off?), skipping app name sampling")
 		return
 	}
 	defer rows.Close()

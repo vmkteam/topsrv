@@ -38,7 +38,8 @@ type ServerConfig struct {
 }
 
 type PostgresConfig struct {
-	DSN string
+	DSN      string
+	Disabled bool // skip PostgreSQL monitoring even if discovery finds a local process
 }
 
 // AngieConfig holds Angie-specific monitoring settings.
@@ -239,6 +240,11 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 }
 
 func (a *App) registerPostgres(services []topsrv.Service) {
+	if a.cfg.Postgres != nil && a.cfg.Postgres.Disabled {
+		a.Printf("postgres: disabled by config")
+		return
+	}
+
 	var dsn string
 
 	if a.cfg.Postgres != nil {
