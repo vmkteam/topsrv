@@ -53,9 +53,11 @@ type stmtCurrent struct {
 	database string
 	cur      stmtPrev
 	// deltas (current - previous); negative means reset, skip
-	deltaTime  float64
-	deltaCalls int64
-	deltaBlks  int64 // blksRead delta, for top-N sorting
+	deltaTime        float64
+	deltaCalls       int64
+	deltaBlksRead    int64 // shared_blks_read delta — top by read-heavy
+	deltaBlksDirtied int64 // shared_blks_dirtied delta — top by write-heavy (DML pressure)
+	deltaWalBytes    int64 // wal_bytes delta — top by WAL generation (replication/archive pressure); 0 if wal_bytes unavailable
 }
 
 func newHistBuckets() map[float64]uint64 {
@@ -175,7 +177,9 @@ func (c *Collector) scanStatements(rows interface {
 		if prev, ok := c.prevStmts[sc.key]; ok {
 			sc.deltaCalls = sc.cur.calls - prev.calls
 			sc.deltaTime = sc.cur.totalTime - prev.totalTime
-			sc.deltaBlks = sc.cur.blksRead - prev.blksRead
+			sc.deltaBlksRead = sc.cur.blksRead - prev.blksRead
+			sc.deltaBlksDirtied = sc.cur.blksDirtied - prev.blksDirtied
+			sc.deltaWalBytes = sc.cur.walBytes - prev.walBytes
 
 			if sc.deltaCalls > 0 && sc.deltaTime >= 0 {
 				c.feedHistogram(sc.cur, prev, sc.deltaCalls, sc.deltaTime)
@@ -383,7 +387,7 @@ func (c *Collector) emitStatementMetrics(ch chan<- prometheus.Metric, sc stmtCur
 // selectTopStatements returns a set of keys for the top-N statements by delta time, delta calls, and delta blks_read.
 // On the first scrape (no previous snapshot), falls back to cumulative values.
 func (c *Collector) selectTopStatements(all []stmtCurrent, topN int) map[string]bool {
-	result := make(map[string]bool, topN*3)
+	result := make(map[string]bool, topN*5)
 
 	addTopN := func(lessFunc func(a, b stmtCurrent) int) {
 		sorted := make([]stmtCurrent, len(all))
@@ -396,7 +400,11 @@ func (c *Collector) selectTopStatements(all []stmtCurrent, topN int) map[string]
 
 	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaTime, a.deltaTime) })
 	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaCalls, a.deltaCalls) })
-	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlks, a.deltaBlks) })
+	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlksRead, a.deltaBlksRead) })
+	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlksDirtied, a.deltaBlksDirtied) })
+	if c.hasWalBytes {
+		addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaWalBytes, a.deltaWalBytes) })
+	}
 
 	return result
 }

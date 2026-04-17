@@ -191,7 +191,7 @@ Coverage:
 - **Database sizes** — per-database byte size
 - **Tables** (top 50 by size) — seq/idx scans, tuple ops, dead tuples, autovacuum count, `last_maintenance_timestamp{op=vacuum|analyze}`, `mod_since_analyze` — with `database, schema, table` labels
 - **Indexes** (top 50) — `scans_total`, `size_bytes` — with `database, schema, table, index` labels
-- **pg_stat_statements** — union of top 20 by time, calls, and blocks read (~40–60 unique queries), outlier-aware duration histogram, WAL bytes (optional); full query text pushed separately to control plane (`/v1/meta`)
+- **pg_stat_statements** — union of top 20 by time, calls, blocks read, blocks dirtied (DML pressure), and WAL bytes (PG13+, if available) — ~80–100 unique queries covering both read-heavy and write-heavy workloads; outlier-aware duration histogram; full query text pushed separately to control plane (`/v1/meta`)
 - **Settings** — curated GUCs (`shared_buffers`, `work_mem`, `max_connections` etc.) normalized to bytes/seconds
 - **Stats reset timestamps** — `pg_stat_database`, `pg_stat_bgwriter`, `pg_stat_wal` (PG17), `pg_stat_archiver` — for detecting unexpected resets
 

@@ -112,7 +112,7 @@
 | `topsrv_pg_wraparound_xid_age` | gauge | database | Transaction ID age |
 | `topsrv_pg_wraparound_max_age` | gauge | — | Autovacuum freeze max age |
 | `topsrv_pg_longest_transaction_seconds` | gauge | database, usename | Age of longest running transactions (top 5) |
-| `topsrv_pg_query_time_seconds_total` | counter | queryid, query, database | Total query execution time |
+| `topsrv_pg_query_time_seconds_total` | counter | queryid, query, database | Total query execution time. Union of top-20 by `total_time`, `calls`, `blks_read`, `blks_dirtied`, and `wal_bytes` (PG13+) — covers both read-heavy and write-heavy workloads |
 | `topsrv_pg_query_calls_total` | counter | queryid, query, database | Query call count |
 | `topsrv_pg_query_rows_total` | counter | queryid, query, database | Rows returned by query |
 | `topsrv_pg_query_blks_hit_total` | counter | queryid, query, database | Shared blocks hit |
