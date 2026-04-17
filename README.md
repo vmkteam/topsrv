@@ -255,6 +255,12 @@ GRANT SELECT ON pg_stat_statements TO topsrv;
 
 If `pg_stat_statements` is not installed, topsrv silently skips query metrics — everything else works.
 
+### Behaviour when PG is unreachable
+
+`NewCollector` is lazy — the connection pool is created on first `Collect()`. If PostgreSQL is down at topsrv startup (e.g. systemd boot ordering), `topsrv_pg_up` will report `0` and the non-PG collectors continue working. The next scrape retries the connection automatically; no topsrv restart is needed once PG comes back.
+
+To skip PG monitoring entirely (even when auto-discovery finds a local process), set `Postgres.Disabled = true` in the config.
+
 
 ## Nginx
 
