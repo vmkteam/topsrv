@@ -260,3 +260,12 @@ Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `topsrv_angie_slab_pages` | gauge | zone, state | Slab pages (used/free) |
+
+## Self-monitoring (`topsrv_collector_*`)
+
+Per-collector instrumentation. Any collector registered via `addCollector` is wrapped to record its last scrape duration and recover from panics without breaking `/metrics`.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_collector_scrape_duration_seconds` | gauge | collector | Last scrape duration. Alert: `> 5s` = monitoring is adding overhead to the target |
+| `topsrv_collector_scrape_panics_total` | counter | collector | Panics recovered during Collect. Any non-zero rate = bug, page immediately |
