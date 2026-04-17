@@ -14,6 +14,8 @@ import (
 	"sort"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
 	"github.com/shirou/gopsutil/v4/host"
@@ -47,7 +49,6 @@ type Pusher struct {
 	hostname      string
 	metaProviders []QueryMetaProvider
 	metaEndpoint  string // derived: /v1/write → /v1/meta
-	pushCount     int
 }
 
 func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, registry *prometheus.Registry) *Pusher {
@@ -142,9 +143,7 @@ func (p *Pusher) push(ctx context.Context) {
 		p.Printf("push: ok, size=%d, gatherMs=%d, totalMs=%d", len(data), gatherMs, totalMs)
 	}
 
-	// Push query metadata every 10th cycle (~5 minutes at 30s interval).
-	p.pushCount++
-	if p.pushCount%10 == 0 && len(p.metaProviders) > 0 {
+	if len(p.metaProviders) > 0 {
 		p.sendMeta(ctx)
 	}
 }
@@ -287,7 +286,7 @@ func deriveMetaEndpoint(pushEndpoint string) string {
 }
 
 type metaPayload struct {
-	Queries []QueryMeta `json:"queries"`
+	Queries []postgres.QueryMeta `json:"queries"`
 }
 
 // sendMeta pushes query metadata from all providers to gatesrv.
@@ -296,7 +295,7 @@ func (p *Pusher) sendMeta(ctx context.Context) {
 		return
 	}
 
-	var all []QueryMeta
+	var all []postgres.QueryMeta
 	for _, mp := range p.metaProviders {
 		all = append(all, mp.QueryMeta()...)
 	}

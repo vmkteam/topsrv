@@ -1,6 +1,10 @@
 package topsrv
 
-import "github.com/prometheus/client_golang/prometheus"
+import (
+	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
+
+	"github.com/prometheus/client_golang/prometheus"
+)
 
 // Collector gathers metrics from a single source.
 // Implements prometheus.Collector — metrics are collected on scrape/gather.
@@ -11,7 +15,7 @@ type Collector interface {
 
 // QueryMetaProvider returns query metadata for push to gatesrv.
 type QueryMetaProvider interface {
-	QueryMeta() []QueryMeta
+	QueryMeta() []postgres.QueryMeta
 }
 
 // Service is a discovered service on the host.

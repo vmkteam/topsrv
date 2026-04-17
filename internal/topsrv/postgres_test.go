@@ -9,17 +9,9 @@ import (
 	"github.com/vmkteam/embedlog"
 )
 
-func TestPostgresCollectorDescribe(t *testing.T) {
-	dsn := "postgres://invalid:invalid@localhost:59999/invalid?connect_timeout=1"
-	pg, err := NewPostgresCollector(embedlog.Logger{}, dsn)
-	if err == nil {
-		pg.Close()
-		t.Skip("unexpectedly connected to postgres")
-	}
-	t.Logf("expected error creating collector: %v", err)
-}
-
-func TestPostgresCollectorNoConflicts(t *testing.T) {
+// TestNonPostgresCollectorsNoConflicts verifies that the non-postgres collectors
+// share no metric names and pass Prometheus lint when registered together.
+func TestNonPostgresCollectorsNoConflicts(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	l := embedlog.Logger{}
 	reg.MustRegister(NewSystemCollector(l, "test"))

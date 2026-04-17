@@ -91,14 +91,24 @@
 | `topsrv_pg_buffers_total` | counter | source | Buffers (checkpoint/clean/backend/alloc) |
 | `topsrv_pg_autovacuum_workers` | gauge | type | Autovacuum workers (common/wraparound) |
 | `topsrv_pg_autovacuum_max_workers` | gauge | — | Max autovacuum workers |
-| `topsrv_pg_locks` | gauge | mode | Locks by mode |
+| `topsrv_pg_locks` | gauge | mode, granted | Locks by mode and grant status. `granted="false"` = waiting locks |
+| `topsrv_pg_blocked_backends` | gauge | — | Backends currently waiting on a heavyweight lock |
+| `topsrv_pg_lock_wait_seconds_max` | gauge | — | Longest current lock wait across all backends |
+| `topsrv_pg_wait_events` | gauge | backend_type, datname, application_name, wait_event_type, wait_event, state | ASH-style sample from `pg_stat_activity`. `wait_event_type="CPU"` means on-CPU |
 | `topsrv_pg_replication_lag_bytes` | gauge | client_addr | Replication lag in bytes |
-| `topsrv_pg_replication_lag_seconds` | gauge | client_addr | Replication lag in seconds |
+| `topsrv_pg_replication_lag_seconds` | gauge | client_addr, stage | Replication lag by stage: `write` (network), `flush` (fsync on replica), `replay` (apply). Splits bottleneck |
 | `topsrv_pg_replication_slot_retained_bytes` | gauge | slot | WAL retained by slot |
 | `topsrv_pg_replication_streaming` | gauge | client_addr | Streaming status (0/1) |
+| `topsrv_pg_replication_sync_state` | gauge | client_addr, sync_state | Current sync_state per standby (`async`/`sync`/`potential`/`quorum`). Value = 1 |
 | `topsrv_pg_database_size_bytes` | gauge | database | Database size |
-| `topsrv_pg_wal_bytes` | counter | — | WAL position in bytes |
+| `topsrv_pg_wal_bytes` | counter | — | WAL position in bytes (from `pg_current_wal_lsn`) |
 | `topsrv_pg_wal_files` | gauge | — | WAL file count |
+| `topsrv_pg_wal_records_total` | counter | — | WAL records generated (PG14+, `pg_stat_wal`) |
+| `topsrv_pg_wal_fpi_total` | counter | — | WAL full-page images generated (PG14+) |
+| `topsrv_pg_wal_buffers_full_total` | counter | — | Times WAL was written because `wal_buffers` were full (PG14+) |
+| `topsrv_pg_wal_io_time_seconds_total` | counter | op | WAL I/O time by stage (`write`/`sync`, PG14+) |
+| `topsrv_pg_archiver_total` | counter | result | WAL archiver events by outcome (`archived`/`failed`). Only when `archive_mode=on` |
+| `topsrv_pg_archiver_last_timestamp_seconds` | gauge | result | Unix time of last archiver event. Alert: `time() - metric > 300` |
 | `topsrv_pg_wraparound_xid_age` | gauge | database | Transaction ID age |
 | `topsrv_pg_wraparound_max_age` | gauge | — | Autovacuum freeze max age |
 | `topsrv_pg_longest_transaction_seconds` | gauge | database, usename | Age of longest running transactions (top 5) |
@@ -114,13 +124,19 @@
 | `topsrv_pg_query_temp_blks_written_total` | counter | queryid, query, database | Temp blocks written |
 | `topsrv_pg_query_wal_bytes_total` | counter | queryid, query, database | WAL bytes generated |
 | `topsrv_pg_query_duration_seconds` | histogram | — | Per-query mean execution time distribution |
-| `topsrv_pg_table_size_bytes` | gauge | schema, table | Total table size |
-| `topsrv_pg_table_seq_scan_total` | counter | schema, table | Sequential scans |
-| `topsrv_pg_table_seq_tup_read_total` | counter | schema, table | Sequential tuples read |
-| `topsrv_pg_table_idx_scan_total` | counter | schema, table | Index scans |
-| `topsrv_pg_table_tup_total` | counter | schema, table, op | Tuple operations (insert/update/delete) |
-| `topsrv_pg_table_tuples` | gauge | schema, table, state | Tuples by state (live/dead) |
-| `topsrv_pg_table_autovacuum_count_total` | counter | schema, table | Autovacuum runs per table |
+| `topsrv_pg_table_size_bytes` | gauge | database, schema, table | Total table size |
+| `topsrv_pg_table_seq_scan_total` | counter | database, schema, table | Sequential scans |
+| `topsrv_pg_table_seq_tup_read_total` | counter | database, schema, table | Sequential tuples read |
+| `topsrv_pg_table_idx_scan_total` | counter | database, schema, table | Index scans |
+| `topsrv_pg_table_tup_total` | counter | database, schema, table, op | Tuple operations (insert/update/delete) |
+| `topsrv_pg_table_tuples` | gauge | database, schema, table, state | Tuples by state (live/dead) |
+| `topsrv_pg_table_autovacuum_count_total` | counter | database, schema, table | Autovacuum runs per table |
+| `topsrv_pg_table_last_maintenance_timestamp_seconds` | gauge | database, schema, table, op | Unix time of last VACUUM/ANALYZE (manual or auto). `op="vacuum\|analyze"`. Alert: `time() - metric > 86400` |
+| `topsrv_pg_table_mod_since_analyze` | gauge | database, schema, table | Rows modified since last ANALYZE. Growing value = planner stats getting stale |
+| `topsrv_pg_index_scans_total` | counter | database, schema, table, index | Index scans (pg_stat_user_indexes). `idx_scan=0` over long period = unused index |
+| `topsrv_pg_index_size_bytes` | gauge | database, schema, table, index | Index size in bytes |
+| `topsrv_pg_setting` | gauge | name | Selected GUCs (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem, max_wal_size, min_wal_size, checkpoint_timeout, wal_buffers, random_page_cost). Normalized: memory/WAL in bytes, time in seconds |
+| `topsrv_pg_stats_reset_timestamp_seconds` | gauge | scope | Unix time of last pg_stat_* reset. `scope=database` (oldest across DBs), `bgwriter`, `wal` (PG17+), `archiver` (if `archive_mode=on`) |
 
 ## Nginx (`topsrv_nginx_*`)
 

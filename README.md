@@ -175,20 +175,27 @@ TOPSRV_CONFIG=/etc/topsrv/topsrv.toml topsrv
 
 ## PostgreSQL
 
-Supports **PG15+** (PG17: `pg_stat_checkpointer`).
+Supports **PG15+** (version-gated features: `pg_stat_wal` PG14+, `pg_stat_statements.toplevel` PG14+, `pg_stat_checkpointer` PG17, `shared_blk_*_time` PG17).
 
-14 SQL queries cover all monitoring needs:
-- Connections (by state, by client_addr, max)
-- Transactions, deadlocks, temp files per database
-- Checkpoints, bgwriter, buffers
-- Autovacuum workers (common vs wraparound)
-- Locks by mode
-- Replication (lag bytes/seconds, slots, streaming status)
-- Database sizes
-- WAL (position, files count via `pg_ls_waldir()`)
-- Wraparound (xid_age vs freeze_max_age)
-- pg_stat_statements — union of top 20 by time, calls, and blocks read (~40-60 unique queries), duration histogram, WAL bytes (optional, skipped if extension absent)
-- Tables — top 50 by size (seq/idx scans, tuple ops, dead tuples, autovacuum count)
+Coverage:
+- **Connections** — by state, by client_addr, by application_name, max
+- **Transactions** — commit/rollback, deadlocks, temp files/bytes per database, longest transaction age
+- **Checkpoints & bgwriter** — timed/requested, checkpoint time, buffers (checkpoint/bgwriter/backend)
+- **Autovacuum** — common vs wraparound workers, max_workers
+- **Locks** — by mode + granted label, `blocked_backends` (via `pg_blocking_pids()`), max lock wait duration
+- **Wait events** — sampled from `pg_stat_activity` (backend_type, datname, application_name, wait_event_type, wait_event, state) — pganalyze/APM-style «why is it slow right now»
+- **Replication** — lag bytes, lag seconds by stage (`write`/`flush`/`replay`), `sync_state`, slots (retained bytes, active/inactive)
+- **WAL** — LSN position, files count via `pg_ls_waldir()`, plus `pg_stat_wal` (records, FPI, `buffers_full`, write/sync time) on PG14+
+- **Archiver** — `pg_stat_archiver` with `result=archived|failed`, timestamp pattern (`time() - last_timestamp_seconds` for age)
+- **Wraparound** — `xid_age` vs `autovacuum_freeze_max_age`, per-database + cluster max
+- **Database sizes** — per-database byte size
+- **Tables** (top 50 by size) — seq/idx scans, tuple ops, dead tuples, autovacuum count, `last_maintenance_timestamp{op=vacuum|analyze}`, `mod_since_analyze` — with `database, schema, table` labels
+- **Indexes** (top 50) — `scans_total`, `size_bytes` — with `database, schema, table, index` labels
+- **pg_stat_statements** — union of top 20 by time, calls, and blocks read (~40–60 unique queries), outlier-aware duration histogram, WAL bytes (optional); full query text pushed separately to control plane (`/v1/meta`)
+- **Settings** — curated GUCs (`shared_buffers`, `work_mem`, `max_connections` etc.) normalized to bytes/seconds
+- **Stats reset timestamps** — `pg_stat_database`, `pg_stat_bgwriter`, `pg_stat_wal` (PG17), `pg_stat_archiver` — for detecting unexpected resets
+
+topsrv connects with `application_name=topsrv` (visible in `pg_stat_activity`) and selects the largest database on startup for per-DB views (`pg_stat_user_tables`/`pg_stat_user_indexes`).
 
 ### Setup
 

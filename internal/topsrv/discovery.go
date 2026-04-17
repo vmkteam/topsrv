@@ -3,14 +3,18 @@ package topsrv
 import (
 	"context"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
+
 	"github.com/shirou/gopsutil/v4/process"
 	"github.com/vmkteam/embedlog"
 )
 
+const servicePostgreSQL = "postgresql"
+
 // serviceNames maps process names to service types.
 var serviceNames = map[string]string{
-	"postgres":     "postgresql",
-	"postmaster":   "postgresql",
+	"postgres":     servicePostgreSQL,
+	"postmaster":   servicePostgreSQL,
 	"nginx":        "nginx",
 	"angie":        "angie",
 	"redis-server": "redis",
@@ -20,11 +24,11 @@ var serviceNames = map[string]string{
 
 // defaultInstances maps service types to default listen addresses.
 var defaultInstances = map[string]string{
-	"postgresql": "127.0.0.1:5432",
-	"nginx":      "127.0.0.1:80",
-	"angie":      "127.0.0.1:80",
-	"redis":      "127.0.0.1:6379",
-	"pgbouncer":  "127.0.0.1:6432",
+	servicePostgreSQL: "127.0.0.1:5432",
+	"nginx":           "127.0.0.1:80",
+	"angie":           "127.0.0.1:80",
+	"redis":           "127.0.0.1:6379",
+	"pgbouncer":       "127.0.0.1:6432",
 }
 
 // Discover scans processes and detects running services.
@@ -61,8 +65,8 @@ func Discover(ctx context.Context, logger embedlog.Logger) []Service {
 		}
 
 		// Override default port from postgresql.conf if available.
-		if svcType == "postgresql" && svc.ConfigPath != "" {
-			svc.Instance = updatePostgresInstance(svc.Instance, svc.ConfigPath)
+		if svcType == servicePostgreSQL && svc.ConfigPath != "" {
+			svc.Instance = postgres.UpdateInstance(svc.Instance, svc.ConfigPath)
 		}
 
 		services = append(services, svc)

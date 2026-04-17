@@ -14,6 +14,7 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv"
 	"github.com/vmkteam/topsrv/internal/topsrv/angie"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
+	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
 	"github.com/vmkteam/topsrv/internal/topsrv/smart"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -249,11 +250,11 @@ func (a *App) registerPostgres(services []topsrv.Service) {
 			a.Printf("postgres: not found")
 			return
 		}
-		dsn = topsrv.BuildDSN(svc.Instance, a.cfg.Push.Token)
+		dsn = postgres.BuildDSN(svc.Instance, a.cfg.Push.Token)
 		a.Printf("postgres: found at %s, trying auto-connect", svc.Instance)
 	}
 
-	pg, err := topsrv.NewPostgresCollector(a.Logger, dsn)
+	pg, err := postgres.NewCollector(a.Logger, dsn)
 	if err != nil {
 		a.Printf("postgres: failed to connect: %v", err)
 		return

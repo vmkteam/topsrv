@@ -1,4 +1,4 @@
-package topsrv
+package postgres
 
 import (
 	"crypto/sha256"
@@ -75,8 +75,9 @@ func parsePostgresPort(configPath string) int {
 	return port
 }
 
-// updatePostgresInstance replaces the port in instance string if configPath provides a non-default port.
-func updatePostgresInstance(instance, configPath string) string {
+// UpdateInstance replaces the port in instance string if configPath provides a non-default port.
+// Used by discovery when PostgreSQL is configured to listen on a non-default port.
+func UpdateInstance(instance, configPath string) string {
 	if configPath == "" {
 		return instance
 	}
