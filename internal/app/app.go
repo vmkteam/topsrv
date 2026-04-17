@@ -66,26 +66,38 @@ type NginxConfig struct {
 type App struct {
 	embedlog.Logger
 
-	appName    string
-	version    string
-	cfg        Config
-	srv        *http.Server
-	registry   *prometheus.Registry
-	pusher     *topsrv.Pusher
-	closers    []io.Closer
-	statusBody []byte
+	appName        string
+	version        string
+	cfg            Config
+	srv            *http.Server
+	registry       *prometheus.Registry
+	pusher         *topsrv.Pusher
+	closers        []io.Closer
+	statusBody     []byte
+	scrapeDuration *prometheus.GaugeVec
+	scrapePanics   *prometheus.CounterVec
 }
 
 func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 	body, _ := json.Marshal(map[string]string{"status": "ok", "app": appName, "version": version})
-	return &App{
+	a := &App{
 		Logger:     logger,
 		appName:    appName,
 		version:    version,
 		cfg:        cfg,
 		registry:   prometheus.NewRegistry(),
 		statusBody: body,
+		scrapeDuration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "topsrv_collector_scrape_duration_seconds",
+			Help: "Last scrape duration in seconds, by collector. Use to spot slow collectors adding overhead.",
+		}, []string{"collector"}),
+		scrapePanics: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "topsrv_collector_scrape_panics_total",
+			Help: "Number of panics recovered during Collect() calls, by collector. Any non-zero rate means a bug.",
+		}, []string{"collector"}),
 	}
+	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics)
+	return a
 }
 
 // Run starts the HTTP server and push loop.
@@ -96,6 +108,8 @@ func (a *App) Run(ctx context.Context) error {
 
 	if a.cfg.Push.Endpoint != "" {
 		a.pusher = topsrv.NewPusher(a.Logger, a.appName, a.version, a.cfg.Push, a.registry)
+	} else {
+		a.Print(ctx, "push: disabled — set [Push].Endpoint to send metrics to VictoriaMetrics")
 	}
 
 	a.registerCollectors(ctx, services)
@@ -260,9 +274,11 @@ func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
 		a.Print(ctx, "postgres: found, trying auto-connect", "instance", svc.Instance)
 	}
 
+	// NewCollector is lazy — pool is created on first Collect, so a temporarily-unreachable
+	// PG (e.g. boot-time ordering) no longer disables monitoring until restart.
 	pg, err := postgres.NewCollector(a.Logger, dsn)
 	if err != nil {
-		a.Error(ctx, "postgres: failed to connect", "error", err)
+		a.Error(ctx, "postgres: invalid DSN", "error", err)
 		return
 	}
 
@@ -426,6 +442,37 @@ func findService(services []topsrv.Service, types ...string) *topsrv.Service {
 }
 
 func (a *App) addCollector(c topsrv.Collector) {
-	a.registry.MustRegister(c)
+	a.registry.MustRegister(&instrumentedCollector{
+		inner:    c,
+		logger:   a.Logger,
+		duration: a.scrapeDuration.WithLabelValues(c.Name()),
+		panics:   a.scrapePanics.WithLabelValues(c.Name()),
+	})
 	a.Print(context.Background(), "collector registered", "name", c.Name())
+}
+
+// instrumentedCollector wraps a topsrv.Collector to record its scrape duration
+// and recover from panics. Panics are logged and counted but not re-raised, so
+// a bug in one collector can't break the whole /metrics response.
+type instrumentedCollector struct {
+	inner    topsrv.Collector
+	logger   embedlog.Logger
+	duration prometheus.Gauge
+	panics   prometheus.Counter
+}
+
+func (ic *instrumentedCollector) Describe(ch chan<- *prometheus.Desc) {
+	ic.inner.Describe(ch)
+}
+
+func (ic *instrumentedCollector) Collect(ch chan<- prometheus.Metric) {
+	start := time.Now()
+	defer func() {
+		ic.duration.Set(time.Since(start).Seconds())
+		if r := recover(); r != nil {
+			ic.panics.Inc()
+			ic.logger.Error(context.Background(), "collector panic recovered", "collector", ic.inner.Name(), "panic", r)
+		}
+	}()
+	ic.inner.Collect(ch)
 }
