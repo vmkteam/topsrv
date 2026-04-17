@@ -38,7 +38,8 @@ type ServerConfig struct {
 }
 
 type PostgresConfig struct {
-	DSN string
+	DSN      string
+	Disabled bool // skip PostgreSQL monitoring even if discovery finds a local process
 }
 
 // AngieConfig holds Angie-specific monitoring settings.
@@ -65,36 +66,50 @@ type NginxConfig struct {
 type App struct {
 	embedlog.Logger
 
-	appName    string
-	version    string
-	cfg        Config
-	srv        *http.Server
-	registry   *prometheus.Registry
-	pusher     *topsrv.Pusher
-	closers    []io.Closer
-	statusBody []byte
+	appName        string
+	version        string
+	cfg            Config
+	srv            *http.Server
+	registry       *prometheus.Registry
+	pusher         *topsrv.Pusher
+	closers        []io.Closer
+	statusBody     []byte
+	scrapeDuration *prometheus.GaugeVec
+	scrapePanics   *prometheus.CounterVec
 }
 
 func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 	body, _ := json.Marshal(map[string]string{"status": "ok", "app": appName, "version": version})
-	return &App{
+	a := &App{
 		Logger:     logger,
 		appName:    appName,
 		version:    version,
 		cfg:        cfg,
 		registry:   prometheus.NewRegistry(),
 		statusBody: body,
+		scrapeDuration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
+			Name: "topsrv_collector_scrape_duration_seconds",
+			Help: "Last scrape duration in seconds, by collector. Use to spot slow collectors adding overhead.",
+		}, []string{"collector"}),
+		scrapePanics: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "topsrv_collector_scrape_panics_total",
+			Help: "Number of panics recovered during Collect() calls, by collector. Any non-zero rate means a bug.",
+		}, []string{"collector"}),
 	}
+	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics)
+	return a
 }
 
 // Run starts the HTTP server and push loop.
 func (a *App) Run(ctx context.Context) error {
-	a.Printf("starting %s %s", a.appName, a.version)
+	a.Print(ctx, "starting", "app", a.appName, "version", a.version)
 
 	services := topsrv.Discover(ctx, a.Logger)
 
 	if a.cfg.Push.Endpoint != "" {
 		a.pusher = topsrv.NewPusher(a.Logger, a.appName, a.version, a.cfg.Push, a.registry)
+	} else {
+		a.Print(ctx, "push: disabled — set [Push].Endpoint to send metrics to VictoriaMetrics")
 	}
 
 	a.registerCollectors(ctx, services)
@@ -125,7 +140,7 @@ func (a *App) Run(ctx context.Context) error {
 	}
 
 	// Push-only mode: block until context is cancelled.
-	a.Printf("push-only mode (no HTTP server)")
+	a.Print(ctx, "push-only mode (no HTTP server)")
 	<-ctx.Done()
 	return nil
 }
@@ -135,7 +150,7 @@ func (a *App) Shutdown() {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		if err := a.srv.Shutdown(ctx); err != nil {
-			a.Printf("http shutdown error: %v", err)
+			a.Error(ctx, "http shutdown error", "error", err)
 		}
 	}
 	for _, c := range a.closers {
@@ -150,7 +165,7 @@ func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
 
 func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service) {
 	for _, svc := range services {
-		a.Printf("discovered %s at %s", svc.Type, svc.Instance)
+		a.Print(ctx, "discovered service", "type", svc.Type, "instance", svc.Instance)
 	}
 
 	// System collectors — always enabled.
@@ -161,7 +176,7 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 	a.addCollector(topsrv.NewProcessCollector(a.Logger))
 
 	// PostgreSQL — config takes precedence over discovery.
-	a.registerPostgres(services)
+	a.registerPostgres(ctx, services)
 
 	// Angie — config or auto-discover from angie.conf.
 	// Nginx — config or auto-discover from nginx.conf.
@@ -178,11 +193,11 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 }
 
 // discoverAccessLogs extracts access logs with $request_time from a DiscoverResult and returns a LogConfig.
-func (a *App) discoverAccessLogs(label string, discovered *nginx.DiscoverResult) nginx.LogConfig {
+func (a *App) discoverAccessLogs(ctx context.Context, label string, discovered *nginx.DiscoverResult) nginx.LogConfig {
 	for name, format := range discovered.LogFormats {
 		hasTiming := strings.Contains(format, "$request_time") || strings.Contains(format, "request_time")
 		isJSON := discovered.JSONFormats[name]
-		a.Printf("%s: log_format %q (timing=%v, json=%v)", label, name, hasTiming, isJSON)
+		a.Print(ctx, "log_format detected", "label", label, "name", name, "timing", hasTiming, "json", isJSON)
 	}
 
 	cfg := nginx.LogConfig{
@@ -238,7 +253,12 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	go logC.RunPaths(ctx, cfg.LogPaths)
 }
 
-func (a *App) registerPostgres(services []topsrv.Service) {
+func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
+	if a.cfg.Postgres != nil && a.cfg.Postgres.Disabled {
+		a.Print(ctx, "postgres: disabled by config")
+		return
+	}
+
 	var dsn string
 
 	if a.cfg.Postgres != nil {
@@ -247,16 +267,18 @@ func (a *App) registerPostgres(services []topsrv.Service) {
 		// Auto-discovery: build DSN from discovered instance + Push token.
 		svc := findService(services, "postgresql")
 		if svc == nil {
-			a.Printf("postgres: not found")
+			a.Print(ctx, "postgres: not found")
 			return
 		}
 		dsn = postgres.BuildDSN(svc.Instance, a.cfg.Push.Token)
-		a.Printf("postgres: found at %s, trying auto-connect", svc.Instance)
+		a.Print(ctx, "postgres: found, trying auto-connect", "instance", svc.Instance)
 	}
 
+	// NewCollector is lazy — pool is created on first Collect, so a temporarily-unreachable
+	// PG (e.g. boot-time ordering) no longer disables monitoring until restart.
 	pg, err := postgres.NewCollector(a.Logger, dsn)
 	if err != nil {
-		a.Printf("postgres: failed to connect: %v", err)
+		a.Error(ctx, "postgres: invalid DSN", "error", err)
 		return
 	}
 
@@ -291,17 +313,17 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 			return
 		}
 		if svc.ConfigPath == "" {
-			a.Printf("nginx: found but no config path — add [Nginx] section to config")
+			a.Print(ctx, "nginx: found but no config path — add [Nginx] section to config")
 			return
 		}
 
 		discovered, err := nginx.DiscoverConfig(svc.ConfigPath)
 		if err != nil {
-			a.Printf("nginx: failed to parse %s: %v", svc.ConfigPath, err)
+			a.Error(ctx, "nginx: failed to parse config", "path", svc.ConfigPath, "error", err)
 			return
 		}
 
-		logCfg := a.discoverAccessLogs("nginx", discovered)
+		logCfg := a.discoverAccessLogs(ctx, "nginx", discovered)
 
 		// Preserve ExtraLabels from config when auto-discovering logs.
 		if ngxCfg != nil {
@@ -314,15 +336,15 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 
 		if discovered.StubStatusPath != "" {
 			ngxCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
-			a.Printf("nginx: auto-detected stub_status at %s", ngxCfg.StubStatusURL)
+			a.Print(ctx, "nginx: auto-detected stub_status", "url", ngxCfg.StubStatusURL)
 		}
 
 		if len(discovered.SSLCertificates) > 0 {
 			a.addCollector(nginx.NewSSLCollector(a.Logger, discovered.SSLCertificates))
-			a.Printf("nginx: monitoring %d SSL certificates", len(discovered.SSLCertificates))
+			a.Print(ctx, "nginx: monitoring SSL certificates", "count", len(discovered.SSLCertificates))
 		}
 
-		a.Printf("nginx: auto-discovered %d access logs with timing from %s", len(ngxCfg.AccessLogs), svc.ConfigPath)
+		a.Print(ctx, "nginx: auto-discovered access logs", "count", len(ngxCfg.AccessLogs), "config", svc.ConfigPath)
 	} else {
 		ngxCfg.logCfg = nginx.LogConfig{
 			LogPaths:    ngxCfg.AccessLogs,
@@ -349,17 +371,17 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 			return
 		}
 		if svc.ConfigPath == "" {
-			a.Printf("angie: found but no config path — add [Angie] section to config")
+			a.Print(ctx, "angie: found but no config path — add [Angie] section to config")
 			return
 		}
 
 		discovered, err := nginx.DiscoverConfig(svc.ConfigPath)
 		if err != nil {
-			a.Printf("angie: failed to parse %s: %v", svc.ConfigPath, err)
+			a.Error(ctx, "angie: failed to parse config", "path", svc.ConfigPath, "error", err)
 			return
 		}
 
-		logCfg := a.discoverAccessLogs("angie", discovered)
+		logCfg := a.discoverAccessLogs(ctx, "angie", discovered)
 
 		// Preserve ExtraLabels and StatusURL from config when auto-discovering logs.
 		var cfgStatusURL, cfgStubStatusURL string
@@ -377,19 +399,19 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 
 		if discovered.APIStatusPath != "" && angieCfg.StatusURL == "" {
 			angieCfg.StatusURL = statusURL(discovered.APIStatusHost, discovered.APIStatusPort, discovered.APIStatusPath)
-			a.Printf("angie: auto-detected API at %s", angieCfg.StatusURL)
+			a.Print(ctx, "angie: auto-detected API", "url", angieCfg.StatusURL)
 		}
 		if discovered.StubStatusPath != "" && angieCfg.StubStatusURL == "" {
 			angieCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
-			a.Printf("angie: auto-detected stub_status at %s", angieCfg.StubStatusURL)
+			a.Print(ctx, "angie: auto-detected stub_status", "url", angieCfg.StubStatusURL)
 		}
 
 		if len(discovered.SSLCertificates) > 0 {
 			a.addCollector(nginx.NewSSLCollector(a.Logger, discovered.SSLCertificates))
-			a.Printf("angie: monitoring %d SSL certificates", len(discovered.SSLCertificates))
+			a.Print(ctx, "angie: monitoring SSL certificates", "count", len(discovered.SSLCertificates))
 		}
 
-		a.Printf("angie: auto-discovered %d access logs with timing from %s", len(angieCfg.AccessLogs), svc.ConfigPath)
+		a.Print(ctx, "angie: auto-discovered access logs", "count", len(angieCfg.AccessLogs), "config", svc.ConfigPath)
 	} else {
 		angieCfg.logCfg = nginx.LogConfig{
 			LogPaths:    angieCfg.AccessLogs,
@@ -420,6 +442,37 @@ func findService(services []topsrv.Service, types ...string) *topsrv.Service {
 }
 
 func (a *App) addCollector(c topsrv.Collector) {
-	a.registry.MustRegister(c)
-	a.Printf("collector %s registered", c.Name())
+	a.registry.MustRegister(&instrumentedCollector{
+		inner:    c,
+		logger:   a.Logger,
+		duration: a.scrapeDuration.WithLabelValues(c.Name()),
+		panics:   a.scrapePanics.WithLabelValues(c.Name()),
+	})
+	a.Print(context.Background(), "collector registered", "name", c.Name())
+}
+
+// instrumentedCollector wraps a topsrv.Collector to record its scrape duration
+// and recover from panics. Panics are logged and counted but not re-raised, so
+// a bug in one collector can't break the whole /metrics response.
+type instrumentedCollector struct {
+	inner    topsrv.Collector
+	logger   embedlog.Logger
+	duration prometheus.Gauge
+	panics   prometheus.Counter
+}
+
+func (ic *instrumentedCollector) Describe(ch chan<- *prometheus.Desc) {
+	ic.inner.Describe(ch)
+}
+
+func (ic *instrumentedCollector) Collect(ch chan<- prometheus.Metric) {
+	start := time.Now()
+	defer func() {
+		ic.duration.Set(time.Since(start).Seconds())
+		if r := recover(); r != nil {
+			ic.panics.Inc()
+			ic.logger.Error(context.Background(), "collector panic recovered", "collector", ic.inner.Name(), "panic", r)
+		}
+	}()
+	ic.inner.Collect(ch)
 }

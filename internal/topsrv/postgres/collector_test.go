@@ -1,11 +1,29 @@
 package postgres
 
 import (
+	"context"
+	"fmt"
+	"net"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/vmkteam/embedlog"
 )
+
+// unreachableDSN returns a DSN pointing at a TCP port that is guaranteed to refuse
+// connections for the duration of the test. We bind a listener on :0 (kernel picks
+// a free port), then close it before handing the port out — any connect attempt
+// hits ECONNREFUSED immediately. Safer than hard-coding a port that might become busy.
+func unreachableDSN(t *testing.T) string {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return fmt.Sprintf("postgres://nobody@127.0.0.1:%d/nothing?sslmode=disable&connect_timeout=1", port)
+}
 
 func TestFeedHistogramOutliers(t *testing.T) {
 	// Simulate: 1000 calls, total 11000ms. 999 at 1ms + 1 at 10s scenario.
@@ -63,12 +81,48 @@ func TestConvertSetting(t *testing.T) {
 	}
 }
 
-func TestCollectorConnectFailure(t *testing.T) {
-	dsn := "postgres://invalid:invalid@localhost:59999/invalid?connect_timeout=1"
+// TestNewCollectorNoNetworkIO verifies the core promise of the lazy init refactor:
+// NewCollector does not attempt to connect to Postgres. A collector created against
+// an unreachable DSN must return successfully so topsrv keeps serving the non-PG
+// collectors; connection errors surface only on Collect().
+func TestNewCollectorNoNetworkIO(t *testing.T) {
+	dsn := unreachableDSN(t)
+	start := time.Now()
 	pg, err := NewCollector(embedlog.Logger{}, dsn)
-	if err == nil {
-		pg.Close()
-		t.Skip("unexpectedly connected to postgres")
-	}
-	t.Logf("expected error creating collector: %v", err)
+	elapsed := time.Since(start)
+
+	require.NoError(t, err, "NewCollector must succeed for any syntactically valid DSN")
+	require.NotNil(t, pg)
+	defer pg.Close()
+
+	assert.Nil(t, pg.pool, "pool must stay nil until first ensureReady")
+	assert.False(t, pg.initDone, "feature detection must not have run")
+	assert.Less(t, elapsed, 500*time.Millisecond, "NewCollector must not do network I/O (observed %s)", elapsed)
+}
+
+func TestNewCollectorInvalidDSN(t *testing.T) {
+	pg, err := NewCollector(embedlog.Logger{}, "not-a-valid-dsn://")
+	require.Error(t, err, "malformed DSN must be rejected synchronously")
+	assert.Nil(t, pg)
+}
+
+// TestEnsureReadyRetryable verifies that a failed ensureReady leaves the collector
+// in a clean state so the next Collect can retry. Without this guarantee topsrv
+// would permanently mark PG down after one transient failure.
+func TestEnsureReadyRetryable(t *testing.T) {
+	pg, err := NewCollector(embedlog.Logger{}, unreachableDSN(t))
+	require.NoError(t, err)
+	defer pg.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+
+	// Two consecutive failures must both return errors without panicking or corrupting state.
+	err1 := pg.ensureReady(ctx)
+	require.Error(t, err1, "first ensureReady must surface the connect/ping error")
+
+	err2 := pg.ensureReady(ctx)
+	require.Error(t, err2, "second ensureReady must also fail — retry is expected, not a permanent disable")
+
+	assert.False(t, pg.initDone, "initDone must stay false after failures so detectFeatures runs on recovery")
 }

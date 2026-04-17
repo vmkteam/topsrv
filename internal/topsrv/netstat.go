@@ -1,6 +1,7 @@
 package topsrv
 
 import (
+	"context"
 	"strconv"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -66,7 +67,7 @@ const tcpStateListen = "LISTEN"
 func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 	conns, err := net.Connections("tcp")
 	if err != nil {
-		c.Printf("netstat: Connections failed: %v", err)
+		c.Print(context.Background(), "netstat: Connections failed", "error", err)
 		return
 	}
 
@@ -107,7 +108,7 @@ func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 func (c *NetstatCollector) collectProtoCounters(ch chan<- prometheus.Metric) {
 	counters, err := net.ProtoCounters([]string{"tcp", "udp", "ip"})
 	if err != nil {
-		c.Printf("netstat: ProtoCounters failed: %v", err)
+		c.Print(context.Background(), "netstat: ProtoCounters failed", "error", err)
 		return
 	}
 	for _, proto := range counters {

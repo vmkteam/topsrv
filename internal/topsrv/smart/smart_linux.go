@@ -3,6 +3,7 @@
 package smart
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -57,8 +58,9 @@ func discoverBlockDevices() []string {
 
 func (c *Collector) scan() {
 	devices := discoverBlockDevices()
+	ctx := context.Background()
 	if len(devices) == 0 {
-		c.Printf("smart: no block devices found")
+		c.Print(ctx, "smart: no block devices found")
 		return
 	}
 
@@ -66,9 +68,9 @@ func (c *Collector) scan() {
 	scanned := 0
 
 	for _, name := range devices {
-		m, err := c.collectFromDevice(name)
+		m, err := c.collectFromDevice(ctx, name)
 		if err != nil {
-			c.Printf("smart: %s: %v", name, err)
+			c.Error(ctx, "smart: device scan failed", "device", name, "error", err)
 			continue
 		}
 		metrics = append(metrics, m...)
@@ -76,7 +78,7 @@ func (c *Collector) scan() {
 	}
 
 	if !c.scanned {
-		c.Printf("smart: scanned %d/%d devices, %d metrics", scanned, len(devices), len(metrics))
+		c.Print(ctx, "smart: initial scan complete", "scanned", scanned, "total", len(devices), "metrics", len(metrics))
 	}
 
 	c.mu.Lock()
@@ -85,7 +87,7 @@ func (c *Collector) scan() {
 	c.mu.Unlock()
 }
 
-func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) {
+func (c *Collector) collectFromDevice(ctx context.Context, name string) ([]prometheus.Metric, error) {
 	dev, err := sm.Open("/dev/" + name)
 	if err != nil {
 		return nil, err
@@ -97,7 +99,7 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 	// Common metrics from generic attributes.
 	ga, gaErr := dev.ReadGenericAttributes()
 	if gaErr != nil && !c.scanned {
-		c.Printf("smart: %s: ReadGenericAttributes: %v", name, gaErr)
+		c.Error(ctx, "smart: ReadGenericAttributes failed", "device", name, "error", gaErr)
 	}
 	if gaErr == nil {
 		if ga.Temperature > 0 {
@@ -115,21 +117,21 @@ func (c *Collector) collectFromDevice(name string) ([]prometheus.Metric, error) 
 	switch d := dev.(type) {
 	case *sm.SataDevice:
 		if !c.scanned {
-			c.Printf("smart: %s: type=sata", name)
+			c.Print(ctx, "smart: detected device", "device", name, "type", "sata")
 		}
 		metrics = append(metrics, c.collectSata(name, d)...)
 	case *sm.NVMeDevice:
 		if !c.scanned {
-			c.Printf("smart: %s: type=nvme", name)
+			c.Print(ctx, "smart: detected device", "device", name, "type", "nvme")
 		}
 		metrics = append(metrics, c.collectNVMe(name, d)...)
 	case *sm.ScsiDevice:
 		if !c.scanned {
-			c.Printf("smart: %s: type=scsi", name)
+			c.Print(ctx, "smart: detected device", "device", name, "type", "scsi")
 		}
 		metrics = append(metrics, c.collectScsi(name, d)...)
 	default:
-		c.Printf("smart: %s: unsupported device type %T, skipping", name, dev)
+		c.Print(ctx, "smart: unsupported device type, skipping", "device", name, "type", dev)
 	}
 
 	return metrics, nil

@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"cmp"
+	"context"
 	"slices"
 	"strings"
 
@@ -75,7 +76,7 @@ func (c *ProcessCollector) Describe(ch chan<- *prometheus.Desc) {
 func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 	procs, err := process.Processes()
 	if err != nil {
-		c.Errorf("process: Processes failed: %v", err)
+		c.Error(context.Background(), "process: Processes failed", "error", err)
 		return
 	}
 

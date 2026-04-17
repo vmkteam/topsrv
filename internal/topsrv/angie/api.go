@@ -169,21 +169,21 @@ func (c *APICollector) Collect(ch chan<- prometheus.Metric) {
 
 	resp, err := c.client.Do(req)
 	if err != nil {
-		c.Errorf("angie: API request failed: %v", err)
+		c.Error(ctx, "angie: API request failed", "error", err)
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 0)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		c.Errorf("angie: API returned status %d", resp.StatusCode)
+		c.Error(ctx, "angie: API returned error status", "status", resp.StatusCode)
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 0)
 		return
 	}
 
 	var status StatusResponse
 	if err := json.NewDecoder(resp.Body).Decode(&status); err != nil {
-		c.Errorf("angie: failed to decode API response: %v", err)
+		c.Error(ctx, "angie: failed to decode API response", "error", err)
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 0)
 		return
 	}

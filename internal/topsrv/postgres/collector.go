@@ -25,13 +25,18 @@ const (
 type Collector struct {
 	embedlog.Logger
 
-	pool              *pgxpool.Pool
-	versionNum        int    // server_version_num, cached
-	database          string // current_database() — scope for per-DB views (pg_stat_user_tables/indexes)
-	statementsTimeCol string // "total_exec_time" (PG13+) or "total_time" (PG12-)
-	hasWalBytes       bool   // pg_stat_statements has wal_bytes column
-	hasToplevel       bool   // pg_stat_statements has toplevel column (PG14+)
-	archiveEnabled    bool   // archive_mode is 'on' or 'always'
+	cfg                *pgxpool.Config // saved for lazy pool creation on first Collect
+	initMu             sync.Mutex      // guards lazy pool creation + one-shot feature detection
+	initDone           bool            // feature detection done (version, pg_stat_statements, archive_mode, ...); gates sampler start too
+	ensureReadyLastErr time.Time       // rate-limit ensureReady error logs to 1/minute
+	pool               *pgxpool.Pool   // nil until first successful ensureReady
+	versionNum         int             // server_version_num, cached
+	database           string          // current_database() — scope for per-DB views (pg_stat_user_tables/indexes)
+	statementsTimeCol  string          // "total_exec_time" (PG13+) or "total_time" (PG12-)
+	hasWalBytes        bool            // pg_stat_statements has wal_bytes column
+	hasToplevel        bool            // pg_stat_statements has toplevel column (PG14+)
+	archiveEnabled     bool            // archive_mode is 'on' or 'always'
+	hasActivityQID     bool            // pg_stat_activity.query_id column present (PG14+)
 
 	// query metadata for push to gatesrv (full query texts + database names)
 	queryMetaMu sync.RWMutex
@@ -39,11 +44,11 @@ type Collector struct {
 
 	// queryid → set of application_names (accumulated from pg_stat_activity samples).
 	// Sampled by a background ticker independent of Prometheus scrape to capture short queries.
-	appNamesMu      sync.RWMutex
-	appNames        map[int64]map[string]bool
-	appNamesAvail   bool // false after first query failure (compute_query_id off)
-	appSampleCancel context.CancelFunc
-	appSampleDone   chan struct{}
+	appNamesMu       sync.RWMutex
+	appNames         map[int64]map[string]bool
+	appSampleLastErr time.Time // rate-limit sampler error logs to 1/minute
+	appSampleCancel  context.CancelFunc
+	appSampleDone    chan struct{}
 
 	// histogram state — cumulative counters for query duration distribution
 	prevStmts   map[string]stmtPrev
@@ -133,7 +138,11 @@ type Collector struct {
 	settingsLastRefresh time.Time
 }
 
-// NewCollector creates a PostgreSQL metrics collector connected via the given DSN.
+// NewCollector creates a PostgreSQL metrics collector. It never performs network I/O —
+// the connection pool is created lazily on first Collect(). This ensures topsrv stays
+// useful when PG is temporarily unreachable at startup (e.g. boot-time ordering with
+// systemd). Only a malformed DSN causes an error here.
+//
 // Sets application_name=topsrv so DBAs can distinguish monitoring from app traffic.
 func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	cfg, err := pgxpool.ParseConfig(dsn)
@@ -147,80 +156,104 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	}
 	cfg.ConnConfig.RuntimeParams["application_name"] = "topsrv"
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-
-	pool, err := pgxpool.NewWithConfig(ctx, cfg)
-	if err != nil {
-		return nil, fmt.Errorf("connect: %w", err)
-	}
-
-	// Detect PG version (SHOW returns text, not int).
-	var versionStr string
-	var versionNum int
-	if vErr := pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionStr); vErr != nil {
-		logger.Printf("postgres: failed to detect version: %v", vErr)
-	} else {
-		versionNum, _ = strconv.Atoi(versionStr)
-		logger.Printf("postgres: connected, version=%d", versionNum)
-	}
-
-	// Auto-switch to the largest non-template database for table-level metrics.
-	pool, err = switchToLargestDB(ctx, logger, pool, cfg)
-	if err != nil {
-		return nil, err
-	}
-
-	// Resolve current database name for per-DB metric labels.
-	var database string
-	_ = pool.QueryRow(ctx, "SELECT current_database()").Scan(&database)
-
-	// pg_stat_statements: detect columns via pg_attribute (information_schema doesn't show extension views).
-	hasCol := func(col string) bool {
-		var ok int
-		return pool.QueryRow(ctx,
-			"SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'pg_stat_statements' AND a.attname = $1", col).Scan(&ok) == nil
-	}
-
-	statementsTimeCol := "total_exec_time"
-	if !hasCol("total_exec_time") {
-		statementsTimeCol = "total_time"
-	}
-
-	hasWalBytes := hasCol("wal_bytes")
-	hasToplevel := hasCol("toplevel")
-	if hasToplevel {
-		logger.Printf("postgres: pg_stat_statements toplevel filter enabled")
-	}
-
-	// Detect archive_mode once at startup. 'on' and 'always' both produce archiver stats.
-	var archiveMode string
-	archiveEnabled := false
-	if err := pool.QueryRow(ctx, "SHOW archive_mode").Scan(&archiveMode); err == nil {
-		archiveEnabled = archiveMode == "on" || archiveMode == "always"
-		if archiveEnabled {
-			logger.Printf("postgres: archive_mode=%s, pg_stat_archiver collection enabled", archiveMode)
-		}
-	}
-
 	c := &Collector{
 		Logger:            logger,
-		pool:              pool,
-		versionNum:        versionNum,
-		database:          database,
-		statementsTimeCol: statementsTimeCol,
-		hasWalBytes:       hasWalBytes,
-		hasToplevel:       hasToplevel,
-		archiveEnabled:    archiveEnabled,
+		cfg:               cfg,
+		statementsTimeCol: "total_exec_time", // refined by detectFeatures once reachable
 		appNames:          make(map[int64]map[string]bool),
-		appNamesAvail:     true,
 		prevStmts:         make(map[string]stmtPrev),
 		histBuckets:       newHistBuckets(),
 		settingsCache:     map[string]float64{},
 	}
 	c.initDescriptors()
-	c.startAppNamesSampler(1 * time.Second)
 	return c, nil
+}
+
+// ensureReady lazily creates the connection pool and probes server features on first call.
+// Subsequent calls only Ping to detect runtime connection loss; pgxpool reconnects itself.
+// Returns error if the pool cannot be created or the server is unreachable.
+func (c *Collector) ensureReady(ctx context.Context) error {
+	c.initMu.Lock()
+	defer c.initMu.Unlock()
+
+	if c.pool == nil {
+		pool, err := pgxpool.NewWithConfig(ctx, c.cfg)
+		if err != nil {
+			return fmt.Errorf("connect: %w", err)
+		}
+		c.pool = pool
+	}
+
+	if err := c.pool.Ping(ctx); err != nil {
+		return fmt.Errorf("ping: %w", err)
+	}
+
+	if !c.initDone {
+		if err := c.detectFeatures(ctx); err != nil {
+			return fmt.Errorf("detect features: %w", err)
+		}
+		c.initDone = true
+	}
+	return nil
+}
+
+// detectFeatures runs once after the first successful Ping: resolves version,
+// switches to the largest database for per-table metrics, and probes optional
+// columns (pg_stat_statements, pg_stat_activity.query_id, archive_mode).
+func (c *Collector) detectFeatures(ctx context.Context) error {
+	var versionStr string
+	if err := c.pool.QueryRow(ctx, "SHOW server_version_num").Scan(&versionStr); err == nil {
+		c.versionNum, _ = strconv.Atoi(versionStr)
+		c.Print(ctx, "postgres: connected", "version", c.versionNum)
+	} else {
+		c.Error(ctx, "postgres: failed to detect version", "error", err)
+	}
+
+	// Auto-switch to the largest non-template database for table-level metrics.
+	// On failure c.pool is left intact, so retrying detectFeatures is safe.
+	newPool, err := switchToLargestDB(ctx, c.Logger, c.pool, c.cfg)
+	if err != nil {
+		return err
+	}
+	c.pool = newPool
+
+	_ = c.pool.QueryRow(ctx, "SELECT current_database()").Scan(&c.database)
+
+	// pg_stat_statements column probes (extension views aren't in information_schema).
+	hasCol := func(col string) bool {
+		var ok int
+		return c.pool.QueryRow(ctx,
+			"SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'pg_stat_statements' AND a.attname = $1", col).Scan(&ok) == nil
+	}
+	if !hasCol("total_exec_time") {
+		c.statementsTimeCol = "total_time"
+	}
+	c.hasWalBytes = hasCol("wal_bytes")
+	c.hasToplevel = hasCol("toplevel")
+	if c.hasToplevel {
+		c.Print(ctx, "postgres: pg_stat_statements toplevel filter enabled")
+	}
+
+	// archive_mode ('on' and 'always' both produce archiver stats).
+	var archiveMode string
+	if err := c.pool.QueryRow(ctx, "SHOW archive_mode").Scan(&archiveMode); err == nil {
+		c.archiveEnabled = archiveMode == "on" || archiveMode == "always"
+		if c.archiveEnabled {
+			c.Print(ctx, "postgres: pg_stat_archiver collection enabled", "archive_mode", archiveMode)
+		}
+	}
+
+	// pg_stat_activity.query_id (PG14+) — required for the app-name sampler.
+	_ = c.pool.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+			WHERE c.relname = 'pg_stat_activity' AND a.attname = 'query_id')`).Scan(&c.hasActivityQID)
+
+	if c.hasActivityQID {
+		c.startAppNamesSampler(1 * time.Second)
+	} else {
+		c.Print(ctx, "postgres: app-name sampling disabled", "reason", "pg_stat_activity.query_id not present (PG<14)")
+	}
+	return nil
 }
 
 // Name returns a human-readable collector name.
@@ -238,9 +271,15 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	ctx, cancel := context.WithTimeout(context.Background(), collectTimeout)
 	defer cancel()
 
-	if err := c.pool.Ping(ctx); err != nil {
+	if err := c.ensureReady(ctx); err != nil {
 		ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 0)
-		c.Errorf("postgres: ping failed: %v", err)
+		// Rate-limit to 1/min so a down PG doesn't spam the log every scrape.
+		c.initMu.Lock()
+		if time.Since(c.ensureReadyLastErr) > time.Minute {
+			c.ensureReadyLastErr = time.Now()
+			c.Error(ctx, "postgres: not ready", "error", err)
+		}
+		c.initMu.Unlock()
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.up, prometheus.GaugeValue, 1)
@@ -274,17 +313,18 @@ func (c *Collector) Close() error {
 	}
 	if c.pool != nil {
 		c.pool.Close()
-		c.Printf("postgres: connection pool closed")
+		c.Print(context.Background(), "postgres: connection pool closed")
 	}
 	return nil
 }
 
 func (c *Collector) queryWarn(query string, err error) {
-	c.Printf("postgres: query failed: %s: %v", query, err)
+	c.Error(context.Background(), "postgres: query failed", "query", query, "error", err)
 }
 
 // switchToLargestDB reconnects to the largest non-template database if it differs from current.
 // This allows table-level metrics (pg_stat_user_tables) to see application tables.
+// On failure the original pool is returned untouched so the caller can retry on the next scrape.
 func switchToLargestDB(ctx context.Context, logger embedlog.Logger, pool *pgxpool.Pool, cfg *pgxpool.Config) (*pgxpool.Pool, error) {
 	var largestDB string
 	_ = pool.QueryRow(ctx,
@@ -294,13 +334,17 @@ func switchToLargestDB(ctx context.Context, logger embedlog.Logger, pool *pgxpoo
 		return pool, nil
 	}
 
-	logger.Printf("postgres: largest database is %q, reconnecting (was %q)", largestDB, cfg.ConnConfig.Database)
-	pool.Close()
+	logger.Print(ctx, "postgres: reconnecting to largest database", "largest", largestDB, "previous", cfg.ConnConfig.Database)
 
+	// Build the new pool first; only close the old one once the new one is up.
+	// Keeps the collector usable if the reconnect fails (e.g. the target DB was dropped mid-scrape).
+	previousDB := cfg.ConnConfig.Database
 	cfg.ConnConfig.Database = largestDB
 	newPool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
-		return nil, fmt.Errorf("reconnect to %s: %w", largestDB, err)
+		cfg.ConnConfig.Database = previousDB // restore cfg for next retry
+		return pool, fmt.Errorf("reconnect to %s: %w", largestDB, err)
 	}
+	pool.Close()
 	return newPool, nil
 }

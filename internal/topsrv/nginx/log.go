@@ -253,10 +253,10 @@ func (c *LogCollector) tailFile(ctx context.Context, path string, out chan<- log
 		Location:  &tail.SeekInfo{Offset: 0, Whence: 2},
 	})
 	if err != nil {
-		c.Errorf("nginx-log: failed to tail %s: %v", path, err)
+		c.Error(ctx, "nginx-log: failed to tail", "path", path, "error", err)
 		return
 	}
-	c.Printf("nginx-log: tailing started, path=%s", path)
+	c.Print(ctx, "nginx-log: tailing started", "path", path)
 
 	for {
 		select {

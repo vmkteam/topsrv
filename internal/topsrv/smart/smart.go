@@ -109,7 +109,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 // Run starts the background scan loop. Blocks until ctx is cancelled.
 func (c *Collector) Run(ctx context.Context) {
-	c.Printf("smart: started, interval=%s", c.interval)
+	c.Print(ctx, "smart: started", "interval", c.interval)
 
 	c.scan()
 
@@ -119,7 +119,7 @@ func (c *Collector) Run(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
-			c.Printf("smart: stopped")
+			c.Print(ctx, "smart: stopped")
 			return
 		case <-ticker.C:
 			c.scan()
