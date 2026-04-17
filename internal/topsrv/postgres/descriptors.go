@@ -81,6 +81,10 @@ func (c *Collector) initTableIndexDescs() {
 	c.tableModSinceAnz = prometheus.NewDesc("topsrv_pg_table_mod_since_analyze", "Rows modified since last ANALYZE.", []string{"database", "schema", "table"}, nil)
 	c.indexScans = prometheus.NewDesc("topsrv_pg_index_scans_total", "Index scans (pg_stat_user_indexes). idx_scan=0 over long period = unused index.", []string{"database", "schema", "table", "index"}, nil)
 	c.indexSize = prometheus.NewDesc("topsrv_pg_index_size_bytes", "Index size in bytes.", []string{"database", "schema", "table", "index"}, nil)
+	c.tableBloatSize = prometheus.NewDesc("topsrv_pg_table_bloat_size_bytes", "Estimated wasted bytes in table heap (ioguix heuristic). Top 50 by bloat_size. Refreshed every 15 min.", []string{"database", "schema", "table"}, nil)
+	c.tableBloatPct = prometheus.NewDesc("topsrv_pg_table_bloat_pct", "Estimated table bloat percentage (0-100). >30% typically worth pg_repack / CLUSTER.", []string{"database", "schema", "table"}, nil)
+	c.indexBloatSize = prometheus.NewDesc("topsrv_pg_index_bloat_size_bytes", "Estimated wasted bytes in btree index (ioguix heuristic). Top 50 by bloat_size. Refreshed every 15 min.", []string{"database", "schema", "table", "index"}, nil)
+	c.indexBloatPct = prometheus.NewDesc("topsrv_pg_index_bloat_pct", "Estimated index bloat percentage (0-100). >50% worth REINDEX CONCURRENTLY.", []string{"database", "schema", "table", "index"}, nil)
 }
 
 // allDescs returns every descriptor in a deterministic order. Used by Describe.
@@ -108,7 +112,9 @@ func (c *Collector) allDescs() []*prometheus.Desc {
 		c.tableSize, c.tableSeqScan, c.tableSeqRead, c.tableIdxScan,
 		c.tableTup, c.tableTuples, c.tableAutoVacCount,
 		c.tableLastMaint, c.tableModSinceAnz,
+		c.tableBloatSize, c.tableBloatPct,
 		c.indexScans, c.indexSize,
+		c.indexBloatSize, c.indexBloatPct,
 		c.settingGauge, c.statsResetGauge,
 	}
 }

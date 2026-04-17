@@ -135,6 +135,10 @@
 | `topsrv_pg_table_mod_since_analyze` | gauge | database, schema, table | Rows modified since last ANALYZE. Growing value = planner stats getting stale |
 | `topsrv_pg_index_scans_total` | counter | database, schema, table, index | Index scans (pg_stat_user_indexes). `idx_scan=0` over long period = unused index |
 | `topsrv_pg_index_size_bytes` | gauge | database, schema, table, index | Index size in bytes |
+| `topsrv_pg_table_bloat_size_bytes` | gauge | database, schema, table | Estimated wasted bytes in table heap (ioguix heuristic). Top 50 by bloat size. Refreshed every 15 min. `>30%` typically worth `pg_repack` / `CLUSTER` |
+| `topsrv_pg_table_bloat_pct` | gauge | database, schema, table | Estimated table bloat percentage (0–100) |
+| `topsrv_pg_index_bloat_size_bytes` | gauge | database, schema, table, index | Estimated wasted bytes in btree index (ioguix heuristic). Top 50. Refreshed every 15 min |
+| `topsrv_pg_index_bloat_pct` | gauge | database, schema, table, index | Estimated index bloat percentage (0–100). `>50%` worth `REINDEX CONCURRENTLY` |
 | `topsrv_pg_setting` | gauge | name | Selected GUCs (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem, max_wal_size, min_wal_size, checkpoint_timeout, wal_buffers, random_page_cost). Normalized: memory/WAL in bytes, time in seconds |
 | `topsrv_pg_stats_reset_timestamp_seconds` | gauge | scope | Unix time of last pg_stat_* reset. `scope=database` (oldest across DBs), `bgwriter`, `wal` (PG17+), `archiver` (if `archive_mode=on`) |
 

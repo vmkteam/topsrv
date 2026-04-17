@@ -3,7 +3,7 @@ BUILD_DIR = bin
 export GOEXPERIMENT = jsonv2
 export CGO_ENABLED = 0
 
-.PHONY: build run test test-integration fmt lint clean init demo demo-stop
+.PHONY: build run test test-integration test-certs fmt lint clean init demo demo-stop
 
 build:
 	go build -o $(BUILD_DIR)/$(APP_NAME) ./cmd/$(APP_NAME)
@@ -17,7 +17,10 @@ run:
 test:
 	go test ./...
 
-test-integration:
+test-certs:
+	@scripts/gen-test-certs.sh
+
+test-integration: test-certs
 	docker compose -f docker-compose.test.yml up -d --wait
 	go test -tags=integration -count=1 -v ./internal/topsrv/...
 	docker compose -f docker-compose.test.yml down
