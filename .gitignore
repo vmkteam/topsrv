@@ -6,3 +6,4 @@ cfg/local-pg.toml
 .idea/
 .DS_Store
 .playwright-cli/
+testdata/certs/
