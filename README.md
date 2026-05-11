@@ -59,6 +59,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **Angie** | JSON API (server zones, upstreams, SSL, caches, rate limiting, slabs) + access log parsing | — |
 | **S.M.A.R.T.** | Disk health (ATA attributes, NVMe health log, temperature, wear, errors) | smartctl_exporter |
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
+| **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
 
 ## Auto-discovery
 
@@ -141,6 +142,18 @@ Channel  = "stable"         # stable / beta
 # [Smart]
 # Disabled = true    # set to disable
 # Interval = "5m"
+
+# Bot-logs (optional — ships UA-classified bot events to topsrv.io for analytics)
+# [BotLogs]
+# Enabled       = true
+# Token         = ""        # required — issued by topsrv.io per project
+# Endpoint      = ""        # default: [Push].Endpoint with /v1/bot-logs path
+# BatchSize     = 5000      # events per batch
+# BatchInterval = "5s"      # flush interval
+# SpoolDir      = ""        # default: [Push].SpoolDir; a "botlog/" subdir is created inside
+# MaxSpoolMB    = 200       # WAL disk budget
+# UATruncate    = 1024      # truncate user-agent at this length
+# ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
 ```
 
 | Parameter | Default | Description |
@@ -166,6 +179,15 @@ Channel  = "stable"         # stable / beta
 | `Angie.AccessLogs` | `[]` | Paths to access log files |
 | `Smart.Disabled` | `false` | Disable S.M.A.R.T. collector |
 | `Smart.Interval` | `5m` | S.M.A.R.T. polling interval |
+| `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
+| `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
+| `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
+| `BotLogs.BatchSize` | `5000` | Events per batch |
+| `BotLogs.BatchInterval` | `5s` | Flush interval |
+| `BotLogs.SpoolDir` | derived | Parent dir for WAL spool; `botlog/` subdir is created inside. Defaults to `[Push].SpoolDir` |
+| `BotLogs.MaxSpoolMB` | `200` | Disk budget for spool subdir |
+| `BotLogs.UATruncate` | `1024` | Max UA length per event |
+| `BotLogs.ExtraUAPatterns` | `[]` | Local additions to known-bots UA patterns |
 
 ### Environment variables
 
@@ -325,6 +347,47 @@ http {
     }
 }
 ```
+
+## Bot-logs (optional)
+
+When `[BotLogs].Enabled = true`, every parsed nginx access-log line is matched
+against a built-in UA fingerprint table (38 families, 100+ patterns) covering:
+
+- **Search engines** — Googlebot, Bingbot, DuckDuckBot, Applebot, YandexBot
+  (10 subtypes), Mail.RU_Bot, StackRambler, SputnikBot, Baiduspider, Sogou,
+  360Spider, PetalBot, Naver Yeti, Daum
+- **AI / LLM** — GPTBot / OAI-SearchBot / ChatGPT-User, ClaudeBot /
+  Claude-User / Claude-SearchBot, PerplexityBot / Perplexity-User,
+  MistralAI-User, cohere-ai, Amazonbot, Diffbot, AI2Bot, YouBot, Timpibot,
+  Meta-ExternalAgent / Fetcher, Bytespider, TikTokSpider, CCBot
+- **SEO crawlers** — AhrefsBot, SemrushBot (+ subtypes), MJ12bot, DotBot,
+  rogerbot, BLEXBot, DataForSeoBot
+- **Social / messengers** — Twitterbot, LinkedInBot, Pinterestbot, Slackbot,
+  Discordbot, TelegramBot, WhatsApp, vkShare, SkypeUriPreview
+- **Archive** — ia_archiver, archive.org_bot
+
+Matched events become JSON records with `botFamily` / `botName` /
+`serverName` / `remoteAddr` / `uri` / `status` / timing, are batched into
+gzipped ndjson, and POSTed to the topsrv.io `/v1/bot-logs` endpoint. On
+transient send failures the batch lands in `SpoolDir/botlog/` for replay on
+the next interval; permanent rejections (HTTP 4xx, except 408/429) are
+discarded without retry to avoid corrupted batches blocking the queue.
+
+Enabling `[BotLogs]` extends nginx auto-discovery to log_formats *without*
+`$request_time` so bot events from API/auxiliary vhosts flow through too —
+timing histograms are simply skipped per-line for those. Installs without
+`[BotLogs]` keep the original behavior.
+
+**Required log_format variables**: `$http_user_agent`, `$server_name`,
+`$remote_addr`, `$http_referer`. Any user-supplied `[Nginx].ExtraLabels`
+are dropped while bot-logs is enabled (ParsedLine has only four label slots)
+— this is logged on startup. Missing variables surface as empty strings;
+events still ship.
+
+Metrics: `topsrv_botlog_events_total{state=enqueued|sent|spooled|dropped}`,
+`topsrv_botlog_match_total{family}`, `topsrv_botlog_send_errors_total{kind}`,
+`topsrv_botlog_batch_duration_seconds`, `topsrv_botlog_spool_files`,
+`topsrv_botlog_spool_bytes`.
 
 ## Metrics reference
 

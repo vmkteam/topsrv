@@ -65,6 +65,7 @@ type LogCollector struct {
 	parsers       map[string]*gonx.Parser // path → parser (for multi-format)
 	jsonPaths     map[string]bool         // path → true if log is JSON format
 	extraFields   []string                // nginx variable names to use as extra labels
+	logPaths      []string                // captured from LogConfig.LogPaths for Run
 
 	reqDuration      *prometheus.Desc
 	upstreamDuration *prometheus.Desc
@@ -89,6 +90,17 @@ type LogCollector struct {
 	uri4xx       map[statusURI]uint64
 	bytesByURI   map[string]uint64
 	bytesTotal   atomic.Int64
+
+	observers []LogObserver // set-once before Run; iterated lock-free on the parse goroutine
+}
+
+// LogObserver receives parsed log lines after metric accumulation. OnLogLine is
+// invoked synchronously on the tail-parsing goroutine, so implementations must
+// not block, perform I/O, or call back into LogCollector. Pass the ParsedLine
+// through to async storage (channel, ring buffer) and return quickly. The
+// pointer must not be retained past the call or mutated.
+type LogObserver interface {
+	OnLogLine(line *ParsedLine, path string)
 }
 
 type statusURI struct {
@@ -133,6 +145,7 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		parsers:       parsers,
 		jsonPaths:     cfg.JSONPaths,
 		extraFields:   cfg.ExtraLabels,
+		logPaths:      cfg.LogPaths,
 
 		reqDuration:      prometheus.NewDesc("topsrv_nginx_request_duration_seconds", "Nginx request duration histogram.", nil, nil),
 		upstreamDuration: prometheus.NewDesc("topsrv_nginx_upstream_duration_seconds", "Nginx upstream response time histogram.", nil, nil),
@@ -216,8 +229,14 @@ type logLine struct {
 	path string
 }
 
-// RunPaths starts tailing multiple access log files. Blocks until context is cancelled.
-func (c *LogCollector) RunPaths(ctx context.Context, paths []string) {
+// Run tails every access log captured in LogPaths. Blocks until ctx is cancelled.
+func (c *LogCollector) Run(ctx context.Context) {
+	c.runPaths(ctx, c.logPaths)
+}
+
+// runPaths tails the explicit paths instead of the captured LogPaths — exposed
+// only inside the package for tests that synthesize ad-hoc log files.
+func (c *LogCollector) runPaths(ctx context.Context, paths []string) {
 	lines := make(chan logLine, 256)
 
 	for _, p := range paths {
@@ -233,13 +252,13 @@ func (c *LogCollector) RunPaths(ctx context.Context, paths []string) {
 				return
 			}
 			if c.jsonPaths[ll.path] {
-				c.ParseJSONLine(ll.text)
+				c.parseJSONLine(ll.text, ll.path)
 			} else {
 				parser := c.defaultParser
 				if p, ok := c.parsers[ll.path]; ok {
 					parser = p
 				}
-				c.parseLineWith(parser, ll.text)
+				c.parseLineWith(parser, ll.text, ll.path)
 			}
 		}
 	}
@@ -275,53 +294,64 @@ func (c *LogCollector) tailFile(ctx context.Context, path string, out chan<- log
 	}
 }
 
+// AddObserver registers o to receive every parsed line. Must be called before Run;
+// not safe to call concurrently with parsing.
+func (c *LogCollector) AddObserver(o LogObserver) {
+	c.observers = append(c.observers, o)
+}
+
 func (c *LogCollector) parseLine(line string) {
-	c.parseLineWith(c.defaultParser, line)
+	c.parseLineWith(c.defaultParser, line, "")
 }
 
-// parsedLine holds fields extracted from a log line by either text or JSON parser.
-type parsedLine struct {
-	status               string
-	uri                  string // already normalized
-	bodyBytesSent        string
-	requestTime          string
-	upstreamResponseTime string
-	upstreamCacheStatus  string
-	extras               [4]string // extra label values (pre-extracted)
-	nExtras              int
+// ParsedLine holds fields extracted from a log line by either text or JSON parser.
+// Passed by pointer to LogObserver; implementations must not mutate it.
+type ParsedLine struct {
+	Status               string
+	URI                  string // already normalized
+	BodyBytesSent        string
+	RequestTime          string
+	UpstreamResponseTime string
+	UpstreamCacheStatus  string
+	Extras               [4]string // extra label values (pre-extracted)
+	NExtras              int
 }
 
-func (c *LogCollector) parseLineWith(parser *gonx.Parser, line string) {
+func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 	entry, err := parser.ParseString(line)
 	if err != nil {
 		return
 	}
 
-	var p parsedLine
-	p.status, _ = entry.Field("status")
-	p.bodyBytesSent, _ = entry.Field("body_bytes_sent")
-	p.requestTime, _ = entry.Field("request_time")
-	p.upstreamResponseTime, _ = entry.Field("upstream_response_time")
-	p.upstreamCacheStatus, _ = entry.Field("upstream_cache_status")
+	var p ParsedLine
+	p.Status, _ = entry.Field("status")
+	p.BodyBytesSent, _ = entry.Field("body_bytes_sent")
+	p.RequestTime, _ = entry.Field("request_time")
+	p.UpstreamResponseTime, _ = entry.Field("upstream_response_time")
+	p.UpstreamCacheStatus, _ = entry.Field("upstream_cache_status")
 
 	if req, err := entry.Field("request"); err == nil {
-		p.uri = normalizeURI(req)
+		p.URI = normalizeURI(req)
 	} else if u, err := entry.Field("uri"); err == nil {
-		p.uri = normalizePath(u)
+		p.URI = normalizePath(u)
 	}
 
 	for i, f := range c.extraFields {
-		if i >= len(p.extras) {
+		if i >= len(p.Extras) {
 			break
 		}
-		p.extras[i], _ = entry.Field(f)
-		p.nExtras = i + 1
+		p.Extras[i], _ = entry.Field(f)
+		p.NExtras = i + 1
 	}
 
-	c.recordLine(&p)
+	c.finishLine(&p, path)
 }
 
 func (c *LogCollector) ParseJSONLine(line string) {
+	c.parseJSONLine(line, "")
+}
+
+func (c *LogCollector) parseJSONLine(line, path string) {
 	// When extra labels are needed, unmarshal into a generic map once
 	// to get both typed fields and arbitrary extra label values.
 	if len(c.extraFields) > 0 {
@@ -330,23 +360,23 @@ func (c *LogCollector) ParseJSONLine(line string) {
 			return
 		}
 
-		var p parsedLine
-		p.status = m["status"]
-		p.bodyBytesSent = m["body_bytes_sent"]
-		p.requestTime = m["request_time"]
-		p.upstreamResponseTime = m["upstream_response_time"]
-		p.upstreamCacheStatus = m["upstream_cache_status"]
-		p.uri = normalizeRequestURI(m["request_uri"], m["request"])
+		var p ParsedLine
+		p.Status = m["status"]
+		p.BodyBytesSent = m["body_bytes_sent"]
+		p.RequestTime = m["request_time"]
+		p.UpstreamResponseTime = m["upstream_response_time"]
+		p.UpstreamCacheStatus = m["upstream_cache_status"]
+		p.URI = normalizeRequestURI(m["request_uri"], m["request"])
 
 		for i, f := range c.extraFields {
-			if i >= len(p.extras) {
+			if i >= len(p.Extras) {
 				break
 			}
-			p.extras[i] = m[f]
-			p.nExtras = i + 1
+			p.Extras[i] = m[f]
+			p.NExtras = i + 1
 		}
 
-		c.recordLine(&p)
+		c.finishLine(&p, path)
 		return
 	}
 
@@ -355,16 +385,26 @@ func (c *LogCollector) ParseJSONLine(line string) {
 		return
 	}
 
-	p := parsedLine{
-		status:               entry.Status,
-		bodyBytesSent:        entry.BodyBytesSent,
-		requestTime:          entry.RequestTime,
-		upstreamResponseTime: entry.UpstreamResponseTime,
-		upstreamCacheStatus:  entry.UpstreamCacheStatus,
-		uri:                  normalizeRequestURI(entry.RequestURI, entry.Request),
+	p := ParsedLine{
+		Status:               entry.Status,
+		BodyBytesSent:        entry.BodyBytesSent,
+		RequestTime:          entry.RequestTime,
+		UpstreamResponseTime: entry.UpstreamResponseTime,
+		UpstreamCacheStatus:  entry.UpstreamCacheStatus,
+		URI:                  normalizeRequestURI(entry.RequestURI, entry.Request),
 	}
 
-	c.recordLine(&p)
+	c.finishLine(&p, path)
+}
+
+func (c *LogCollector) finishLine(p *ParsedLine, path string) {
+	c.recordLine(p)
+	if len(c.observers) == 0 {
+		return
+	}
+	for _, o := range c.observers {
+		o.OnLogLine(p, path)
+	}
 }
 
 // jsonLogEntry represents a single JSON-formatted nginx access log line.
@@ -393,17 +433,17 @@ func normalizeRequestURI(requestURI, request string) string {
 }
 
 // recordLine updates all metric accumulators from a parsed log line. Must not be called concurrently.
-func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
+func (c *LogCollector) recordLine(p *ParsedLine) { //nolint:gocognit,nestif
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	if status := p.status; status != "" { //nolint:nestif
+	if status := p.Status; status != "" { //nolint:nestif
 		if len(c.extraFields) == 0 {
 			c.statusCounts[status]++
 		} else {
-			key := taggedStatusKey{status: status, n: p.nExtras}
-			for i := range p.nExtras {
-				v := p.extras[i]
+			key := taggedStatusKey{status: status, n: p.NExtras}
+			for i := range p.NExtras {
+				v := p.Extras[i]
 				if v == "-" {
 					v = ""
 				}
@@ -414,7 +454,7 @@ func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
 			}
 		}
 
-		uri := p.uri
+		uri := p.URI
 
 		if strings.HasPrefix(status, "5") && uri != "" {
 			key := statusURI{status, uri}
@@ -430,7 +470,7 @@ func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
 			}
 		}
 
-		if v, err := strconv.ParseInt(p.bodyBytesSent, 10, 64); err == nil {
+		if v, err := strconv.ParseInt(p.BodyBytesSent, 10, 64); err == nil {
 			c.bytesTotal.Add(v)
 			if uri != "" {
 				if _, ok := c.bytesByURI[uri]; ok || len(c.bytesByURI) < maxCardinalityURI {
@@ -440,13 +480,13 @@ func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
 		}
 	}
 
-	if v, err := strconv.ParseFloat(p.requestTime, 64); err == nil {
+	if v, err := strconv.ParseFloat(p.RequestTime, 64); err == nil {
 		c.reqCount++
 		c.reqSum += v
 		c.reqBuckets[bucketIndex(v)]++
 	}
 
-	if s := p.upstreamResponseTime; s != "" {
+	if s := p.UpstreamResponseTime; s != "" {
 		if i := strings.IndexByte(s, ','); i > 0 {
 			s = strings.TrimSpace(s[:i])
 		}
@@ -457,7 +497,7 @@ func (c *LogCollector) recordLine(p *parsedLine) { //nolint:gocognit,nestif
 		}
 	}
 
-	if s := p.upstreamCacheStatus; s != "" && s != "-" {
+	if s := p.UpstreamCacheStatus; s != "" && s != "-" {
 		c.cacheCounts[s]++
 	}
 }
