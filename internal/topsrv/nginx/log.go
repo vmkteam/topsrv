@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json/v2"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -151,24 +152,16 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 	if len(extractFields) == 0 {
 		extractFields = cfg.ExtraLabels
 	}
-	// Cap to the size of ParsedLine.Extras so callers reading positionally
-	// can't index past the array.
 	if maxFields := len(ParsedLine{}.Extras); len(extractFields) > maxFields {
 		extractFields = extractFields[:maxFields]
 	}
 
-	// labelIdx[k] is the position in extractFields where labelFields[k] lives,
-	// or -1 when the operator listed a label that no parser will populate
-	// (defensive — should not happen with a sane config).
+	// labelIdx[k] = position in extractFields, or -1 if the label has no
+	// matching extract entry. Caller is expected to surface mismatches via
+	// LabelIdx()/ExtractFields() — see app.registerLogCollector.
 	labelIdx := make([]int, len(cfg.ExtraLabels))
 	for k, name := range cfg.ExtraLabels {
-		labelIdx[k] = -1
-		for i, f := range extractFields {
-			if f == name {
-				labelIdx[k] = i
-				break
-			}
-		}
+		labelIdx[k] = slices.Index(extractFields, name)
 	}
 
 	// Labels for httpRequests: "status" + low-cardinality extra labels.
@@ -213,13 +206,6 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 }
 
 func (c *LogCollector) Name() string { return "nginx-log" }
-
-// ExtractFields exposes the ordered list of nginx variables that the collector
-// reads into ParsedLine.Extras. Observers (e.g. botlog) need this to resolve
-// positional access at construction time.
-func (c *LogCollector) ExtractFields() []string {
-	return c.extractFields
-}
 
 func (c *LogCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.reqDuration

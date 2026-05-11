@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -81,10 +82,15 @@ type App struct {
 	hostname       string
 	scrapeDuration *prometheus.GaugeVec
 	scrapePanics   *prometheus.CounterVec
+	configWarnings *prometheus.CounterVec
 
 	// Populated by registerLogCollector; tailing starts in Run() after
 	// observers (e.g. botlog) have been attached.
 	logCollector *nginx.LogCollector
+
+	// Built once in registerLogCollector; consumed by registerBotLogs to wire
+	// Observer's positional field-index resolution.
+	extractFields []string
 
 	// Tracks pusher/log collector/smart/updater so Shutdown can wait for
 	// their drain paths before the process exits.
@@ -124,8 +130,12 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 			Name: "topsrv_collector_scrape_panics_total",
 			Help: "Number of panics recovered during Collect() calls, by collector. Any non-zero rate means a bug.",
 		}, []string{"collector"}),
+		configWarnings: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "topsrv_collector_config_warnings_total",
+			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field.",
+		}, []string{"kind"}),
 	}
-	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics)
+	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics, a.configWarnings)
 	return a
 }
 
@@ -326,21 +336,21 @@ var highCardLabelDenylist = []string{
 	"query_string",
 }
 
-// registerLogCollector creates and registers a log collector for the given
-// config. Tailing is not started here — App.Run starts logCollector.Run after
-// observers (botlog) have a chance to attach.
+// registerLogCollector creates and registers a log collector. Tailing is not
+// started here — App.Run starts logCollector.Run after observers attach.
 //
-// BotLogs no longer overwrites operator-supplied ExtraLabels — that mistake
-// promoted four high-cardinality variables to Prometheus labels and cost
-// myshows a dashboard outage on v0.0.22-rc.2. Now BotLogs.RequiredFields()
-// gets merged into ExtractFields (parser reads only) while ExtraLabels
-// (Prometheus labels) stay exactly as the operator configured them.
+// BotLogs.RequiredFields() is merged into ExtractFields (parser reads) when
+// BotLogs is enabled; ExtraLabels (Prometheus labels) is left untouched so
+// observer needs can't inflate label cardinality. Operator-config warnings
+// are logged via Print and tick topsrv_collector_config_warnings_total so the
+// degraded state stays visible in Prometheus, not just startup stdout.
 func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if len(cfg.LogPaths) == 0 {
 		return
 	}
 	if bad := highCardLabels(cfg.ExtraLabels); len(bad) > 0 {
-		a.Error(ctx, "WARN: ExtraLabels contains high-cardinality variables — Prometheus series may explode",
+		a.warnConfig(ctx, "high_card_label",
+			"ExtraLabels contains high-cardinality variables — Prometheus series may explode",
 			"forbidden", bad, "see", "docs/metrics.md")
 	}
 
@@ -348,14 +358,63 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
 		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields())
 		if !logHasUserAgent(cfg) {
-			a.Error(ctx, "WARN: BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
+			a.warnConfig(ctx, "botlog_no_ua_field",
+				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
 				"log_paths", cfg.LogPaths)
 		}
 	}
 
+	if dropped := capExtractFields(&cfg); len(dropped) > 0 {
+		a.warnConfig(ctx, "truncated_extract",
+			"ExtractFields truncated to fit ParsedLine.Extras",
+			"kept", nginx.MaxExtras, "dropped", truncateList(dropped, 16))
+	}
+	if missing := missingFromExtract(cfg.ExtraLabels, cfg.ExtractFields); len(missing) > 0 {
+		a.warnConfig(ctx, "missing_extract",
+			"ExtraLabels references variables missing from ExtractFields — those label values will be empty",
+			"missing", truncateList(missing, 16))
+	}
+
+	a.extractFields = cfg.ExtractFields
 	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
 	a.logCollector = logC
+}
+
+// warnConfig logs the warning and increments the metric for post-hoc visibility.
+// Severity is Print, not Error — embedlog has no Warn level, but encoding
+// severity in the message text fights log-aggregator level filters.
+func (a *App) warnConfig(ctx context.Context, kind, msg string, kv ...any) {
+	a.configWarnings.WithLabelValues(kind).Inc()
+	a.Print(ctx, "WARN: "+msg, kv...)
+}
+
+// capExtractFields trims cfg.ExtractFields to nginx.MaxExtras and returns the
+// dropped tail. The cap matches ParsedLine.Extras' fixed array size.
+func capExtractFields(cfg *nginx.LogConfig) []string {
+	if len(cfg.ExtractFields) <= nginx.MaxExtras {
+		return nil
+	}
+	dropped := append([]string(nil), cfg.ExtractFields[nginx.MaxExtras:]...)
+	cfg.ExtractFields = cfg.ExtractFields[:nginx.MaxExtras]
+	return dropped
+}
+
+func missingFromExtract(labels, extract []string) []string {
+	var missing []string
+	for _, l := range labels {
+		if !slices.Contains(extract, l) {
+			missing = append(missing, l)
+		}
+	}
+	return missing
+}
+
+func truncateList(s []string, n int) []string {
+	if len(s) <= n {
+		return s
+	}
+	return append(append([]string(nil), s[:n]...), "…+more")
 }
 
 func logHasUserAgent(cfg nginx.LogConfig) bool {
@@ -374,11 +433,8 @@ func logHasUserAgent(cfg nginx.LogConfig) bool {
 func highCardLabels(labels []string) []string {
 	var bad []string
 	for _, l := range labels {
-		for _, d := range highCardLabelDenylist {
-			if l == d {
-				bad = append(bad, l)
-				break
-			}
+		if slices.Contains(highCardLabelDenylist, l) {
+			bad = append(bad, l)
 		}
 	}
 	return bad
@@ -460,7 +516,7 @@ func (a *App) registerBotLogs(ctx context.Context) {
 		return
 	}
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
-	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.logCollector.ExtractFields())
+	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.extractFields)
 	a.logCollector.AddObserver(obs)
 	a.goBackground(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)

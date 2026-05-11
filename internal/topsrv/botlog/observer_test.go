@@ -178,7 +178,7 @@ func TestObserver_PluggableThroughLogCollector(t *testing.T) {
 		JSONPaths:     map[string]bool{logPath: true},
 		ExtractFields: RequiredFields(),
 	})
-	obs := NewObserver(p, cfg, "web01", logC.ExtractFields())
+	obs := NewObserver(p, cfg, "web01", RequiredFields())
 	logC.AddObserver(obs)
 
 	logC.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1","request_uri":"/a",` +
@@ -189,9 +189,8 @@ func TestObserver_PluggableThroughLogCollector(t *testing.T) {
 	assert.Len(t, p.queue, 1, "only the GPTBot line should land on the queue")
 }
 
-// Operator labels come first in ExtractFields; Observer must still find UA at
-// its actual position (not assume Extras[0]). Guards against the v0.0.22-rc.2
-// compile-time-idx fragility.
+// Operator labels first in ExtractFields → Observer still finds UA at its
+// actual position, not Extras[0].
 func TestObserver_IndicesResolvedAtRuntime(t *testing.T) {
 	cfg := Config{
 		Enabled: true, Endpoint: "http://x.invalid/", Token: "bl_test", BatchSize: 10,

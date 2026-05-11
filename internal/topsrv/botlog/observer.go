@@ -1,6 +1,7 @@
 package botlog
 
 import (
+	"slices"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
@@ -47,20 +48,11 @@ func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string)
 		hostname:      hostname,
 		uaTruncate:    cfg.UATruncate,
 		extraPatterns: cfg.ExtraUAPatterns,
-		idxUA:         indexOf(extractFields, fieldUserAgent),
-		idxServerName: indexOf(extractFields, fieldServerName),
-		idxRemoteAddr: indexOf(extractFields, fieldRemoteAddr),
-		idxReferer:    indexOf(extractFields, fieldReferer),
+		idxUA:         slices.Index(extractFields, fieldUserAgent),
+		idxServerName: slices.Index(extractFields, fieldServerName),
+		idxRemoteAddr: slices.Index(extractFields, fieldRemoteAddr),
+		idxReferer:    slices.Index(extractFields, fieldReferer),
 	}
-}
-
-func indexOf(fields []string, name string) int {
-	for i, f := range fields {
-		if f == name {
-			return i
-		}
-	}
-	return -1
 }
 
 // OnLogLine satisfies nginx.LogObserver. Matches the UA first to skip Fields

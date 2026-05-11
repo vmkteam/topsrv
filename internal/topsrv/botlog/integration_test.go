@@ -99,7 +99,7 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 		JSONPaths:     map[string]bool{logPath: true},
 		ExtractFields: RequiredFields(),
 	})
-	obs := NewObserver(p, cfg, "smoke-host", logC.ExtractFields())
+	obs := NewObserver(p, cfg, "smoke-host", RequiredFields())
 	logC.AddObserver(obs)
 
 	ctx, cancel := context.WithCancel(context.Background())

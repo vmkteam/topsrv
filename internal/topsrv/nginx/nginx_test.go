@@ -657,9 +657,9 @@ server {
 	assert.Equal(t, 2, nonOff)
 }
 
-// Regression for the myshows v0.0.22-rc.2 incident: ExtractFields being a
-// superset of ExtraLabels must NOT leak the extra-only variables (e.g.
-// http_user_agent that botlog reads) into Prometheus labels.
+// ExtractFields being a superset of ExtraLabels must NOT leak the
+// extra-only variables (e.g. http_user_agent read by botlog) into
+// Prometheus labels.
 func TestExtraLabels_NotInExtractFields_NoBleed(t *testing.T) {
 	format := `$remote_addr [$time_local] "$server_name" "$request" $status $body_bytes_sent "$http_user_agent"`
 	c := NewLogCollector(embedlog.Logger{}, LogConfig{

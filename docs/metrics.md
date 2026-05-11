@@ -300,3 +300,4 @@ Per-collector instrumentation. Any collector registered via `addCollector` is wr
 |--------|------|--------|-------------|
 | `topsrv_collector_scrape_duration_seconds` | gauge | collector | Last scrape duration. Alert: `> 5s` = monitoring is adding overhead to the target |
 | `topsrv_collector_scrape_panics_total` | counter | collector | Panics recovered during Collect. Any non-zero rate = bug, page immediately |
+| `topsrv_collector_config_warnings_total` | counter | kind | Operator-config warnings raised at startup. `kind` ∈ {`high_card_label` (denylisted variable in ExtraLabels), `missing_extract` (ExtraLabels references variable absent from ExtractFields → empty label values), `truncated_extract` (ExtractFields > MaxExtras=8 → tail dropped), `botlog_no_ua_field` (BotLogs enabled but no log_format carries http_user_agent)}. Any non-zero value points at a fixable config — see the matching WARN in stdout/journald for the offending names |

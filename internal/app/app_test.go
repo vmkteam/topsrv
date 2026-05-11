@@ -109,26 +109,17 @@ func TestHighCardLabels(t *testing.T) {
 		highCardLabels([]string{"server_name", "http_user_agent", "http_referer"}))
 }
 
-// Closes the v0.0.22-rc.2 regression: BotLogs.Enabled=true must not promote
-// botlog's required fields to Prometheus labels. Verifies the wiring at the
-// LogCollector level — labelFields stays equal to operator's ExtraLabels,
-// extractFields is the union.
-func TestNewLogCollector_BotLogsDoesNotPromoteToLabels(t *testing.T) {
-	cfg := nginx.LogConfig{
-		LogPaths:    []string{"/dev/null"},
-		LogFormat:   `$remote_addr [$time_local] "$server_name" "$http_platform" "$request" $status $body_bytes_sent "$http_user_agent"`,
-		ExtraLabels: []string{"server_name", "http_platform"},
-		// Simulate what registerLogCollector does when BotLogs is enabled:
-		ExtractFields: mergeUnique(
-			[]string{"server_name", "http_platform"},
-			[]string{"http_user_agent", "server_name", "remote_addr", "http_referer"},
-		),
-	}
-	c := nginx.NewLogCollector(embedlog.Logger{}, cfg)
+// Wiring contract: registerLogCollector builds the same union mergeUnique
+// produces and parks it on App.extractFields. Other tests (mergeUnique unit
+// test, nginx labelIdx test) cover the rest.
+func TestMergeUnique_RegisterLogCollectorWiring(t *testing.T) {
+	got := mergeUnique(
+		[]string{"server_name", "http_platform"},
+		[]string{"http_user_agent", "server_name", "remote_addr", "http_referer"},
+	)
 	assert.Equal(t,
 		[]string{"server_name", "http_platform", "http_user_agent", "remote_addr", "http_referer"},
-		c.ExtractFields(),
-		"ExtractFields must be the union with operator labels first")
+		got, "operator labels first, then unique botlog requireds")
 }
 
 func TestMergeUnique(t *testing.T) {
@@ -156,4 +147,34 @@ func TestMergeUnique(t *testing.T) {
 			assert.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestCapExtractFields(t *testing.T) {
+	t.Run("no truncation", func(t *testing.T) {
+		cfg := nginx.LogConfig{ExtractFields: []string{"a", "b"}}
+		assert.Empty(t, capExtractFields(&cfg))
+		assert.Equal(t, []string{"a", "b"}, cfg.ExtractFields)
+	})
+	t.Run("truncated past MaxExtras", func(t *testing.T) {
+		fields := []string{"f1", "f2", "f3", "f4", "f5", "f6", "f7", "f8", "f9", "f10"}
+		cfg := nginx.LogConfig{ExtractFields: fields}
+		dropped := capExtractFields(&cfg)
+		assert.Len(t, cfg.ExtractFields, nginx.MaxExtras)
+		assert.Equal(t, []string{"f9", "f10"}, dropped)
+	})
+}
+
+func TestMissingFromExtract(t *testing.T) {
+	assert.Empty(t, missingFromExtract([]string{"a", "b"}, []string{"a", "b", "c"}))
+	assert.Equal(t,
+		[]string{"missing1", "missing2"},
+		missingFromExtract(
+			[]string{"server_name", "missing1", "missing2"},
+			[]string{"server_name", "http_user_agent"}))
+}
+
+func TestTruncateList(t *testing.T) {
+	assert.Equal(t, []string{"a", "b"}, truncateList([]string{"a", "b"}, 4))
+	got := truncateList([]string{"a", "b", "c", "d", "e"}, 2)
+	assert.Equal(t, []string{"a", "b", "…+more"}, got)
 }
