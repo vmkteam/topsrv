@@ -308,7 +308,8 @@ func (c *LogCollector) parseLine(line string) {
 // Passed by pointer to LogObserver; implementations must not mutate it.
 type ParsedLine struct {
 	Status               string
-	URI                  string // already normalized
+	URI                  string // path normalized for nginx-metrics cardinality (/:id, /:rest)
+	RawPath              string // un-normalized request path (querystring stripped) — for observers that need the actual URL (e.g. botlog)
 	BodyBytesSent        string
 	RequestTime          string
 	UpstreamResponseTime string
@@ -332,8 +333,10 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 
 	if req, err := entry.Field("request"); err == nil {
 		p.URI = normalizeURI(req)
+		p.RawPath = rawPathFromRequest(req)
 	} else if u, err := entry.Field("uri"); err == nil {
 		p.URI = normalizePath(u)
+		p.RawPath = stripQuery(u)
 	}
 
 	for i, f := range c.extraFields {
@@ -367,6 +370,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		p.UpstreamResponseTime = m["upstream_response_time"]
 		p.UpstreamCacheStatus = m["upstream_cache_status"]
 		p.URI = normalizeRequestURI(m["request_uri"], m["request"])
+		p.RawPath = rawPathFromJSON(m["request_uri"], m["request"])
 
 		for i, f := range c.extraFields {
 			if i >= len(p.Extras) {
@@ -392,6 +396,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		UpstreamResponseTime: entry.UpstreamResponseTime,
 		UpstreamCacheStatus:  entry.UpstreamCacheStatus,
 		URI:                  normalizeRequestURI(entry.RequestURI, entry.Request),
+		RawPath:              rawPathFromJSON(entry.RequestURI, entry.Request),
 	}
 
 	c.finishLine(&p, path)
@@ -430,6 +435,33 @@ func normalizeRequestURI(requestURI, request string) string {
 		return normalizeURI(request)
 	}
 	return ""
+}
+
+// rawPathFromRequest extracts the un-normalized path from "$request" (e.g.
+// "GET /news/12345/title HTTP/1.1") with the querystring stripped. Returns ""
+// if request is malformed.
+func rawPathFromRequest(request string) string {
+	parts := strings.SplitN(request, " ", 3)
+	if len(parts) < 2 {
+		return ""
+	}
+	return stripQuery(parts[1])
+}
+
+// rawPathFromJSON picks request_uri (preferred — already path-only in most
+// log_formats) and falls back to parsing $request. Querystring is stripped.
+func rawPathFromJSON(requestURI, request string) string {
+	if requestURI != "" {
+		return stripQuery(requestURI)
+	}
+	return rawPathFromRequest(request)
+}
+
+func stripQuery(p string) string {
+	if i := strings.IndexByte(p, '?'); i >= 0 {
+		return p[:i]
+	}
+	return p
 }
 
 // recordLine updates all metric accumulators from a parsed log line. Must not be called concurrently.
