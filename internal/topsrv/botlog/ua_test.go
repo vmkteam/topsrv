@@ -147,7 +147,7 @@ func TestMatchUA(t *testing.T) {
 		},
 		{
 			ua:     "Mozilla/5.0 TikTokSpider (+https://www.tiktok.com/robots)",
-			family: "tiktok",
+			family: "bytespider",
 			name:   "tiktokspider",
 		},
 		// Asian.

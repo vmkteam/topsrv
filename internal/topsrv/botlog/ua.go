@@ -153,10 +153,11 @@ var knownBots = []Bot{
 		{"FacebookBot", "facebookbot"},
 	}},
 	{Family: "bytespider", NamesByUA: []UAName{
-		{"Bytespider", "bytespider"},
-	}},
-	{Family: "tiktok", NamesByUA: []UAName{
+		// TikTokSpider shares *.bytedance.com PTR with Bytespider — keep them
+		// under one family so FCrDNS verification on the receiver side stays
+		// consistent and legit TikTok crawls aren't mis-flagged as spoofed.
 		{"TikTokSpider", "tiktokspider"},
+		{"Bytespider", "bytespider"},
 	}},
 	{Family: "common-crawl", NamesByUA: []UAName{
 		{"CCBot", "ccbot"},
