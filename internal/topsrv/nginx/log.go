@@ -114,7 +114,7 @@ type statusURI struct {
 }
 
 // MaxExtras caps the per-line Extras slot count. Sized to fit operator
-// ExtraLabels (typically ≤3) plus botlog's 4 RequiredFields() with room.
+// ExtraLabels (typically ≤3) plus botlog's RequiredFields() with room.
 const MaxExtras = 8
 
 type taggedStatusKey struct {

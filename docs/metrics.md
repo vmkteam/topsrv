@@ -271,6 +271,12 @@ Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in 
 
 Opt-in. Emitted when `[BotLogs].Enabled = true`. The agent matches every parsed nginx access-log line against a built-in UA fingerprint table (38 families) and ships matched events as gzipped ndjson to the topsrv.io `/v1/bot-logs` endpoint, with disk-backed WAL spool for retry on transient send failures.
 
+Event payload notes:
+
+- `host` — the request `$host` header, normalized (lowercased, optional `:port` stripped, bracketed IPv6 preserved). Client-controlled. Use this when grouping by the actual domain the client requested.
+- `serverName` — nginx `$server_name` of the matched virtual host (config-controlled). Use this when grouping by the operator-configured vhost.
+- Both ship side by side; downstream dashboards/joins should pick the one that fits the question.
+
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `topsrv_botlog_events_total` | counter | state, reason | Event lifecycle counts. `state=enqueued` (entered queue), `sent` (acked by ingest), `spooled` (written to WAL after transient failure), `dropped` (`reason` splits cause). For non-dropped states `reason=""`. For `state=dropped` the `reason` label is one of `queue_full` (Enqueue while queue full → raise `BatchSize`), `permanent` (4xx, payload bad), `spool_write` (mkdir/write/missing SpoolDir), `spool_evict` (trim by `MaxSpoolMB` or foreign-owned file). |

@@ -3,6 +3,7 @@ package botlog
 import (
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,11 +18,11 @@ import (
 )
 
 func TestRequiredFieldsContents(t *testing.T) {
-	// RequiredFields contract: the four nginx variables botlog needs read into
+	// RequiredFields contract: nginx variables botlog needs read into
 	// ParsedLine.Extras. Order is no longer load-bearing (Observer resolves
 	// indices at runtime), but the set must stay stable across versions.
 	assert.ElementsMatch(t,
-		[]string{fieldUserAgent, fieldServerName, fieldRemoteAddr, fieldReferer},
+		[]string{fieldUserAgent, fieldHost, fieldServerName, fieldRemoteAddr, fieldReferer},
 		RequiredFields())
 }
 
@@ -35,37 +36,37 @@ func newObserverPair(t *testing.T) (*Observer, *Pusher) {
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
 	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
-	// Default order matches botParsedLine's Extras layout (ua, serverName,
-	// remoteAddr, referer) so existing tests' positional assumptions hold.
+	// Tests use the canonical RequiredFields() order: ua, host, server_name,
+	// remote_addr, referer (see botParsedLine).
 	o := NewObserver(p, cfg, "web01", RequiredFields())
 	return o, p
 }
 
-func botParsedLine(ua, serverName, remoteAddr, referer string) *nginx.ParsedLine {
+func botParsedLine(ua, host, serverName, remoteAddr, referer string) *nginx.ParsedLine {
 	return &nginx.ParsedLine{
 		Status:        "200",
 		URI:           "/api",
 		BodyBytesSent: "1234",
 		RequestTime:   "0.150",
-		Extras:        [nginx.MaxExtras]string{ua, serverName, remoteAddr, referer},
-		NExtras:       4,
+		Extras:        [nginx.MaxExtras]string{ua, host, serverName, remoteAddr, referer},
+		NExtras:       5,
 	}
 }
 
 func TestObserver_EnqueuesBotEvent(t *testing.T) {
 	o, p := newObserverPair(t)
 
-	o.OnLogLine(botParsedLine("Mozilla/5.0 GPTBot/1.0", "api.example.com", "203.0.113.5", "-"), "")
+	o.OnLogLine(botParsedLine("Mozilla/5.0 GPTBot/1.0", "api.example.com", "vhost_cfg", "203.0.113.5", "-"), "")
 
 	assert.InDelta(t, 1, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 	assert.InDelta(t, 1, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
 
-	// Pull the event off the queue and inspect.
 	select {
 	case ev := <-p.queue:
 		assert.Equal(t, "openai", ev.BotFamily)
 		assert.Equal(t, "gptbot", ev.BotName)
-		assert.Equal(t, "api.example.com", ev.ServerName)
+		assert.Equal(t, "api.example.com", ev.Host, "Host carries the request $host header")
+		assert.Equal(t, "vhost_cfg", ev.ServerName, "ServerName carries the matched $server_name")
 		assert.Equal(t, "203.0.113.5", ev.RemoteAddr)
 		assert.Empty(t, ev.Referer, "dash referer dropped")
 		assert.Equal(t, "web01", ev.AgentHostname)
@@ -111,7 +112,7 @@ func TestObserver_FallsBackToURIWhenRawPathEmpty(t *testing.T) {
 func TestObserver_NonBotIgnored(t *testing.T) {
 	o, p := newObserverPair(t)
 
-	o.OnLogLine(botParsedLine("Mozilla/5.0 (Macintosh) Safari/605", "x.example.com", "1.2.3.4", "-"), "")
+	o.OnLogLine(botParsedLine("Mozilla/5.0 (Macintosh) Safari/605", "x.example.com", "", "1.2.3.4", "-"), "")
 
 	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 	assert.InDelta(t, 0, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
@@ -120,7 +121,7 @@ func TestObserver_NonBotIgnored(t *testing.T) {
 func TestObserver_EmptyUAIgnored(t *testing.T) {
 	o, p := newObserverPair(t)
 
-	o.OnLogLine(botParsedLine("", "x.example.com", "1.2.3.4", "-"), "")
+	o.OnLogLine(botParsedLine("", "x.example.com", "", "1.2.3.4", "-"), "")
 
 	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 }
@@ -238,7 +239,56 @@ func TestObserver_MissingFieldsSafe(t *testing.T) {
 	require.Len(t, p.queue, 1)
 	ev := <-p.queue
 	assert.Equal(t, "openai", ev.BotFamily)
+	assert.Empty(t, ev.Host)
 	assert.Empty(t, ev.ServerName)
 	assert.Empty(t, ev.RemoteAddr)
 	assert.Empty(t, ev.Referer)
+}
+
+func TestNormalizeHost(t *testing.T) {
+	cases := []struct {
+		name, in, want string
+	}{
+		{"empty", "", ""},
+		{"lowercase", "Example.COM", "example.com"},
+		{"strip port", "example.com:8080", "example.com"},
+		{"strip port + lowercase", "API.Example.com:443", "api.example.com"},
+		{"no port", "example.com", "example.com"},
+		{"trailing colon — SplitHostPort accepts empty port", "example.com:", "example.com"},
+		{"IPv6 bracketed with port", "[::1]:8080", "::1"},
+		// SplitHostPort needs a port to unwrap brackets; bare bracketed
+		// literals pass through verbatim. Not a design choice — artifact.
+		{"IPv6 bracketed no port", "[2001:db8::1]", "[2001:db8::1]"},
+		{"truncate over maxHostLen", strings.Repeat("a", 300), strings.Repeat("a", 256)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, normalizeHost(tc.in))
+		})
+	}
+}
+
+// Host and ServerName are independent: Host carries the (normalized) request
+// $host, ServerName carries the matched nginx $server_name. Either may be
+// empty if the log_format doesn't include it.
+func TestObserver_HostAndServerNameIndependent(t *testing.T) {
+	o, p := newObserverPair(t)
+	o.OnLogLine(botParsedLine("GPTBot/1.0", "Real.Example.COM:443", "vhost_cfg", "1.2.3.4", "https://prev.example.com/page"), "")
+
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.Equal(t, "real.example.com", ev.Host, "Host = normalizeHost($host)")
+	assert.Equal(t, "vhost_cfg", ev.ServerName, "ServerName = raw $server_name")
+	assert.Equal(t, "https://prev.example.com/page", ev.Referer, "non-dash referer passes through")
+}
+
+// log_format without $host: Event.Host is empty, ServerName still ships.
+func TestObserver_HostMissingShipsEmpty(t *testing.T) {
+	o, p := newObserverPair(t)
+	o.OnLogLine(botParsedLine("GPTBot/1.0", "", "vhost_cfg", "1.2.3.4", "-"), "")
+
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.Empty(t, ev.Host)
+	assert.Equal(t, "vhost_cfg", ev.ServerName)
 }
