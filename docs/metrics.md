@@ -265,6 +265,31 @@ Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in 
 |--------|------|--------|-------------|
 | `topsrv_angie_slab_pages` | gauge | zone, state | Slab pages (used/free) |
 
+## Bot-logs (`topsrv_botlog_*`)
+
+Opt-in. Emitted when `[BotLogs].Enabled = true`. The agent matches every parsed nginx access-log line against a built-in UA fingerprint table (38 families) and ships matched events as gzipped ndjson to the topsrv.io `/v1/bot-logs` endpoint, with disk-backed WAL spool for retry on transient send failures.
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_botlog_events_total` | counter | state, reason | Event lifecycle counts. `state=enqueued` (entered queue), `sent` (acked by ingest), `spooled` (written to WAL after transient failure), `dropped` (`reason` splits cause). For non-dropped states `reason=""`. For `state=dropped` the `reason` label is one of `queue_full` (Enqueue while queue full → raise `BatchSize`), `permanent` (4xx, payload bad), `spool_write` (mkdir/write/missing SpoolDir), `spool_evict` (trim by `MaxSpoolMB` or foreign-owned file). |
+| `topsrv_botlog_match_total` | counter | family | UA matches by family (`google`, `yandex`, `mailru`, `bing`, `openai`, `anthropic`, `ahrefs`, `semrush`, `bytespider`, ...). Use rate to spot crawl bursts per vendor |
+| `topsrv_botlog_send_errors_total` | counter | kind | Failed ingest requests by kind: `connect` (dial/DNS), `timeout` (request timeout), `status` (HTTP ≥ 400) |
+| `topsrv_botlog_batch_duration_seconds` | histogram | — | End-to-end batch flush latency (encode + HTTP send) |
+| `topsrv_botlog_queue_depth` | gauge | — | Events currently buffered in the send queue. Capacity is `BatchSize*2`. |
+| `topsrv_botlog_spool_files` | gauge | — | Pending spool files awaiting retry |
+| `topsrv_botlog_spool_bytes` | gauge | — | Disk bytes used by the spool subdir. Alert when approaching `MaxSpoolMB` |
+
+Alerting guidance:
+- `rate(topsrv_botlog_send_errors_total{kind="connect"}[5m]) > 0` — ingest endpoint unreachable
+- `topsrv_botlog_spool_bytes > 0.8 * MaxSpoolMB * 1048576` — spool filling up, retries failing
+- `topsrv_botlog_queue_depth > 0.7 * (2 * <BatchSize>)` for 5 m — backpressure approaching; raise `BatchSize` or shorten `BatchInterval` before drops start
+- Split the `dropped` alert by `reason` — each maps to a different fix:
+  - `rate(topsrv_botlog_events_total{state="dropped", reason="queue_full"}[5m]) > 0` — agent can't keep up; raise `BatchSize` or shorten `BatchInterval`
+  - `rate(topsrv_botlog_events_total{state="dropped", reason="permanent"}[5m]) > 0` — receiver returning 4xx; inspect payload/auth
+  - `rate(topsrv_botlog_events_total{state="dropped", reason="spool_write"}[5m]) > 0` — `SpoolDir` unwritable or full; check disk and permissions
+  - `rate(topsrv_botlog_events_total{state="dropped", reason="spool_evict"}[5m]) > 0` — WAL budget exceeded; raise `MaxSpoolMB` or investigate why receiver isn't catching up
+- `rate(topsrv_botlog_events_total{state="sent"}[5m]) == 0` while `match_total` grows — pipeline stuck between observer and ingest
+
 ## Self-monitoring (`topsrv_collector_*`)
 
 Per-collector instrumentation. Any collector registered via `addCollector` is wrapped to record its last scrape duration and recover from panics without breaking `/metrics`.

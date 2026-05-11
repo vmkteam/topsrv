@@ -31,3 +31,21 @@ Channel  = "stable"      # stable / beta
 # LogFormat     = '$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time'
 # ExtraLabels   = ["server_name"]
 # AccessLogs    = ["/var/log/angie/access.log"]
+
+# Bot-logs ingest to topsrv.io (optional — ships bot traffic events for analytics).
+# When enabled, the nginx access-log collector's ExtraLabels are forced to the
+# four variables botlog needs (http_user_agent, server_name, remote_addr,
+# http_referer) — any user-specified ExtraLabels on [Nginx]/[Angie] are dropped.
+# Endpoint defaults to [Push].Endpoint with the path replaced by /v1/bot-logs.
+# SpoolDir defaults to [Push].SpoolDir; bot-log files live in a "botlog/" subdir
+# so they don't collide with the metrics push spool.
+# [BotLogs]
+# Enabled       = true
+# Token         = ""        # required — issued by topsrv.io per project
+# Endpoint      = ""        # default: derived from [Push].Endpoint
+# BatchSize     = 5000      # events per batch
+# BatchInterval = "5s"      # flush interval
+# SpoolDir      = ""        # default: [Push].SpoolDir
+# MaxSpoolMB    = 200       # WAL disk budget
+# UATruncate    = 1024      # truncate user-agent at this length
+# ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list

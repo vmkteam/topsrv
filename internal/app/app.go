@@ -9,16 +9,19 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
 	"github.com/vmkteam/topsrv/internal/topsrv/angie"
+	"github.com/vmkteam/topsrv/internal/topsrv/botlog"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
 	"github.com/vmkteam/topsrv/internal/topsrv/smart"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
+	"github.com/shirou/gopsutil/v4/host"
 	"github.com/vmkteam/embedlog"
 )
 
@@ -31,6 +34,7 @@ type Config struct {
 	Nginx    *NginxConfig        `toml:"Nginx,omitempty"`
 	Angie    *AngieConfig        `toml:"Angie,omitempty"`
 	Smart    *smart.Config       `toml:"Smart,omitempty"`
+	BotLogs  *botlog.Config      `toml:"BotLogs,omitempty"`
 }
 
 type ServerConfig struct {
@@ -74,12 +78,36 @@ type App struct {
 	pusher         *topsrv.Pusher
 	closers        []io.Closer
 	statusBody     []byte
+	hostname       string
 	scrapeDuration *prometheus.GaugeVec
 	scrapePanics   *prometheus.CounterVec
+
+	// Populated by registerLogCollector; tailing starts in Run() after
+	// observers (e.g. botlog) have been attached.
+	logCollector *nginx.LogCollector
+
+	// Tracks pusher/log collector/smart/updater so Shutdown can wait for
+	// their drain paths before the process exits.
+	bg sync.WaitGroup
 }
+
+// shutdownTimeout caps the whole shutdown — HTTP server drain and background
+// goroutine drain run in parallel under a single deadline. The botlog pusher's
+// final flush relies on `shutdownTimeout ≥ botlog.shutdownDrainBudget + slack`
+// (flushFinal performs one send and falls through to spool — no retry chain).
+// k8s `terminationGracePeriodSeconds` should be at least this much + 5s slack.
+const shutdownTimeout = 15 * time.Second
+
+// httpShutdownTimeout caps just the net/http server's graceful shutdown so a
+// stuck keep-alive can't starve the pusher's final flush of the outer budget.
+const httpShutdownTimeout = 5 * time.Second
 
 func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 	body, _ := json.Marshal(map[string]string{"status": "ok", "app": appName, "version": version})
+	hostname := ""
+	if info, err := host.Info(); err == nil {
+		hostname = info.Hostname
+	}
 	a := &App{
 		Logger:     logger,
 		appName:    appName,
@@ -87,6 +115,7 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 		cfg:        cfg,
 		registry:   prometheus.NewRegistry(),
 		statusBody: body,
+		hostname:   hostname,
 		scrapeDuration: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "topsrv_collector_scrape_duration_seconds",
 			Help: "Last scrape duration in seconds, by collector. Use to spot slow collectors adding overhead.",
@@ -114,12 +143,18 @@ func (a *App) Run(ctx context.Context) error {
 
 	a.registerCollectors(ctx, services)
 
+	a.registerBotLogs(ctx)
+
+	if a.logCollector != nil {
+		a.goBackground(func() { a.logCollector.Run(ctx) })
+	}
+
 	if a.pusher != nil {
-		go a.pusher.Run(ctx)
+		a.goBackground(func() { a.pusher.Run(ctx) })
 
 		if a.cfg.Update.Enabled {
 			updater := topsrv.NewUpdater(a.Logger, a.appName, a.version, a.cfg.Update, a.cfg.Push)
-			go updater.Run(ctx)
+			a.goBackground(func() { updater.Run(ctx) })
 		}
 	}
 
@@ -146,16 +181,41 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) Shutdown() {
+	overall, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
 	if a.srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := a.srv.Shutdown(ctx); err != nil {
-			a.Error(ctx, "http shutdown error", "error", err)
-		}
+		a.goBackground(func() {
+			srvCtx, srvCancel := context.WithTimeout(overall, httpShutdownTimeout)
+			defer srvCancel()
+			if err := a.srv.Shutdown(srvCtx); err != nil {
+				a.Error(srvCtx, "http shutdown error", "error", err)
+			}
+		})
 	}
+
+	done := make(chan struct{})
+	go func() {
+		a.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-overall.Done():
+		a.Error(context.Background(), "shutdown: background goroutines did not finish in time", "timeout", shutdownTimeout)
+	}
+
 	for _, c := range a.closers {
 		_ = c.Close()
 	}
+}
+
+func (a *App) goBackground(fn func()) {
+	a.bg.Add(1)
+	go func() {
+		defer a.bg.Done()
+		fn()
+	}()
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -192,8 +252,15 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 	a.registerSmart(ctx)
 }
 
-// discoverAccessLogs extracts access logs with $request_time from a DiscoverResult and returns a LogConfig.
+// discoverAccessLogs extracts access logs from a DiscoverResult and returns a LogConfig.
+// By default, only logs whose format includes $request_time are tailed — the
+// metrics collector's main reason to read them is the timing histogram.
+// When [BotLogs] is enabled the filter is dropped so bot events from
+// timing-less log_formats also flow through; timing histograms are then
+// skipped per-line in recordLine while status counters and observers work
+// on any format.
 func (a *App) discoverAccessLogs(ctx context.Context, label string, discovered *nginx.DiscoverResult) nginx.LogConfig {
+	needAllLogs := a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled
 	for name, format := range discovered.LogFormats {
 		hasTiming := strings.Contains(format, "$request_time") || strings.Contains(format, "request_time")
 		isJSON := discovered.JSONFormats[name]
@@ -214,9 +281,11 @@ func (a *App) discoverAccessLogs(ctx context.Context, label string, discovered *
 			continue
 		}
 		isJSON := discovered.JSONFormats[entry.FormatName]
-		hasTiming := strings.Contains(format, "$request_time") || (isJSON && strings.Contains(format, "request_time"))
-		if !hasTiming {
-			continue
+		if !needAllLogs {
+			hasTiming := strings.Contains(format, "$request_time") || (isJSON && strings.Contains(format, "request_time"))
+			if !hasTiming {
+				continue
+			}
 		}
 		seen[entry.Path] = true
 		cfg.LogPaths = append(cfg.LogPaths, entry.Path)
@@ -243,14 +312,39 @@ func statusURL(host string, port int, path string) string {
 	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(port)), path)
 }
 
-// registerLogCollector creates and registers a log collector for the given config.
+// registerLogCollector creates and registers a log collector for the given
+// config. Tailing is not started here — App.Run starts logCollector.Run after
+// observers (botlog) have a chance to attach.
 func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if len(cfg.LogPaths) == 0 {
 		return
 	}
+	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
+		if len(cfg.ExtraLabels) > 0 {
+			a.Error(ctx, "WARN: nginx ExtraLabels dropped — BotLogs needs the four ParsedLine.Extras slots; user-supplied labels will not appear on Prometheus metrics",
+				"user_labels", cfg.ExtraLabels, "replaced_with", botlog.RequiredFields())
+		}
+		cfg.ExtraLabels = botlog.RequiredFields()
+		if !logHasUserAgent(cfg) {
+			a.Error(ctx, "WARN: BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
+				"log_paths", cfg.LogPaths)
+		}
+	}
 	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
-	go logC.RunPaths(ctx, cfg.LogPaths)
+	a.logCollector = logC
+}
+
+func logHasUserAgent(cfg nginx.LogConfig) bool {
+	if strings.Contains(cfg.LogFormat, "http_user_agent") {
+		return true
+	}
+	for _, f := range cfg.LogFormats {
+		if strings.Contains(f, "http_user_agent") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
@@ -289,6 +383,29 @@ func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
 	}
 }
 
+// registerBotLogs no-ops when [BotLogs] is disabled or no nginx access logs
+// were discovered. Otherwise it validates the config, builds the Pusher,
+// attaches the Observer to the access-log collector before tailing starts, and
+// launches the pusher goroutine.
+func (a *App) registerBotLogs(ctx context.Context) {
+	if a.cfg.BotLogs == nil || !a.cfg.BotLogs.Enabled {
+		return
+	}
+	if err := a.cfg.BotLogs.Validate(a.cfg.Push); err != nil {
+		a.Error(ctx, "botlog: invalid config — disabled", "error", err)
+		return
+	}
+	if a.logCollector == nil {
+		a.Print(ctx, "botlog: no nginx access logs discovered — disabled")
+		return
+	}
+	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
+	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname)
+	a.logCollector.AddObserver(obs)
+	a.goBackground(func() { bp.Run(ctx) })
+	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)
+}
+
 func (a *App) registerSmart(ctx context.Context) {
 	if a.cfg.Smart != nil && a.cfg.Smart.Disabled {
 		return
@@ -299,7 +416,7 @@ func (a *App) registerSmart(ctx context.Context) {
 	}
 	c := smart.NewCollector(a.Logger, interval)
 	a.addCollector(c)
-	go c.Run(ctx)
+	a.goBackground(func() { c.Run(ctx) })
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

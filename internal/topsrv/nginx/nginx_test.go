@@ -106,6 +106,63 @@ func TestLogCollectorParseLine(t *testing.T) {
 	assert.EqualValues(t, 1323, c.bytesTotal.Load())
 }
 
+// recordingObserver collects every parsed line for assertions. uaIdx is the
+// position of http_user_agent in the collector's ExtraLabels, captured at
+// construction — observers own the mapping from label name to Extras[i].
+type recordingObserver struct {
+	uaIdx int
+	lines []recordedLine
+}
+
+type recordedLine struct {
+	status string
+	uri    string
+	ua     string
+	path   string
+}
+
+func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
+	rl := recordedLine{status: p.Status, uri: p.URI, path: path}
+	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
+		rl.ua = p.Extras[r.uaIdx]
+	}
+	r.lines = append(r.lines, rl)
+}
+
+func TestLogCollectorObserver(t *testing.T) {
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:    []string{"/dev/null"},
+		LogFormat:   `$remote_addr [$time_local] "$request" $status $body_bytes_sent "$http_user_agent"`,
+		ExtraLabels: []string{"http_user_agent"},
+	})
+
+	obs := &recordingObserver{uaIdx: 0}
+	c.AddObserver(obs)
+
+	// Format has no $request_time / $upstream_response_time — verifies that
+	// observer fires regardless of timing fields.
+	lines := []string{
+		`1.2.3.4 [11/Apr/2026:17:15:23 +0300] "GET /api/users HTTP/1.1" 200 1234 "Mozilla/5.0"`,
+		`5.6.7.8 [11/Apr/2026:17:15:24 +0300] "GET /robots.txt HTTP/1.1" 200 50 "Googlebot/2.1"`,
+		`9.10.11.12 [11/Apr/2026:17:15:25 +0300] "GET /missing HTTP/1.1" 404 0 "curl/7.68"`,
+	}
+	for _, l := range lines {
+		c.parseLineWith(c.defaultParser, l, "/var/log/nginx/access.log")
+	}
+
+	require.Len(t, obs.lines, 3)
+	assert.Equal(t, "200", obs.lines[0].status)
+	assert.Equal(t, "Mozilla/5.0", obs.lines[0].ua)
+	assert.Equal(t, "Googlebot/2.1", obs.lines[1].ua)
+	assert.Equal(t, "404", obs.lines[2].status)
+	assert.Equal(t, "/var/log/nginx/access.log", obs.lines[2].path)
+
+	// Status counters still work without timing.
+	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Mozilla/5.0"}, n: 1}])
+	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Googlebot/2.1"}, n: 1}])
+	assert.EqualValues(t, 0, c.reqCount, "no timing field → no histogram update")
+}
+
 func TestLogCollectorCustomFormat(t *testing.T) {
 	format := `$remote_addr - $remote_user [$time_local] "$server_name" "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_cache_status [$upstream_response_time] $http_platform-$http_version $geoip_country_code $request_id`
 
@@ -191,7 +248,7 @@ func TestLogCollectorJSONTail(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.RunPaths(ctx, []string{logPath})
+	go c.runPaths(ctx, []string{logPath})
 
 	time.Sleep(100 * time.Millisecond)
 	_, _ = f.WriteString(`{"status":"500","body_bytes_sent":"100","request_time":"1.500","request_uri":"/users/123","upstream_response_time":"1.200","http_method":"GET"}` + "\n")
@@ -223,7 +280,7 @@ func TestLogCollectorTail(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	go c.RunPaths(ctx, []string{logPath})
+	go c.runPaths(ctx, []string{logPath})
 
 	time.Sleep(100 * time.Millisecond)
 	_, _ = f.WriteString(`1.2.3.4 - - [11/Apr/2026:17:15:23 +0300] "GET /users/123 HTTP/1.1" 500 100 "-" "test" 1.500 1.200` + "\n")
