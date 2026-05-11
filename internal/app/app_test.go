@@ -59,11 +59,6 @@ func TestInstrumentedCollectorRecoversPanic(t *testing.T) {
 	assert.InDelta(t, 1.0, counterValue(t, panics), 1e-9, "panics counter must be incremented once")
 }
 
-// TestLogHasUserAgent guards the BotLogs "silent zero metrics" trap (O4):
-// when no tailed log_format contains $http_user_agent, Observer drops every
-// line and operators see an empty match_total with no explanation. The check
-// must cover both the discovered per-path map and the single LogFormat
-// override used when AccessLogs are configured manually.
 func TestLogHasUserAgent(t *testing.T) {
 	cases := []struct {
 		name string

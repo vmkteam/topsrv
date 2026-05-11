@@ -86,17 +86,21 @@ type App struct {
 	// observers (e.g. botlog) have been attached.
 	logCollector *nginx.LogCollector
 
-	// bg tracks background goroutines started via goBackground (pusher, log
-	// collector, smart, updater). Shutdown waits on bg with a deadline so the
-	// final flush in botlog.Pusher.Run actually has a chance to land — without
-	// this, every rolling restart silently dropped up to BatchSize*2 events.
+	// Tracks pusher/log collector/smart/updater so Shutdown can wait for
+	// their drain paths before the process exits.
 	bg sync.WaitGroup
 }
 
-// shutdownTimeout caps how long Shutdown will wait for background goroutines.
-// Chosen to fit one full send round-trip (sendTimeout=10s in botlog) plus the
-// 5s retry backoff with some headroom — anything longer just means SIGKILL.
+// shutdownTimeout caps the whole shutdown — HTTP server drain and background
+// goroutine drain run in parallel under a single deadline. The botlog pusher's
+// final flush relies on `shutdownTimeout ≥ botlog.shutdownDrainBudget + slack`
+// (flushFinal performs one send and falls through to spool — no retry chain).
+// k8s `terminationGracePeriodSeconds` should be at least this much + 5s slack.
 const shutdownTimeout = 15 * time.Second
+
+// httpShutdownTimeout caps just the net/http server's graceful shutdown so a
+// stuck keep-alive can't starve the pusher's final flush of the outer budget.
+const httpShutdownTimeout = 5 * time.Second
 
 func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 	body, _ := json.Marshal(map[string]string{"status": "ok", "app": appName, "version": version})
@@ -177,19 +181,19 @@ func (a *App) Run(ctx context.Context) error {
 }
 
 func (a *App) Shutdown() {
+	overall, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+
 	if a.srv != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := a.srv.Shutdown(ctx); err != nil {
-			a.Error(ctx, "http shutdown error", "error", err)
-		}
+		a.goBackground(func() {
+			srvCtx, srvCancel := context.WithTimeout(overall, httpShutdownTimeout)
+			defer srvCancel()
+			if err := a.srv.Shutdown(srvCtx); err != nil {
+				a.Error(srvCtx, "http shutdown error", "error", err)
+			}
+		})
 	}
 
-	// Wait for background goroutines (pusher, log collector, updater, smart)
-	// before closing collectors and exiting. The main goroutine has already
-	// cancelled the context by this point, so each Run sees ctx.Done() and
-	// does its drain/flush. Without the wait, process exit kills the pusher
-	// mid-flush and the queue's tail batch is lost.
 	done := make(chan struct{})
 	go func() {
 		a.bg.Wait()
@@ -197,7 +201,7 @@ func (a *App) Shutdown() {
 	}()
 	select {
 	case <-done:
-	case <-time.After(shutdownTimeout):
+	case <-overall.Done():
 		a.Error(context.Background(), "shutdown: background goroutines did not finish in time", "timeout", shutdownTimeout)
 	}
 
@@ -206,8 +210,6 @@ func (a *App) Shutdown() {
 	}
 }
 
-// goBackground runs fn in a tracked goroutine. Shutdown waits on all such
-// goroutines so SIGTERM-triggered drains complete before the process exits.
 func (a *App) goBackground(fn func()) {
 	a.bg.Add(1)
 	go func() {
@@ -323,11 +325,6 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 				"user_labels", cfg.ExtraLabels, "replaced_with", botlog.RequiredFields())
 		}
 		cfg.ExtraLabels = botlog.RequiredFields()
-
-		// Tailing the log won't fail, but Observer silently filters lines whose
-		// $http_user_agent slot is empty. Without UA in *any* tailed format,
-		// bot-log metrics will sit at zero and operators reporting "BotLogs
-		// enabled but match_total is empty" will have nothing to debug.
 		if !logHasUserAgent(cfg) {
 			a.Error(ctx, "WARN: BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
 				"log_paths", cfg.LogPaths)
@@ -338,12 +335,6 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	a.logCollector = logC
 }
 
-// logHasUserAgent reports whether at least one tailed log_format contains the
-// http_user_agent field (as $http_user_agent in text formats or the bare
-// http_user_agent token in JSON formats). Checks both the discovered per-path
-// map and the single LogFormat override used when AccessLogs are configured
-// manually. Used by registerLogCollector to warn ops when BotLogs is enabled
-// against formats it cannot derive bot UAs from.
 func logHasUserAgent(cfg nginx.LogConfig) bool {
 	if strings.Contains(cfg.LogFormat, "http_user_agent") {
 		return true

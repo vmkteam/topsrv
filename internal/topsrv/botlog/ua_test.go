@@ -293,27 +293,18 @@ func TestMatchUA_ExtraPatternsEmptyEntriesIgnored(t *testing.T) {
 	assert.Equal(t, "gptbot", name)
 }
 
-// Representative UAs for the benchmarks: the non-bot case dominates real
-// traffic (~90%) and is the worst case for MatchUA because every pattern is
-// scanned before falling through. Googlebot is the typical bot path that hits
-// a refined subtype.
-
+// Non-bot is the worst case: every pattern scanned. ~90% of real traffic.
 const (
 	benchUANonBot    = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Safari/605.1.15"
 	benchUAGooglebot = "Mozilla/5.0 (compatible; Googlebot/2.1; +http://www.google.com/bot.html)"
 )
 
-// BenchmarkMatchUA_NonBot exercises the worst case — UA matches no pattern, so
-// every entry in knownBots is scanned. Baseline lets future PRs that add 20
-// more families see a clear regression here instead of in prod.
 func BenchmarkMatchUA_NonBot(b *testing.B) {
 	for range b.N {
 		MatchUA(benchUANonBot, nil)
 	}
 }
 
-// BenchmarkMatchUA_Googlebot exercises a typical bot match including
-// refineSubtype's extra Mobile/Android substring scan.
 func BenchmarkMatchUA_Googlebot(b *testing.B) {
 	for range b.N {
 		MatchUA(benchUAGooglebot, nil)

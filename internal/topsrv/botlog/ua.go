@@ -2,16 +2,9 @@ package botlog
 
 import "strings"
 
-// botPattern is a single UA-substring → (family, subtype) rule. Each entry is
-// matched in declaration order; the first hit wins. More specific patterns
-// must precede the family-wide fallback (e.g. Googlebot-Image before Googlebot).
-//
-// Subtypes drive SEO drill-down in the bot-logs UI — googlebot-smartphone vs
-// googlebot-desktop is a load-bearing distinction for mobile-first indexing
-// analysis. Generic "Googlebot" catches everything Google ships with
-// "Googlebot/2.1" and is refined to smartphone/desktop in refineSubtype using
-// the surrounding Mobile/Android markers (Google does not use a distinct UA
-// token for those).
+// botPattern is a single UA-substring → (family, subtype) rule. Order in
+// knownBots is the contract: declare specific patterns before family-wide
+// fallbacks, since the first match wins.
 type botPattern struct {
 	Family string
 	Pat    string // substring match, case-sensitive (UA values from logs are unchanged)
@@ -189,7 +182,10 @@ func MatchUA(ua string, extraPatterns []string) (family, name string) {
 			return "custom", pat
 		}
 	}
-	for _, b := range knownBots {
+	// Index iteration avoids copying botPattern (3 strings) per step on the
+	// non-bot hot path (~70 entries × every access-log line).
+	for i := range knownBots {
+		b := &knownBots[i]
 		if strings.Contains(ua, b.Pat) {
 			return b.Family, refineSubtype(b.Family, b.Name, ua)
 		}

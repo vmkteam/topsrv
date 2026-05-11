@@ -87,6 +87,27 @@ func (r *receiver) lastDecoded(t *testing.T) [][]byte {
 	return out
 }
 
+// decodeBatchLines returns the non-empty ndjson lines from a gzipped batch.
+// nil/empty input returns nil (used by tests that gzip-decode receiver bodies).
+func decodeBatchLines(t *testing.T, raw []byte) [][]byte {
+	t.Helper()
+	if len(raw) == 0 {
+		return nil
+	}
+	gz, err := gzip.NewReader(bytes.NewReader(raw))
+	require.NoError(t, err)
+	defer gz.Close()
+	plain, err := io.ReadAll(gz)
+	require.NoError(t, err)
+	out := make([][]byte, 0)
+	for _, l := range strings.Split(strings.TrimRight(string(plain), "\n"), "\n") {
+		if l != "" {
+			out = append(out, []byte(l))
+		}
+	}
+	return out
+}
+
 // newTestPusher builds a Pusher whose spool lands in parentDir/botlog (the same
 // layout Validate produces in production). Returns the pusher and the final
 // spool subdir so tests can glob inside it.
@@ -260,6 +281,42 @@ func TestPusher_DrainsOnShutdown(t *testing.T) {
 	assert.Len(t, r.lastDecoded(t), 4)
 }
 
+// Verifies the A2 contract: queue cap is BatchSize*2, but the shutdown drain
+// must still flush in chunks of at most BatchSize so a receiver-side per-batch
+// limit isn't exceeded.
+func TestPusher_DrainQueueRespectsBatchSizeOnShutdown(t *testing.T) {
+	r := newReceiver()
+	srv := httptest.NewServer(http.HandlerFunc(r.handler))
+	defer srv.Close()
+
+	// BatchSize=2 → queue cap 4. Enqueue 5 events (1 dropped), then shutdown.
+	// Drain must send chunks of ≤2, not one combined batch of 4.
+	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 2, "10s")
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { p.Run(ctx); close(done) }()
+
+	for range 5 {
+		p.Enqueue(sampleEvent("/x"))
+	}
+	time.Sleep(50 * time.Millisecond)
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancel")
+	}
+
+	r.mu.Lock()
+	bodies := append([][]byte(nil), r.bodies...)
+	r.mu.Unlock()
+	require.NotEmpty(t, bodies, "drain must produce at least one batch")
+	for i, raw := range bodies {
+		assert.LessOrEqual(t, len(decodeBatchLines(t, raw)), 2, "batch %d must respect BatchSize cap", i)
+	}
+}
+
 func TestPusher_TrimSpoolByBudget(t *testing.T) {
 	parent := t.TempDir()
 	cfg := Config{
@@ -403,11 +460,8 @@ func TestBatchIDFromPath(t *testing.T) {
 	assert.Equal(t, "no-suffix", batchIDFromPath("no-suffix"))
 }
 
-// TestPusher_RetrySpoolOrderOldestFirst guards the FIFO contract of retrySpool.
-// retrySpool sorts file names lexicographically and relies on newBatchID's
-// unix-ms prefix to produce a meaningful order. If anyone swaps newBatchID for
-// a UUIDv4 (or any non-prefixed scheme), this test must fail loudly — silent
-// FIFO loss would surface only as ordering anomalies in the ingest stream.
+// Guards the FIFO contract: replacing newBatchID with a non-unix-ms-prefixed
+// scheme must fail this test, not silently break ingest ordering.
 func TestPusher_RetrySpoolOrderOldestFirst(t *testing.T) {
 	r := newReceiver()
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
@@ -443,27 +497,21 @@ func TestPusher_RetrySpoolOrderOldestFirst(t *testing.T) {
 
 	got := make([]string, 0, len(bodies))
 	for _, raw := range bodies {
-		gz, err := gzip.NewReader(bytes.NewReader(raw))
-		require.NoError(t, err)
-		plain, err := io.ReadAll(gz)
-		require.NoError(t, err)
-		gz.Close()
+		plain := bytes.Join(decodeBatchLines(t, raw), nil)
 		switch {
-		case strings.Contains(string(plain), `"/p1"`):
+		case bytes.Contains(plain, []byte(`"/p1"`)):
 			got = append(got, "/p1")
-		case strings.Contains(string(plain), `"/p2"`):
+		case bytes.Contains(plain, []byte(`"/p2"`)):
 			got = append(got, "/p2")
-		case strings.Contains(string(plain), `"/p3"`):
+		case bytes.Contains(plain, []byte(`"/p3"`)):
 			got = append(got, "/p3")
 		}
 	}
 	assert.Equal(t, []string{"/p1", "/p2", "/p3"}, got, "spool replay must send oldest-first")
 }
 
-// TestPusher_DrainSpoolsWhenEndpointDown is the missing graceful-shutdown case:
-// SIGTERM arrives while the receiver is down. The drained batch must hit the
-// spool so the next process picks it up. Closes the regression "rolling restart
-// silently drops the last batch".
+// Drained batch must hit spool when receiver is down at shutdown — covers
+// the rolling-restart-with-503 case.
 func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
 	prev := retryBackoff
 	retryBackoff = 10 * time.Millisecond
@@ -495,20 +543,18 @@ func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
 	assert.Positive(t, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateSpooled, "")))
 }
 
-// TestPusher_RetrySpoolDoesNotBlockOnTransientFailures verifies the A2 fix:
-// even when the oldest batch keeps getting 5xx, newer batches still get a
-// chance within the same pass via maxTransientPerRun.
+// A transient failure on the oldest batch must not stop the loop from
+// forwarding newer batches in the same pass.
 func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
 	prev := retryBackoff
 	retryBackoff = 10 * time.Millisecond
 	defer func() { retryBackoff = prev }()
 
-	// Server: 503 to first batch (/p1), 200 to subsequent.
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
 		_ = req.Body.Close()
-		if bytes.Contains(unwrapGzip(t, body), []byte(`"/p1"`)) {
+		if bytes.Contains(bytes.Join(decodeBatchLines(t, body), nil), []byte(`"/p1"`)) {
 			w.WriteHeader(http.StatusServiceUnavailable)
 			return
 		}
@@ -521,10 +567,7 @@ func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
 	p, spool := newTestPusher(t, srv.URL, parent, 10, "10s")
 	require.NoError(t, os.MkdirAll(spool, 0o700))
 
-	for _, tc := range []struct {
-		name string
-		uri  string
-	}{
+	for _, tc := range []struct{ name, uri string }{
 		{"100-a.ndjson.gz", "/p1"},
 		{"200-b.ndjson.gz", "/p2"},
 		{"300-c.ndjson.gz", "/p3"},
@@ -538,70 +581,28 @@ func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
 	defer cancel()
 	go p.Run(ctx)
 
-	// /p2 and /p3 must be delivered even though /p1 keeps failing.
 	require.Eventually(t, func() bool { return calls.Load() >= 2 }, 2*time.Second, 10*time.Millisecond,
 		"newer batches must not be blocked by a transient-failing older batch")
 
-	// /p1 stays in spool until trim or until receiver heals — that's the contract.
 	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
 	assert.Contains(t, files, filepath.Join(spool, "100-a.ndjson.gz"))
 }
 
-func unwrapGzip(t *testing.T, data []byte) []byte {
-	t.Helper()
-	if len(data) == 0 {
-		return nil
-	}
-	gz, err := gzip.NewReader(bytes.NewReader(data))
-	if err != nil {
-		return data
-	}
-	defer gz.Close()
-	out, _ := io.ReadAll(gz)
-	return out
+func TestHTTPStatusError_NoBody(t *testing.T) {
+	e := &httpStatusError{code: 500, bodyLen: 234}
+	assert.Equal(t, "HTTP 500 (body 234 bytes)", e.Error())
 }
 
-func TestSanitizeResponseBody(t *testing.T) {
-	cases := []struct {
-		name, in, want string
-	}{
-		{"empty", "", ""},
-		{"plain", "plain error message", "plain error message"},
-		{"bearer", "got Bearer abc.def-ghi_123 back", "got [REDACTED] back"},
-		{"json token", `{"token":"abc123"}`, `{"token":"[REDACTED]"}`},
-		{"json api_key", `{"api_key":"sk_live_xyz"}`, `{"api_key":"[REDACTED]"}`},
-		{"header bearer", `Authorization: Bearer sk_live_abcdef`, `Authorization: [REDACTED]`},
-		{"kv api_key", `api_key=topsecret123`, `api_key= [REDACTED]`},
-		{"x-auth header", `x-vmk-auth: tok_42`, `x-vmk-auth: [REDACTED]`},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, sanitizeResponseBody(tc.in))
-		})
-	}
+func TestOwnsSpoolFile_SelfOwned(t *testing.T) {
+	p, dir := newTestPusher(t, "http://x.invalid", t.TempDir(), 1, "1s")
+	require.NoError(t, os.MkdirAll(dir, 0o700))
+	f := filepath.Join(dir, "100-a.ndjson.gz")
+	require.NoError(t, os.WriteFile(f, []byte("x"), 0o600))
+	assert.True(t, p.ownsSpoolFile(context.Background(), f))
 }
 
-func TestPusher_RetrySpoolDiscardsForeignFiles(t *testing.T) {
-	// We can't realistically chown to a different uid in unit tests, so this
-	// test stays focused on the path actually exercised in CI: the "owns"
-	// check returns true (uid match), and a legitimate file replays normally.
-	// The negative case is covered by code inspection — ownsSpoolFile returns
-	// false on uid mismatch and the file is removed.
-	r := newReceiver()
-	srv := httptest.NewServer(http.HandlerFunc(r.handler))
-	defer srv.Close()
-
-	parent := t.TempDir()
-	p, spool := newTestPusher(t, srv.URL, parent, 10, "10s")
-	require.NoError(t, os.MkdirAll(spool, 0o700))
-
-	payload, err := encodeBatch([]Event{sampleEvent("/own")})
-	require.NoError(t, err)
-	path := filepath.Join(spool, "100-own.ndjson.gz")
-	require.NoError(t, os.WriteFile(path, payload, 0o600))
-
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
-	require.Eventually(t, func() bool { return r.calls() >= 1 }, 2*time.Second, 10*time.Millisecond)
+func TestOwnsSpoolFile_NonExistent(t *testing.T) {
+	p, dir := newTestPusher(t, "http://x.invalid", t.TempDir(), 1, "1s")
+	assert.False(t, p.ownsSpoolFile(context.Background(), filepath.Join(dir, "ghost.ndjson.gz")),
+		"non-existent path must fail closed")
 }
