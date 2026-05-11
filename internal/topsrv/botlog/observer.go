@@ -14,19 +14,11 @@ const (
 	fieldReferer    = "http_referer"
 )
 
-// Positions in ParsedLine.Extras assigned by ordering of RequiredFields. The
-// observer reads these directly to avoid a per-line map lookup.
-const (
-	idxUA         = 0
-	idxServerName = 1
-	idxRemoteAddr = 2
-	idxReferer    = 3
-)
-
-// RequiredFields lists the nginx variables the LogCollector must extract into
-// ParsedLine.Extras for the bot-log Observer to work. Order is load-bearing —
-// Observer indexes Extras by position (see idxUA etc). TestRequiredFieldsOrder
-// guards the mapping; a reorder here that drops the assertion will fail tests.
+// RequiredFields lists the nginx variables the LogCollector must read into
+// ParsedLine.Extras for the bot-log Observer to work. These are NOT promoted
+// to Prometheus labels — app.registerLogCollector merges them into
+// LogConfig.ExtractFields, leaving operator-supplied ExtraLabels (low
+// cardinality) as the only Prometheus label set.
 func RequiredFields() []string {
 	return []string{fieldUserAgent, fieldServerName, fieldRemoteAddr, fieldReferer}
 }
@@ -40,29 +32,42 @@ type Observer struct {
 	hostname      string
 	uaTruncate    int
 	extraPatterns []string
+
+	// Resolved at construction from the LogCollector's ExtractFields. -1 when
+	// the operator's log_format doesn't carry that variable.
+	idxUA, idxServerName, idxRemoteAddr, idxReferer int
 }
 
 // NewObserver wires an Observer against an already-constructed Pusher.
-// hostname is shipped on every event as agentHostname; cfg supplies bot-UA
-// patterns and the UA truncate limit (passed explicitly so the Observer does
-// not reach into Pusher internals).
-func NewObserver(p *Pusher, cfg Config, hostname string) *Observer {
+// extractFields must mirror the LogCollector's ExtractFields slice — its
+// indices determine where each variable lands in ParsedLine.Extras.
+func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string) *Observer {
 	return &Observer{
 		pusher:        p,
 		hostname:      hostname,
 		uaTruncate:    cfg.UATruncate,
 		extraPatterns: cfg.ExtraUAPatterns,
+		idxUA:         indexOf(extractFields, fieldUserAgent),
+		idxServerName: indexOf(extractFields, fieldServerName),
+		idxRemoteAddr: indexOf(extractFields, fieldRemoteAddr),
+		idxReferer:    indexOf(extractFields, fieldReferer),
 	}
+}
+
+func indexOf(fields []string, name string) int {
+	for i, f := range fields {
+		if f == name {
+			return i
+		}
+	}
+	return -1
 }
 
 // OnLogLine satisfies nginx.LogObserver. Matches the UA first to skip Fields
 // construction on the ~90% non-bot traffic — the hot path is one Extras read
 // and one substring scan when no bot is seen.
 func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
-	if idxUA >= p.NExtras {
-		return
-	}
-	ua := p.Extras[idxUA]
+	ua := o.field(p, o.idxUA)
 	if ua == "" {
 		return
 	}
@@ -86,16 +91,16 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 		UpstreamResponseTime: p.UpstreamResponseTime,
 		UpstreamCacheStatus:  p.UpstreamCacheStatus,
 		UserAgent:            ua,
-		ServerName:           o.field(p, idxServerName),
-		RemoteAddr:           o.field(p, idxRemoteAddr),
-		Referer:              o.field(p, idxReferer),
+		ServerName:           o.field(p, o.idxServerName),
+		RemoteAddr:           o.field(p, o.idxRemoteAddr),
+		Referer:              o.field(p, o.idxReferer),
 	}, family, name, o.uaTruncate)
 	o.pusher.RecordMatch(family)
 	o.pusher.Enqueue(ev)
 }
 
 func (o *Observer) field(p *nginx.ParsedLine, idx int) string {
-	if idx >= p.NExtras {
+	if idx < 0 || idx >= p.NExtras {
 		return ""
 	}
 	return p.Extras[idx]

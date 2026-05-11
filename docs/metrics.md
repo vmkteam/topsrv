@@ -153,12 +153,14 @@
 | `topsrv_nginx_requests_total` | counter | — | Total requests (stub_status) |
 | `topsrv_nginx_request_duration_seconds` | histogram | — | Request duration |
 | `topsrv_nginx_upstream_duration_seconds` | histogram | — | Upstream response time |
-| `topsrv_nginx_http_requests_total` | counter | status, +extra_labels | Requests by status code |
+| `topsrv_nginx_http_requests_total` | counter | status, +ExtraLabels | Requests by status code. ExtraLabels comes from `[Nginx]/[Angie] ExtraLabels` (operator-controlled, must be low cardinality — `server_name`, `http_platform`, `http_version`). Variables that botlog needs internally are NOT added here; see warning below. |
 | `topsrv_nginx_cache_requests_total` | counter | status | Cache status (HIT/MISS/EXPIRED) |
 | `topsrv_nginx_5xx_requests_total` | counter | status, uri | 5xx errors with normalized URI |
 | `topsrv_nginx_4xx_requests_total` | counter | status, uri | 4xx errors with normalized URI |
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
 | `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI |
+
+> **High-cardinality labels warning.** `ExtraLabels` values appear on every series of `topsrv_nginx_http_requests_total`; total cardinality is `status × ExtraLabels[0] × ExtraLabels[1] × …`. Adding unbounded variables (`remote_addr`, `http_user_agent`, `http_referer`, `http_x_forwarded_for`, `request_id`, `args`, `query_string`) will explode Prometheus storage. The agent logs a WARN at startup if it sees any of these in `ExtraLabels`. Enabling `[BotLogs]` does NOT add any of these to labels — botlog reads them into `ParsedLine.Extras` for event enrichment only.
 
 ## S.M.A.R.T. (`topsrv_smart_*`)
 

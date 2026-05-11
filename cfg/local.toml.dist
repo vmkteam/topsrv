@@ -33,9 +33,10 @@ Channel  = "stable"      # stable / beta
 # AccessLogs    = ["/var/log/angie/access.log"]
 
 # Bot-logs ingest to topsrv.io (optional — ships bot traffic events for analytics).
-# When enabled, the nginx access-log collector's ExtraLabels are forced to the
-# four variables botlog needs (http_user_agent, server_name, remote_addr,
-# http_referer) — any user-specified ExtraLabels on [Nginx]/[Angie] are dropped.
+# When enabled, botlog reads four nginx variables (http_user_agent, server_name,
+# remote_addr, http_referer) from each access-log line. These are NOT added to
+# Prometheus labels — your [Nginx]/[Angie] ExtraLabels stay exactly as you set
+# them (keep them low-cardinality: server_name, http_platform, http_version).
 # Endpoint defaults to [Push].Endpoint with the path replaced by /v1/bot-logs.
 # SpoolDir defaults to [Push].SpoolDir; bot-log files live in a "botlog/" subdir
 # so they don't collide with the metrics push spool.

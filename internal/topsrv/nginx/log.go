@@ -57,14 +57,18 @@ var (
 var scannerSuffixes = [...]string{".env", ".git", ".aws", ".ssh", ".svn", ".bak", ".sql"}
 
 // LogCollector parses nginx access logs and collects metrics.
-// Supports custom labels from log fields via ExtraLabels.
+// Supports custom labels from log fields via ExtraLabels (Prometheus labels)
+// and a superset ExtractFields (values read into ParsedLine.Extras for
+// observers such as botlog).
 type LogCollector struct {
 	embedlog.Logger
 
 	defaultParser *gonx.Parser
 	parsers       map[string]*gonx.Parser // path → parser (for multi-format)
 	jsonPaths     map[string]bool         // path → true if log is JSON format
-	extraFields   []string                // nginx variable names to use as extra labels
+	extractFields []string                // nginx vars read into ParsedLine.Extras (superset of labelFields)
+	labelFields   []string                // nginx vars used as Prometheus labels (must be low-cardinality)
+	labelIdx      []int                   // labelFields[k] is at Extras[labelIdx[k]]; -1 if missing
 	logPaths      []string                // captured from LogConfig.LogPaths for Run
 
 	reqDuration      *prometheus.Desc
@@ -108,19 +112,33 @@ type statusURI struct {
 	uri    string
 }
 
+// MaxExtras caps the per-line Extras slot count. Sized to fit operator
+// ExtraLabels (typically ≤3) plus botlog's 4 RequiredFields() with room.
+const MaxExtras = 8
+
 type taggedStatusKey struct {
 	status string
-	extra  [4]string // extra label values (fixed-size array, max 4 labels)
-	n      int       // number of used extra labels
+	extra  [MaxExtras]string // extra label values (fixed-size array)
+	n      int               // number of used extra labels
 }
 
 // LogConfig holds parameters for creating a LogCollector.
 type LogConfig struct {
-	LogPaths    []string          // multiple log files tailed into one collector
-	LogFormat   string            // default format for all logs
-	LogFormats  map[string]string // path → format override (from discovery)
-	JSONPaths   map[string]bool   // path → true if log is JSON format
-	ExtraLabels []string          // nginx variable names: ["server_name", "http_platform", "http_version"]
+	LogPaths   []string          // multiple log files tailed into one collector
+	LogFormat  string            // default format for all logs
+	LogFormats map[string]string // path → format override (from discovery)
+	JSONPaths  map[string]bool   // path → true if log is JSON format
+
+	// ExtraLabels are the nginx variables exported as Prometheus labels on
+	// topsrv_nginx_http_requests_total. Must be bounded cardinality
+	// (server_name, http_platform, http_version). Operator-controlled.
+	ExtraLabels []string
+
+	// ExtractFields is a superset of ExtraLabels: variables read into
+	// ParsedLine.Extras for observers (e.g. botlog) that need raw values
+	// without paying Prometheus cardinality cost. Empty → defaults to
+	// ExtraLabels (single-purpose behaviour).
+	ExtractFields []string
 }
 
 func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
@@ -128,7 +146,32 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		cfg.LogFormat = DefaultLogFormat
 	}
 
-	// Labels for httpRequests: "status" + extra labels.
+	// Default ExtractFields to ExtraLabels for backward compatibility.
+	extractFields := cfg.ExtractFields
+	if len(extractFields) == 0 {
+		extractFields = cfg.ExtraLabels
+	}
+	// Cap to the size of ParsedLine.Extras so callers reading positionally
+	// can't index past the array.
+	if maxFields := len(ParsedLine{}.Extras); len(extractFields) > maxFields {
+		extractFields = extractFields[:maxFields]
+	}
+
+	// labelIdx[k] is the position in extractFields where labelFields[k] lives,
+	// or -1 when the operator listed a label that no parser will populate
+	// (defensive — should not happen with a sane config).
+	labelIdx := make([]int, len(cfg.ExtraLabels))
+	for k, name := range cfg.ExtraLabels {
+		labelIdx[k] = -1
+		for i, f := range extractFields {
+			if f == name {
+				labelIdx[k] = i
+				break
+			}
+		}
+	}
+
+	// Labels for httpRequests: "status" + low-cardinality extra labels.
 	reqLabels := append([]string{"status"}, cfg.ExtraLabels...)
 
 	// Build per-path parsers if multiple formats provided.
@@ -144,7 +187,9 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		defaultParser: gonx.NewParser(cfg.LogFormat),
 		parsers:       parsers,
 		jsonPaths:     cfg.JSONPaths,
-		extraFields:   cfg.ExtraLabels,
+		extractFields: extractFields,
+		labelFields:   cfg.ExtraLabels,
+		labelIdx:      labelIdx,
 		logPaths:      cfg.LogPaths,
 
 		reqDuration:      prometheus.NewDesc("topsrv_nginx_request_duration_seconds", "Nginx request duration histogram.", nil, nil),
@@ -169,6 +214,13 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 
 func (c *LogCollector) Name() string { return "nginx-log" }
 
+// ExtractFields exposes the ordered list of nginx variables that the collector
+// reads into ParsedLine.Extras. Observers (e.g. botlog) need this to resolve
+// positional access at construction time.
+func (c *LogCollector) ExtractFields() []string {
+	return c.extractFields
+}
+
 func (c *LogCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.reqDuration
 	ch <- c.upstreamDuration
@@ -192,7 +244,7 @@ func (c *LogCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstHistogram(c.upstreamDuration, c.upCount, c.upSum, cumulativeBuckets(defaultHTTPBuckets, c.upBuckets))
 	}
 
-	if len(c.extraFields) == 0 {
+	if len(c.labelFields) == 0 {
 		for status, count := range c.statusCounts {
 			ch <- prometheus.MustNewConstMetric(c.httpRequests, prometheus.CounterValue, float64(count), status)
 		}
@@ -314,7 +366,7 @@ type ParsedLine struct {
 	RequestTime          string
 	UpstreamResponseTime string
 	UpstreamCacheStatus  string
-	Extras               [4]string // extra label values (pre-extracted)
+	Extras               [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
 	NExtras              int
 }
 
@@ -339,7 +391,7 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 		p.RawPath = stripQuery(u)
 	}
 
-	for i, f := range c.extraFields {
+	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
 			break
 		}
@@ -357,7 +409,7 @@ func (c *LogCollector) ParseJSONLine(line string) {
 func (c *LogCollector) parseJSONLine(line, path string) {
 	// When extra labels are needed, unmarshal into a generic map once
 	// to get both typed fields and arbitrary extra label values.
-	if len(c.extraFields) > 0 {
+	if len(c.extractFields) > 0 {
 		var m map[string]string
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			return
@@ -372,7 +424,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		p.URI = normalizeRequestURI(m["request_uri"], m["request"])
 		p.RawPath = rawPathFromJSON(m["request_uri"], m["request"])
 
-		for i, f := range c.extraFields {
+		for i, f := range c.extractFields {
 			if i >= len(p.Extras) {
 				break
 			}
@@ -470,16 +522,22 @@ func (c *LogCollector) recordLine(p *ParsedLine) { //nolint:gocognit,nestif
 	defer c.mu.Unlock()
 
 	if status := p.Status; status != "" { //nolint:nestif
-		if len(c.extraFields) == 0 {
+		if len(c.labelFields) == 0 {
 			c.statusCounts[status]++
 		} else {
-			key := taggedStatusKey{status: status, n: p.NExtras}
-			for i := range p.NExtras {
-				v := p.Extras[i]
+			// Pull label values out of ParsedLine.Extras using labelIdx so
+			// ExtractFields can be a superset (e.g. botlog adds http_user_agent
+			// for event enrichment without making it a Prometheus label).
+			key := taggedStatusKey{status: status, n: len(c.labelFields)}
+			for k, idx := range c.labelIdx {
+				var v string
+				if idx >= 0 && idx < p.NExtras {
+					v = p.Extras[idx]
+				}
 				if v == "-" {
 					v = ""
 				}
-				key.extra[i] = v
+				key.extra[k] = v
 			}
 			if _, ok := c.taggedCounts[key]; ok || len(c.taggedCounts) < maxCardinalityTagged {
 				c.taggedCounts[key]++

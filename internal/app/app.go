@@ -312,24 +312,47 @@ func statusURL(host string, port int, path string) string {
 	return fmt.Sprintf("http://%s%s", net.JoinHostPort(host, strconv.Itoa(port)), path)
 }
 
+// highCardLabelDenylist names nginx variables that explode Prometheus
+// cardinality if used as labels on topsrv_nginx_http_requests_total. Operator
+// configs that include any of these are flagged via WARN log — agent still
+// starts, but the operator is on the hook for the dashboards.
+var highCardLabelDenylist = []string{
+	"remote_addr",
+	"http_user_agent",
+	"http_referer",
+	"http_x_forwarded_for",
+	"request_id",
+	"args",
+	"query_string",
+}
+
 // registerLogCollector creates and registers a log collector for the given
 // config. Tailing is not started here — App.Run starts logCollector.Run after
 // observers (botlog) have a chance to attach.
+//
+// BotLogs no longer overwrites operator-supplied ExtraLabels — that mistake
+// promoted four high-cardinality variables to Prometheus labels and cost
+// myshows a dashboard outage on v0.0.22-rc.2. Now BotLogs.RequiredFields()
+// gets merged into ExtractFields (parser reads only) while ExtraLabels
+// (Prometheus labels) stay exactly as the operator configured them.
 func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if len(cfg.LogPaths) == 0 {
 		return
 	}
+	if bad := highCardLabels(cfg.ExtraLabels); len(bad) > 0 {
+		a.Error(ctx, "WARN: ExtraLabels contains high-cardinality variables — Prometheus series may explode",
+			"forbidden", bad, "see", "docs/metrics.md")
+	}
+
+	cfg.ExtractFields = cfg.ExtraLabels
 	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
-		if len(cfg.ExtraLabels) > 0 {
-			a.Error(ctx, "WARN: nginx ExtraLabels dropped — BotLogs needs the four ParsedLine.Extras slots; user-supplied labels will not appear on Prometheus metrics",
-				"user_labels", cfg.ExtraLabels, "replaced_with", botlog.RequiredFields())
-		}
-		cfg.ExtraLabels = botlog.RequiredFields()
+		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields())
 		if !logHasUserAgent(cfg) {
 			a.Error(ctx, "WARN: BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
 				"log_paths", cfg.LogPaths)
 		}
 	}
+
 	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
 	a.logCollector = logC
@@ -345,6 +368,43 @@ func logHasUserAgent(cfg nginx.LogConfig) bool {
 		}
 	}
 	return false
+}
+
+// highCardLabels returns the intersection of labels with the denylist.
+func highCardLabels(labels []string) []string {
+	var bad []string
+	for _, l := range labels {
+		for _, d := range highCardLabelDenylist {
+			if l == d {
+				bad = append(bad, l)
+				break
+			}
+		}
+	}
+	return bad
+}
+
+// mergeUnique returns base ++ (extras \ base), preserving order. Operator's
+// labels stay at the front so their positions in ParsedLine.Extras are stable
+// across config reloads.
+func mergeUnique(base, extras []string) []string {
+	seen := make(map[string]struct{}, len(base)+len(extras))
+	out := make([]string, 0, len(base)+len(extras))
+	for _, v := range base {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	for _, v := range extras {
+		if _, ok := seen[v]; ok {
+			continue
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out
 }
 
 func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
@@ -400,7 +460,7 @@ func (a *App) registerBotLogs(ctx context.Context) {
 		return
 	}
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
-	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname)
+	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.logCollector.ExtractFields())
 	a.logCollector.AddObserver(obs)
 	a.goBackground(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)

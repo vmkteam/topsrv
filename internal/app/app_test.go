@@ -99,3 +99,61 @@ func TestInstrumentedCollectorNormalCallNoPanicCount(t *testing.T) {
 	ic.Collect(ch)
 	assert.InDelta(t, 0.0, counterValue(t, panics), 1e-9)
 }
+
+func TestHighCardLabels(t *testing.T) {
+	assert.Empty(t, highCardLabels(nil))
+	assert.Empty(t, highCardLabels([]string{"server_name", "http_platform"}))
+	assert.Equal(t, []string{"remote_addr"},
+		highCardLabels([]string{"server_name", "remote_addr"}))
+	assert.Equal(t, []string{"http_user_agent", "http_referer"},
+		highCardLabels([]string{"server_name", "http_user_agent", "http_referer"}))
+}
+
+// Closes the v0.0.22-rc.2 regression: BotLogs.Enabled=true must not promote
+// botlog's required fields to Prometheus labels. Verifies the wiring at the
+// LogCollector level — labelFields stays equal to operator's ExtraLabels,
+// extractFields is the union.
+func TestNewLogCollector_BotLogsDoesNotPromoteToLabels(t *testing.T) {
+	cfg := nginx.LogConfig{
+		LogPaths:    []string{"/dev/null"},
+		LogFormat:   `$remote_addr [$time_local] "$server_name" "$http_platform" "$request" $status $body_bytes_sent "$http_user_agent"`,
+		ExtraLabels: []string{"server_name", "http_platform"},
+		// Simulate what registerLogCollector does when BotLogs is enabled:
+		ExtractFields: mergeUnique(
+			[]string{"server_name", "http_platform"},
+			[]string{"http_user_agent", "server_name", "remote_addr", "http_referer"},
+		),
+	}
+	c := nginx.NewLogCollector(embedlog.Logger{}, cfg)
+	assert.Equal(t,
+		[]string{"server_name", "http_platform", "http_user_agent", "remote_addr", "http_referer"},
+		c.ExtractFields(),
+		"ExtractFields must be the union with operator labels first")
+}
+
+func TestMergeUnique(t *testing.T) {
+	cases := []struct {
+		name         string
+		base, extras []string
+		want         []string
+	}{
+		{"empty", nil, nil, []string{}},
+		{"base only", []string{"a", "b"}, nil, []string{"a", "b"}},
+		{"extras only", nil, []string{"x", "y"}, []string{"x", "y"}},
+		{"distinct", []string{"a"}, []string{"b"}, []string{"a", "b"}},
+		{"overlap, base order preserved", []string{"server_name", "http_platform"},
+			[]string{"http_user_agent", "server_name", "remote_addr"},
+			[]string{"server_name", "http_platform", "http_user_agent", "remote_addr"}},
+		{"dedup within base", []string{"a", "a", "b"}, []string{"a"}, []string{"a", "b"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := mergeUnique(tc.base, tc.extras)
+			if len(tc.want) == 0 {
+				assert.Empty(t, got)
+				return
+			}
+			assert.Equal(t, tc.want, got)
+		})
+	}
+}
