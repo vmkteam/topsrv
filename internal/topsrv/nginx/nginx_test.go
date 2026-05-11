@@ -159,8 +159,8 @@ func TestLogCollectorObserver(t *testing.T) {
 	assert.Equal(t, "/var/log/nginx/access.log", obs.lines[2].path)
 
 	// Status counters still work without timing.
-	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Mozilla/5.0"}, n: 1}])
-	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Googlebot/2.1"}, n: 1}])
+	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [MaxExtras]string{"Mozilla/5.0"}, n: 1}])
+	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [MaxExtras]string{"Googlebot/2.1"}, n: 1}])
 	assert.EqualValues(t, 0, c.reqCount, "no timing field → no histogram update")
 }
 
@@ -202,7 +202,7 @@ func TestParsedLine_RawPathUnnormalized(t *testing.T) {
 		{
 			name: "JSON with extra-labels path (map unmarshal)",
 			setup: func(c *LogCollector) {
-				c.extraFields = []string{"http_user_agent"}
+				c.extractFields = []string{"http_user_agent"}
 				c.AddObserver(&recordingObserver{uaIdx: 0})
 			},
 			feed: func(c *LogCollector) {
@@ -655,4 +655,61 @@ server {
 		}
 	}
 	assert.Equal(t, 2, nonOff)
+}
+
+// Regression for the myshows v0.0.22-rc.2 incident: ExtractFields being a
+// superset of ExtraLabels must NOT leak the extra-only variables (e.g.
+// http_user_agent that botlog reads) into Prometheus labels.
+func TestExtraLabels_NotInExtractFields_NoBleed(t *testing.T) {
+	format := `$remote_addr [$time_local] "$server_name" "$request" $status $body_bytes_sent "$http_user_agent"`
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:      []string{"/dev/null"},
+		LogFormat:     format,
+		ExtraLabels:   []string{"server_name"},
+		ExtractFields: []string{"server_name", "http_user_agent"},
+	})
+
+	// Two lines, same server_name, different UAs. If UA leaked into labels,
+	// taggedCounts would split into two series.
+	for _, l := range []string{
+		`1.1.1.1 [11/Apr/2026:17:15:23 +0300] "example.com" "GET /a HTTP/1.1" 200 100 "Mozilla/5.0"`,
+		`1.1.1.1 [11/Apr/2026:17:15:24 +0300] "example.com" "GET /b HTTP/1.1" 200 100 "Googlebot/2.1"`,
+	} {
+		c.parseLine(l)
+	}
+
+	require.Len(t, c.taggedCounts, 1, "UA must NOT split the (status, server_name) cardinality bucket")
+	for key := range c.taggedCounts {
+		assert.Equal(t, "200", key.status)
+		assert.Equal(t, "example.com", key.extra[0])
+		assert.Equal(t, 1, key.n, "exactly one label dimension beyond status")
+	}
+}
+
+// When ExtractFields is empty, behaviour matches v0.0.21: ExtraLabels is both
+// the parser read-list and the Prometheus label set.
+func TestExtractFields_DefaultsToExtraLabels(t *testing.T) {
+	format := `$remote_addr [$time_local] "$server_name" "$request" $status $body_bytes_sent "$http_user_agent"`
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:    []string{"/dev/null"},
+		LogFormat:   format,
+		ExtraLabels: []string{"server_name"},
+		// ExtractFields intentionally empty
+	})
+	assert.Equal(t, []string{"server_name"}, c.extractFields)
+	assert.Equal(t, []string{"server_name"}, c.labelFields)
+}
+
+// labelIdx must point at the correct Extras slot when operator labels are
+// listed before botlog's extra-only fields in ExtractFields.
+func TestExtractFields_SupersetOrderingLabelIdx(t *testing.T) {
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:      []string{"/dev/null"},
+		LogFormat:     `$remote_addr [$time_local] "$server_name" "$http_platform" "$request" $status $body_bytes_sent "$http_user_agent"`,
+		ExtraLabels:   []string{"server_name", "http_platform"},
+		ExtractFields: []string{"server_name", "http_platform", "http_user_agent"},
+	})
+	require.Len(t, c.labelIdx, 2)
+	assert.Equal(t, 0, c.labelIdx[0], "server_name lives at Extras[0]")
+	assert.Equal(t, 1, c.labelIdx[1], "http_platform lives at Extras[1]")
 }

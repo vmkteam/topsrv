@@ -85,11 +85,9 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	p := NewPusher(embedlog.Logger{}, "topsrv-smoke", "test", cfg, reg)
 
-	obs := NewObserver(p, cfg, "smoke-host")
-
 	// Temp access log + LogCollector with the JSON format (so we can write
-	// structured lines directly without learning gonx). RequiredFields() seeds
-	// the ExtraLabels in the production wire-up — match it here.
+	// structured lines directly without learning gonx). botlog needs its four
+	// fields in ExtractFields only — operator's ExtraLabels stays empty here.
 	dir := t.TempDir()
 	logPath := filepath.Join(dir, "access.json")
 	f, err := os.Create(logPath)
@@ -97,10 +95,11 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 	defer f.Close()
 
 	logC := nginx.NewLogCollector(embedlog.Logger{}, nginx.LogConfig{
-		LogPaths:    []string{logPath},
-		JSONPaths:   map[string]bool{logPath: true},
-		ExtraLabels: RequiredFields(),
+		LogPaths:      []string{logPath},
+		JSONPaths:     map[string]bool{logPath: true},
+		ExtractFields: RequiredFields(),
 	})
+	obs := NewObserver(p, cfg, "smoke-host", logC.ExtractFields())
 	logC.AddObserver(obs)
 
 	ctx, cancel := context.WithCancel(context.Background())
