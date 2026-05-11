@@ -13,6 +13,7 @@ import (
 // wire and save bytes.
 type Event struct {
 	TS                     time.Time `json:"ts"`
+	Host                   string    `json:"host,omitempty"`
 	ServerName             string    `json:"serverName,omitempty"`
 	AgentHostname          string    `json:"agentHostname"`
 	RemoteAddr             string    `json:"remoteAddr,omitempty"`
@@ -40,7 +41,8 @@ type Fields struct {
 	UpstreamResponseTime string // may be a comma-separated chain on retries
 	UpstreamCacheStatus  string
 	UserAgent            string
-	ServerName           string
+	Host                 string // raw request Host header — BuildEvent runs normalizeHost
+	ServerName           string // matched nginx vhost config name
 	RemoteAddr           string
 	Referer              string
 	Method               string
@@ -62,6 +64,7 @@ func NewEvent(now time.Time, agentHostname string, f Fields, extraUAPatterns []s
 func BuildEvent(now time.Time, agentHostname string, f Fields, family, name string, uaTruncate int) Event {
 	return Event{
 		TS:                     now,
+		Host:                   normalizeHost(f.Host),
 		ServerName:             f.ServerName,
 		AgentHostname:          agentHostname,
 		RemoteAddr:             dashToEmpty(f.RemoteAddr),
