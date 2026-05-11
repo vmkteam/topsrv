@@ -56,7 +56,7 @@ func TestObserver_EnqueuesBotEvent(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("Mozilla/5.0 GPTBot/1.0", "api.example.com", "203.0.113.5", "-"), "")
 
-	assert.InDelta(t, 1, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued)), 0.01)
+	assert.InDelta(t, 1, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 	assert.InDelta(t, 1, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
 
 	// Pull the event off the queue and inspect.
@@ -78,7 +78,7 @@ func TestObserver_NonBotIgnored(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("Mozilla/5.0 (Macintosh) Safari/605", "x.example.com", "1.2.3.4", "-"), "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued)), 0.01)
+	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 	assert.InDelta(t, 0, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
 }
 
@@ -87,7 +87,7 @@ func TestObserver_EmptyUAIgnored(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("", "x.example.com", "1.2.3.4", "-"), "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued)), 0.01)
+	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 }
 
 func TestObserver_LogFormatMissingUAField(t *testing.T) {
@@ -97,7 +97,7 @@ func TestObserver_LogFormatMissingUAField(t *testing.T) {
 	pl := &nginx.ParsedLine{Status: "200", URI: "/", NExtras: 0}
 	o.OnLogLine(pl, "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued)), 0.01)
+	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
 }
 
 func TestObserver_PartialFields(t *testing.T) {

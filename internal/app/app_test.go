@@ -3,6 +3,8 @@ package app
 import (
 	"testing"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
+
 	"github.com/prometheus/client_golang/prometheus"
 	dto "github.com/prometheus/client_model/go"
 	"github.com/stretchr/testify/assert"
@@ -55,6 +57,37 @@ func TestInstrumentedCollectorRecoversPanic(t *testing.T) {
 	ch := make(chan prometheus.Metric, 1)
 	assert.NotPanics(t, func() { ic.Collect(ch) }, "instrumentedCollector must swallow panics from inner.Collect")
 	assert.InDelta(t, 1.0, counterValue(t, panics), 1e-9, "panics counter must be incremented once")
+}
+
+// TestLogHasUserAgent guards the BotLogs "silent zero metrics" trap (O4):
+// when no tailed log_format contains $http_user_agent, Observer drops every
+// line and operators see an empty match_total with no explanation. The check
+// must cover both the discovered per-path map and the single LogFormat
+// override used when AccessLogs are configured manually.
+func TestLogHasUserAgent(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  nginx.LogConfig
+		want bool
+	}{
+		{"empty", nginx.LogConfig{}, false},
+		{"single format with UA", nginx.LogConfig{LogFormat: "$remote_addr - $http_user_agent"}, true},
+		{"single format without UA", nginx.LogConfig{LogFormat: "$remote_addr $request_time"}, false},
+		{"map with UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$http_user_agent"}}, true},
+		{"map without UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$remote_addr"}}, false},
+		{"any-of map has UA", nginx.LogConfig{LogFormats: map[string]string{
+			"/a": "$remote_addr",
+			"/b": "$http_user_agent",
+		}}, true},
+		{"json with UA", nginx.LogConfig{LogFormats: map[string]string{
+			"/a": `{"ua":"$http_user_agent"}`,
+		}}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, logHasUserAgent(tc.cfg))
+		})
+	}
 }
 
 // TestInstrumentedCollectorNormalCallNoPanicCount verifies the counter stays zero

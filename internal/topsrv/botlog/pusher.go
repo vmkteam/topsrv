@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -29,11 +30,27 @@ const (
 	spoolFileGlob = "*.ndjson.gz"
 	spoolSuffix   = ".ndjson.gz"
 
+	// maxTransientPerRun caps how many transient send failures retrySpool
+	// tolerates in a single pass. Without a cap the oldest poison batch would
+	// re-fail on every wakeup and block every newer batch behind it until
+	// trimSpool evicted the old file by budget. The remaining files get a chance
+	// on the next ticker tick.
+	maxTransientPerRun = 3
+
 	// eventsTotal state labels.
 	stateEnqueued = "enqueued"
 	stateSent     = "sent"
 	stateSpooled  = "spooled"
 	stateDropped  = "dropped"
+
+	// eventsTotal{state="dropped"} reason labels. Splitting reasons lets ops
+	// turn rate(events_total{state="dropped"}) alerts into actionable signals —
+	// queue_full (raise BatchSize) vs permanent (fix payload) vs spool_write
+	// (disk gone) vs spool_evict (raise MaxSpoolMB) are different pagers.
+	dropReasonQueueFull  = "queue_full"
+	dropReasonPermanent  = "permanent"
+	dropReasonSpoolWrite = "spool_write"
+	dropReasonSpoolEvict = "spool_evict"
 
 	// sendErrors kind labels.
 	errConnect = "connect"
@@ -48,7 +65,9 @@ var retryBackoff = 5 * time.Second
 
 // httpStatusError carries the HTTP status code so callers can distinguish
 // permanent failures (4xx — bad payload, bad token) from transient ones
-// (5xx, network, timeout) that warrant retry.
+// (5xx, network, timeout) that warrant retry. body is already sanitized:
+// receivers can echo arbitrary request bytes back in errors, and that body
+// will surface in logs through Error("...", "error", err) — see sanitizeResponseBody.
 type httpStatusError struct {
 	code int
 	body string
@@ -56,6 +75,44 @@ type httpStatusError struct {
 
 func (e *httpStatusError) Error() string {
 	return fmt.Sprintf("HTTP %d: %s", e.code, e.body)
+}
+
+// sanitizeResponseBody masks Bearer tokens and inline "token"/"authorization"
+// values so that a misbehaving receiver echoing the request back into the
+// response body cannot leak credentials into centralized logs (Loki/Kibana).
+// Matches are conservative — the goal is to scrub the most common token shapes
+// before they reach Error("...", "error", err), not to be a general PII scrubber.
+var (
+	// "Bearer xxx" anywhere — covers Authorization: Bearer xxx style headers
+	// echoed back into a response. Replaced with the literal [REDACTED] so the
+	// subsequent header/json regexes don't double-mask it.
+	reBearerToken = regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._\-+/=]+`)
+	// JSON-style "token":"xxx" and friends. Captures the key so we can keep it.
+	reJSONTokenKV = regexp.MustCompile(`(?i)"(token|api[_-]?key|authorization)"\s*:\s*"[^"]*"`)
+	// Header- and querystring-style key=value / key: value. Value stops at the
+	// first whitespace or structural delimiter. Skipped when the value is the
+	// literal sentinel left by reBearerToken or reJSONTokenKV.
+	reHeaderTokenKV = regexp.MustCompile(`(?i)(token|api[_-]?key|x-[a-z-]*auth[a-z-]*)\s*([:=])\s*([^\s,;}"]+)`)
+)
+
+func sanitizeResponseBody(body string) string {
+	if body == "" {
+		return body
+	}
+	body = reBearerToken.ReplaceAllString(body, "[REDACTED]")
+	body = reJSONTokenKV.ReplaceAllString(body, `"$1":"[REDACTED]"`)
+	body = reHeaderTokenKV.ReplaceAllStringFunc(body, func(m string) string {
+		groups := reHeaderTokenKV.FindStringSubmatch(m)
+		if len(groups) < 4 {
+			return m
+		}
+		// Already scrubbed — don't double-mask.
+		if groups[3] == "[REDACTED]" {
+			return m
+		}
+		return groups[1] + groups[2] + " [REDACTED]"
+	})
+	return body
 }
 
 // isPermanentFailure reports whether the receiver explicitly rejected the
@@ -99,12 +156,13 @@ type Pusher struct {
 	client *http.Client
 	queue  chan Event
 
-	eventsTotal *prometheus.CounterVec // state=enqueued|sent|spooled|dropped
+	eventsTotal *prometheus.CounterVec // state=enqueued|sent|spooled|dropped, reason=queue_full|permanent|spool_write|spool_evict|""
 	matchTotal  *prometheus.CounterVec // family
 	sendErrors  *prometheus.CounterVec // kind=connect|timeout|status
 	batchDur    prometheus.Histogram
 	spoolFiles  prometheus.Gauge
 	spoolBytes  prometheus.Gauge
+	queueDepth  prometheus.GaugeFunc
 }
 
 // NewPusher constructs a Pusher with metrics registered against reg. cfg must
@@ -118,8 +176,9 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg Config, reg 
 
 		eventsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_botlog_events_total",
-			Help: "Bot-log events by lifecycle state.",
-		}, []string{"state"}),
+			Help: "Bot-log events by lifecycle state and (for dropped) reason. " +
+				"Reasons: queue_full|permanent|spool_write|spool_evict. Other states emit reason=\"\".",
+		}, []string{"state", "reason"}),
 		matchTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_botlog_match_total",
 			Help: "Bot-log UA matches by family — incremented as observer sees a line.",
@@ -142,7 +201,14 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg Config, reg 
 			Help: "Disk bytes used by the spool subdir.",
 		}),
 	}
-	reg.MustRegister(p.eventsTotal, p.matchTotal, p.sendErrors, p.batchDur, p.spoolFiles, p.spoolBytes)
+	// queueDepth reads len(queue) at scrape time. Closing over p so the gauge
+	// stays in sync with channel state without a periodic sampler. Useful as an
+	// early backpressure signal — alert on depth > 0.7 * cap to predict drops.
+	p.queueDepth = prometheus.NewGaugeFunc(prometheus.GaugeOpts{
+		Name: "topsrv_botlog_queue_depth",
+		Help: "Current number of events buffered in the send queue.",
+	}, func() float64 { return float64(len(p.queue)) })
+	reg.MustRegister(p.eventsTotal, p.matchTotal, p.sendErrors, p.batchDur, p.spoolFiles, p.spoolBytes, p.queueDepth)
 	return p
 }
 
@@ -160,9 +226,9 @@ func (p *Pusher) RecordMatch(family string) {
 func (p *Pusher) Enqueue(ev Event) {
 	select {
 	case p.queue <- ev:
-		p.eventsTotal.WithLabelValues(stateEnqueued).Inc()
+		p.eventsTotal.WithLabelValues(stateEnqueued, "").Inc()
 	default:
-		p.eventsTotal.WithLabelValues(stateDropped).Inc()
+		p.eventsTotal.WithLabelValues(stateDropped, dropReasonQueueFull).Inc()
 	}
 }
 
@@ -232,14 +298,14 @@ func (p *Pusher) flush(ctx context.Context, batch []Event) {
 	if err := p.sendWithRetry(ctx, payload, batchID); err != nil {
 		if isPermanentFailure(err) {
 			p.Error(ctx, "botlog: batch permanently rejected, dropping", "error", err, "events", len(batch), "batchId", batchID)
-			p.eventsTotal.WithLabelValues(stateDropped).Add(float64(len(batch)))
+			p.eventsTotal.WithLabelValues(stateDropped, dropReasonPermanent).Add(float64(len(batch)))
 			return
 		}
 		p.Error(ctx, "botlog: send failed, spooling", "error", err, "events", len(batch), "batchId", batchID)
 		p.spool(ctx, payload, batchID)
 		return
 	}
-	p.eventsTotal.WithLabelValues(stateSent).Add(float64(len(batch)))
+	p.eventsTotal.WithLabelValues(stateSent, "").Add(float64(len(batch)))
 }
 
 func (p *Pusher) sendWithRetry(ctx context.Context, payload []byte, batchID string) error {
@@ -285,7 +351,9 @@ func (p *Pusher) send(ctx context.Context, payload []byte, batchID string) error
 	if resp.StatusCode >= 400 {
 		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1024))
 		p.sendErrors.WithLabelValues(errStatus).Inc()
-		return &httpStatusError{code: resp.StatusCode, body: string(body)}
+		// Sanitize before storing: the error chain ends up in centralized logs,
+		// and a misbehaving receiver could echo Authorization bytes back.
+		return &httpStatusError{code: resp.StatusCode, body: sanitizeResponseBody(string(body))}
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
@@ -293,33 +361,47 @@ func (p *Pusher) send(ctx context.Context, payload []byte, batchID string) error
 
 // spool persists a failed batch under SpoolDir/<batchID>.ndjson.gz. The subdir
 // is created lazily so a host without WAL configured silently drops on failure.
+//
+// Permissions: 0o700 on the directory and 0o600 on each batch file. Tight by
+// design — retrySpool replays anything matching the glob with a valid Bearer
+// token, so an attacker with write access to SpoolDir could otherwise forge
+// ingest events for this host. Document the requirement in your deployment:
+// the SpoolDir parent and the directory itself should both be owned by the
+// topsrv user and not world-writable.
 func (p *Pusher) spool(ctx context.Context, payload []byte, batchID string) {
 	if p.cfg.SpoolDir == "" {
-		p.eventsTotal.WithLabelValues(stateDropped).Inc()
+		p.eventsTotal.WithLabelValues(stateDropped, dropReasonSpoolWrite).Inc()
 		return
 	}
-	if err := os.MkdirAll(p.cfg.SpoolDir, 0o750); err != nil {
+	if err := os.MkdirAll(p.cfg.SpoolDir, 0o700); err != nil {
 		p.Error(ctx, "botlog: spool mkdir failed", "dir", p.cfg.SpoolDir, "error", err)
-		p.eventsTotal.WithLabelValues(stateDropped).Inc()
+		p.eventsTotal.WithLabelValues(stateDropped, dropReasonSpoolWrite).Inc()
 		return
 	}
 
 	path := filepath.Join(p.cfg.SpoolDir, batchID+spoolSuffix)
-	if err := os.WriteFile(path, payload, 0o640); err != nil {
+	if err := os.WriteFile(path, payload, 0o600); err != nil {
 		p.Error(ctx, "botlog: spool write failed", "path", path, "error", err)
-		p.eventsTotal.WithLabelValues(stateDropped).Inc()
+		p.eventsTotal.WithLabelValues(stateDropped, dropReasonSpoolWrite).Inc()
 		return
 	}
 
-	p.eventsTotal.WithLabelValues(stateSpooled).Inc()
+	p.eventsTotal.WithLabelValues(stateSpooled, "").Inc()
 	p.trimSpool(ctx)
 }
 
-// retrySpool replays spooled batches oldest-first. Transient failures (5xx,
-// network, timeout) break the loop so a down endpoint isn't hammered.
-// Permanent failures (4xx) delete the file and continue — otherwise one
-// corrupted batch would block every subsequent retry until trim evicts it.
-// Unreadable files are removed to keep the spool moving.
+// retrySpool replays spooled batches oldest-first.
+//
+//   - Transient failures (5xx, network, timeout) skip the file and continue —
+//     capped at maxTransientPerRun per pass so a flapping receiver isn't hammered
+//     while newer batches still get a chance. Without this cap a poison batch
+//     repeatedly rejected by the receiver would block every newer batch behind
+//     it until trimSpool evicted the old file by budget.
+//   - Permanent failures (4xx) delete the file and continue — otherwise one
+//     corrupted batch would block the queue until trim evicts it.
+//   - Unreadable files and files not owned by the current process user are
+//     removed: the second case prevents a local attacker who can write into
+//     SpoolDir from forging ingest events under this host's Bearer token.
 func (p *Pusher) retrySpool(ctx context.Context) {
 	if p.cfg.SpoolDir == "" {
 		return
@@ -330,8 +412,19 @@ func (p *Pusher) retrySpool(ctx context.Context) {
 	}
 	sort.Strings(files) // names are unix-ms-prefixed → ascending == oldest first
 
-	sent := 0
+	sent, transientFails := 0, 0
 	for _, path := range files {
+		if transientFails >= maxTransientPerRun {
+			break
+		}
+		if !p.ownsSpoolFile(ctx, path) {
+			// Foreign file in our spool: someone else wrote it. Refuse to forward
+			// arbitrary content with our token and remove it so the alert chain
+			// fires (spool_evict ticks, files gauge stays accurate).
+			_ = os.Remove(path)
+			p.eventsTotal.WithLabelValues(stateDropped, dropReasonSpoolEvict).Inc()
+			continue
+		}
 		data, err := os.ReadFile(path)
 		if err != nil {
 			_ = os.Remove(path)
@@ -344,7 +437,8 @@ func (p *Pusher) retrySpool(ctx context.Context) {
 				_ = os.Remove(path)
 				continue
 			}
-			break // transient — try later
+			transientFails++
+			continue // transient — skip but try the next file
 		}
 		_ = os.Remove(path)
 		sent++
@@ -397,7 +491,10 @@ func (p *Pusher) trimSpool(ctx context.Context) {
 			continue
 		}
 		total -= sizes[i]
-		p.eventsTotal.WithLabelValues(stateDropped).Inc()
+		// One increment per evicted file, not per event — exact event count is
+		// unknown without re-reading the gzip. Operators alerting on
+		// {reason="spool_evict"} should treat the rate as "files evicted".
+		p.eventsTotal.WithLabelValues(stateDropped, dropReasonSpoolEvict).Inc()
 	}
 	p.Print(ctx, "botlog: spool trimmed", "remainingBytes", total, "budget", budget)
 
@@ -466,4 +563,28 @@ func classifyErr(err error) string {
 		return "timeout"
 	}
 	return "connect"
+}
+
+// ownsSpoolFile reports whether path is owned by the current process user.
+// Used by retrySpool to refuse forwarding foreign files under the agent's
+// Bearer token — a local attacker with write access to SpoolDir could
+// otherwise stage arbitrary gzipped ndjson and have it ingested as if it came
+// from this host. Errors and unknown platforms fail closed (return false): we
+// prefer to drop a possibly-legitimate batch over leaking the token's trust.
+func (p *Pusher) ownsSpoolFile(ctx context.Context, path string) bool {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return false
+	}
+	uid, ok := fileUID(fi)
+	if !ok {
+		// Platforms without a usable Stat_t (e.g. Windows): we have no cheap
+		// way to enforce ownership, so trust the directory's filesystem perms.
+		return true
+	}
+	if uid == os.Getuid() {
+		return true
+	}
+	p.Error(ctx, "botlog: spool file not owned by agent user, discarding", "path", path, "fileUID", uid, "agentUID", os.Getuid())
+	return false
 }

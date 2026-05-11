@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
@@ -84,7 +85,18 @@ type App struct {
 	// Populated by registerLogCollector; tailing starts in Run() after
 	// observers (e.g. botlog) have been attached.
 	logCollector *nginx.LogCollector
+
+	// bg tracks background goroutines started via goBackground (pusher, log
+	// collector, smart, updater). Shutdown waits on bg with a deadline so the
+	// final flush in botlog.Pusher.Run actually has a chance to land — without
+	// this, every rolling restart silently dropped up to BatchSize*2 events.
+	bg sync.WaitGroup
 }
+
+// shutdownTimeout caps how long Shutdown will wait for background goroutines.
+// Chosen to fit one full send round-trip (sendTimeout=10s in botlog) plus the
+// 5s retry backoff with some headroom — anything longer just means SIGKILL.
+const shutdownTimeout = 15 * time.Second
 
 func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 	body, _ := json.Marshal(map[string]string{"status": "ok", "app": appName, "version": version})
@@ -130,15 +142,15 @@ func (a *App) Run(ctx context.Context) error {
 	a.registerBotLogs(ctx)
 
 	if a.logCollector != nil {
-		go a.logCollector.Run(ctx)
+		a.goBackground(func() { a.logCollector.Run(ctx) })
 	}
 
 	if a.pusher != nil {
-		go a.pusher.Run(ctx)
+		a.goBackground(func() { a.pusher.Run(ctx) })
 
 		if a.cfg.Update.Enabled {
 			updater := topsrv.NewUpdater(a.Logger, a.appName, a.version, a.cfg.Update, a.cfg.Push)
-			go updater.Run(ctx)
+			a.goBackground(func() { updater.Run(ctx) })
 		}
 	}
 
@@ -172,9 +184,36 @@ func (a *App) Shutdown() {
 			a.Error(ctx, "http shutdown error", "error", err)
 		}
 	}
+
+	// Wait for background goroutines (pusher, log collector, updater, smart)
+	// before closing collectors and exiting. The main goroutine has already
+	// cancelled the context by this point, so each Run sees ctx.Done() and
+	// does its drain/flush. Without the wait, process exit kills the pusher
+	// mid-flush and the queue's tail batch is lost.
+	done := make(chan struct{})
+	go func() {
+		a.bg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(shutdownTimeout):
+		a.Error(context.Background(), "shutdown: background goroutines did not finish in time", "timeout", shutdownTimeout)
+	}
+
 	for _, c := range a.closers {
 		_ = c.Close()
 	}
+}
+
+// goBackground runs fn in a tracked goroutine. Shutdown waits on all such
+// goroutines so SIGTERM-triggered drains complete before the process exits.
+func (a *App) goBackground(fn func()) {
+	a.bg.Add(1)
+	go func() {
+		defer a.bg.Done()
+		fn()
+	}()
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -284,10 +323,37 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 				"user_labels", cfg.ExtraLabels, "replaced_with", botlog.RequiredFields())
 		}
 		cfg.ExtraLabels = botlog.RequiredFields()
+
+		// Tailing the log won't fail, but Observer silently filters lines whose
+		// $http_user_agent slot is empty. Without UA in *any* tailed format,
+		// bot-log metrics will sit at zero and operators reporting "BotLogs
+		// enabled but match_total is empty" will have nothing to debug.
+		if !logHasUserAgent(cfg) {
+			a.Error(ctx, "WARN: BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
+				"log_paths", cfg.LogPaths)
+		}
 	}
 	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
 	a.logCollector = logC
+}
+
+// logHasUserAgent reports whether at least one tailed log_format contains the
+// http_user_agent field (as $http_user_agent in text formats or the bare
+// http_user_agent token in JSON formats). Checks both the discovered per-path
+// map and the single LogFormat override used when AccessLogs are configured
+// manually. Used by registerLogCollector to warn ops when BotLogs is enabled
+// against formats it cannot derive bot UAs from.
+func logHasUserAgent(cfg nginx.LogConfig) bool {
+	if strings.Contains(cfg.LogFormat, "http_user_agent") {
+		return true
+	}
+	for _, f := range cfg.LogFormats {
+		if strings.Contains(f, "http_user_agent") {
+			return true
+		}
+	}
+	return false
 }
 
 func (a *App) registerPostgres(ctx context.Context, services []topsrv.Service) {
@@ -345,7 +411,7 @@ func (a *App) registerBotLogs(ctx context.Context) {
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
 	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname)
 	a.logCollector.AddObserver(obs)
-	go bp.Run(ctx)
+	a.goBackground(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)
 }
 
@@ -359,7 +425,7 @@ func (a *App) registerSmart(ctx context.Context) {
 	}
 	c := smart.NewCollector(a.Logger, interval)
 	a.addCollector(c)
-	go c.Run(ctx)
+	a.goBackground(func() { c.Run(ctx) })
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

@@ -2,229 +2,176 @@ package botlog
 
 import "strings"
 
-// Bot is a known bot family with ordered UA fingerprints. More specific patterns
-// come first; the family-wide fallback (if any) is last.
-type Bot struct {
-	Family    string
-	NamesByUA []UAName
-}
-
-// UAName maps a UA substring to a botName subtype. Subtypes drive SEO drill-down
-// in the bot-logs UI — googlebot-smartphone vs googlebot-desktop is a
-// load-bearing distinction for mobile-first indexing analysis.
-type UAName struct {
-	Pat  string // substring match, case-sensitive (UA values from logs are unchanged)
-	Name string
+// botPattern is a single UA-substring → (family, subtype) rule. Each entry is
+// matched in declaration order; the first hit wins. More specific patterns
+// must precede the family-wide fallback (e.g. Googlebot-Image before Googlebot).
+//
+// Subtypes drive SEO drill-down in the bot-logs UI — googlebot-smartphone vs
+// googlebot-desktop is a load-bearing distinction for mobile-first indexing
+// analysis. Generic "Googlebot" catches everything Google ships with
+// "Googlebot/2.1" and is refined to smartphone/desktop in refineSubtype using
+// the surrounding Mobile/Android markers (Google does not use a distinct UA
+// token for those).
+type botPattern struct {
+	Family string
+	Pat    string // substring match, case-sensitive (UA values from logs are unchanged)
+	Name   string
 }
 
 // knownBots is a snapshot of UA patterns kept in sync with the topsrv.io
 // bot-verifier. Update this list whenever a new family is added upstream.
-//
-// Generic "Googlebot" catches everything Google ships with "Googlebot/2.1" and
-// gets refined to googlebot-smartphone vs googlebot-desktop in refineSubtype —
-// Google distinguishes those two by the surrounding Mobile/Android markers,
-// not by a separate UA token.
-var knownBots = []Bot{
+// Order is contract — declare specific patterns before family-wide fallbacks.
+var knownBots = []botPattern{
 	// ── Search engines: global ─────────────────────────────────────────
-	{Family: "google", NamesByUA: []UAName{
-		{"Googlebot-Image", "googlebot-image"},
-		{"Googlebot-News", "googlebot-news"},
-		{"Googlebot-Video", "googlebot-video"},
-		{"AdsBot-Google-Mobile", "adsbot-google-mobile"},
-		{"AdsBot-Google", "adsbot-google"},
-		{"Mediapartners-Google", "mediapartners-google"},
-		{"FeedFetcher-Google", "feedfetcher-google"},
-		{"Googlebot", "googlebot"}, // refined to smartphone/desktop in refineSubtype
-	}},
-	{Family: "bing", NamesByUA: []UAName{
-		{"BingPreview", "bingpreview"},
-		{"adidxbot", "adidxbot"},
-		{"bingbot", "bingbot"},
-		{"msnbot", "msnbot"},
-	}},
-	{Family: "duckduckgo", NamesByUA: []UAName{
-		{"DuckDuckBot", "duckduckbot"},
-	}},
-	{Family: "apple", NamesByUA: []UAName{
-		{"Applebot", "applebot"},
-	}},
+	{"google", "Googlebot-Image", "googlebot-image"},
+	{"google", "Googlebot-News", "googlebot-news"},
+	{"google", "Googlebot-Video", "googlebot-video"},
+	{"google", "AdsBot-Google-Mobile", "adsbot-google-mobile"},
+	{"google", "AdsBot-Google", "adsbot-google"},
+	{"google", "Mediapartners-Google", "mediapartners-google"},
+	{"google", "FeedFetcher-Google", "feedfetcher-google"},
+	{"google", "Googlebot", "googlebot"}, // refined to smartphone/desktop in refineSubtype
+
+	{"bing", "BingPreview", "bingpreview"},
+	{"bing", "adidxbot", "adidxbot"},
+	{"bing", "bingbot", "bingbot"},
+	{"bing", "msnbot", "msnbot"},
+
+	{"duckduckgo", "DuckDuckBot", "duckduckbot"},
+
+	{"apple", "Applebot", "applebot"},
 
 	// ── Search engines: RU / CIS ───────────────────────────────────────
-	{Family: "yandex", NamesByUA: []UAName{
-		{"YandexAccessibilityBot", "yandex-accessibility"},
-		{"YandexRenderResourcesBot", "yandex-render"},
-		{"YandexMetrika", "yandex-metrika"},
-		{"YandexImages", "yandeximages"},
-		{"YandexMobileBot", "yandexmobile"},
-		{"YandexVideo", "yandexvideo"},
-		{"YandexMedia", "yandexmedia"},
-		{"YandexTurbo", "yandex-turbo"},
-		{"YandexNews", "yandex-news"},
-		{"YandexMarket", "yandex-market"},
-		{"YandexCalendar", "yandex-calendar"},
-		{"YandexDirect", "yandex-direct"},
-		{"YandexFavicons", "yandex-favicons"},
-		{"YandexBot", "yandexbot"},
-	}},
-	{Family: "mailru", NamesByUA: []UAName{
-		{"Mail.RU_Bot/Img", "mailru-images"},
-		{"Mail.RU_Bot/Fast", "mailru-fast"},
-		{"Mail.RU_Bot", "mailru"},
-	}},
-	{Family: "rambler", NamesByUA: []UAName{
-		{"StackRambler", "stackrambler"},
-	}},
-	{Family: "sputnik", NamesByUA: []UAName{
-		{"SputnikImageBot", "sputnik-images"},
-		{"SputnikBot", "sputnik"},
-	}},
+	{"yandex", "YandexAccessibilityBot", "yandex-accessibility"},
+	{"yandex", "YandexRenderResourcesBot", "yandex-render"},
+	{"yandex", "YandexMetrika", "yandex-metrika"},
+	{"yandex", "YandexImages", "yandeximages"},
+	{"yandex", "YandexMobileBot", "yandexmobile"},
+	{"yandex", "YandexVideo", "yandexvideo"},
+	{"yandex", "YandexMedia", "yandexmedia"},
+	{"yandex", "YandexTurbo", "yandex-turbo"},
+	{"yandex", "YandexNews", "yandex-news"},
+	{"yandex", "YandexMarket", "yandex-market"},
+	{"yandex", "YandexCalendar", "yandex-calendar"},
+	{"yandex", "YandexDirect", "yandex-direct"},
+	{"yandex", "YandexFavicons", "yandex-favicons"},
+	{"yandex", "YandexBot", "yandexbot"},
+
+	{"mailru", "Mail.RU_Bot/Img", "mailru-images"},
+	{"mailru", "Mail.RU_Bot/Fast", "mailru-fast"},
+	{"mailru", "Mail.RU_Bot", "mailru"},
+
+	{"rambler", "StackRambler", "stackrambler"},
+
+	{"sputnik", "SputnikImageBot", "sputnik-images"},
+	{"sputnik", "SputnikBot", "sputnik"},
 
 	// ── Search engines: Asian ──────────────────────────────────────────
-	{Family: "baidu", NamesByUA: []UAName{
-		{"Baiduspider-image", "baidu-images"},
-		{"Baiduspider-mobile", "baidu-mobile"},
-		{"Baiduspider-news", "baidu-news"},
-		{"Baiduspider-video", "baidu-video"},
-		{"Baiduspider", "baiduspider"},
-	}},
-	{Family: "sogou", NamesByUA: []UAName{
-		{"Sogou web spider", "sogou-web"},
-		{"Sogou news spider", "sogou-news"},
-		{"Sogou inst spider", "sogou-inst"},
-	}},
-	{Family: "qihoo", NamesByUA: []UAName{
-		{"360Spider", "360spider"},
-		{"HaosouSpider", "haosou"},
-	}},
-	{Family: "petal", NamesByUA: []UAName{
-		{"PetalBot", "petalbot"},
-		{"AspiegelBot", "aspiegel"},
-	}},
-	{Family: "naver", NamesByUA: []UAName{
-		{"Yeti", "yeti"},
-	}},
-	{Family: "daum", NamesByUA: []UAName{
-		{"Daum", "daum"},
-	}},
+	{"baidu", "Baiduspider-image", "baidu-images"},
+	{"baidu", "Baiduspider-mobile", "baidu-mobile"},
+	{"baidu", "Baiduspider-news", "baidu-news"},
+	{"baidu", "Baiduspider-video", "baidu-video"},
+	{"baidu", "Baiduspider", "baiduspider"},
+
+	{"sogou", "Sogou web spider", "sogou-web"},
+	{"sogou", "Sogou news spider", "sogou-news"},
+	{"sogou", "Sogou inst spider", "sogou-inst"},
+
+	{"qihoo", "360Spider", "360spider"},
+	{"qihoo", "HaosouSpider", "haosou"},
+
+	{"petal", "PetalBot", "petalbot"},
+	{"petal", "AspiegelBot", "aspiegel"},
+
+	{"naver", "Yeti", "yeti"},
+
+	{"daum", "Daum", "daum"},
 
 	// ── AI / LLM crawlers (2024-2026) ──────────────────────────────────
-	{Family: "openai", NamesByUA: []UAName{
-		{"GPTBot", "gptbot"},
-		{"OAI-SearchBot", "oai-searchbot"},
-		{"ChatGPT-User", "chatgpt-user"},
-	}},
-	{Family: "anthropic", NamesByUA: []UAName{
-		{"Claude-SearchBot", "claude-searchbot"},
-		{"Claude-User", "claude-user"},
-		{"ClaudeBot", "claudebot"},
-		{"Claude-Web", "claude-web"},
-		{"anthropic-ai", "anthropic-ai"},
-	}},
-	{Family: "perplexity", NamesByUA: []UAName{
-		{"PerplexityBot", "perplexitybot"},
-		{"Perplexity-User", "perplexity-user"},
-	}},
-	{Family: "mistral", NamesByUA: []UAName{
-		{"MistralAI-User", "mistral-user"},
-	}},
-	{Family: "cohere", NamesByUA: []UAName{
-		{"cohere-training-data-crawler", "cohere-training"},
-		{"cohere-ai", "cohere"},
-	}},
-	{Family: "amazon", NamesByUA: []UAName{
-		{"Amazonbot", "amazonbot"},
-	}},
-	{Family: "diffbot", NamesByUA: []UAName{
-		{"Diffbot", "diffbot"},
-	}},
-	{Family: "ai2", NamesByUA: []UAName{
-		{"AI2Bot", "ai2bot"},
-	}},
-	{Family: "you", NamesByUA: []UAName{
-		{"YouBot", "youbot"},
-	}},
-	{Family: "timpi", NamesByUA: []UAName{
-		{"Timpibot", "timpibot"},
-	}},
-	{Family: "meta", NamesByUA: []UAName{
-		{"meta-externalagent", "meta-externalagent"},
-		{"meta-externalfetcher", "meta-externalfetcher"},
-		{"facebookexternalhit", "facebookexternalhit"},
-		{"FacebookBot", "facebookbot"},
-	}},
-	{Family: "bytespider", NamesByUA: []UAName{
-		// TikTokSpider shares *.bytedance.com PTR with Bytespider — keep them
-		// under one family so FCrDNS verification on the receiver side stays
-		// consistent and legit TikTok crawls aren't mis-flagged as spoofed.
-		{"TikTokSpider", "tiktokspider"},
-		{"Bytespider", "bytespider"},
-	}},
-	{Family: "common-crawl", NamesByUA: []UAName{
-		{"CCBot", "ccbot"},
-	}},
+	{"openai", "GPTBot", "gptbot"},
+	{"openai", "OAI-SearchBot", "oai-searchbot"},
+	{"openai", "ChatGPT-User", "chatgpt-user"},
+
+	{"anthropic", "Claude-SearchBot", "claude-searchbot"},
+	{"anthropic", "Claude-User", "claude-user"},
+	{"anthropic", "ClaudeBot", "claudebot"},
+	{"anthropic", "Claude-Web", "claude-web"},
+	{"anthropic", "anthropic-ai", "anthropic-ai"},
+
+	{"perplexity", "PerplexityBot", "perplexitybot"},
+	{"perplexity", "Perplexity-User", "perplexity-user"},
+
+	{"mistral", "MistralAI-User", "mistral-user"},
+
+	{"cohere", "cohere-training-data-crawler", "cohere-training"},
+	{"cohere", "cohere-ai", "cohere"},
+
+	{"amazon", "Amazonbot", "amazonbot"},
+
+	{"diffbot", "Diffbot", "diffbot"},
+
+	{"ai2", "AI2Bot", "ai2bot"},
+
+	{"you", "YouBot", "youbot"},
+
+	{"timpi", "Timpibot", "timpibot"},
+
+	{"meta", "meta-externalagent", "meta-externalagent"},
+	{"meta", "meta-externalfetcher", "meta-externalfetcher"},
+	{"meta", "facebookexternalhit", "facebookexternalhit"},
+	{"meta", "FacebookBot", "facebookbot"},
+
+	// TikTokSpider shares *.bytedance.com PTR with Bytespider — keep them
+	// under one family so FCrDNS verification on the receiver side stays
+	// consistent and legit TikTok crawls aren't mis-flagged as spoofed.
+	{"bytespider", "TikTokSpider", "tiktokspider"},
+	{"bytespider", "Bytespider", "bytespider"},
+
+	{"common-crawl", "CCBot", "ccbot"},
 
 	// ── SEO crawlers ──────────────────────────────────────────────────
-	{Family: "ahrefs", NamesByUA: []UAName{
-		{"AhrefsSiteAudit", "ahrefs-siteaudit"},
-		{"AhrefsBot", "ahrefsbot"},
-	}},
-	{Family: "semrush", NamesByUA: []UAName{
-		{"SemrushBot-OCOB", "semrush-ocob"},
-		{"SemrushBot-SI", "semrush-si"},
-		{"SemrushBot-SWA", "semrush-swa"},
-		{"SemrushBot-BA", "semrush-ba"},
-		{"SemrushBot", "semrushbot"},
-	}},
-	{Family: "majestic", NamesByUA: []UAName{
-		{"MJ12bot", "mj12bot"},
-	}},
-	{Family: "moz", NamesByUA: []UAName{
-		{"rogerbot", "rogerbot"},
-		{"DotBot", "dotbot"},
-	}},
-	{Family: "webmeup", NamesByUA: []UAName{
-		{"BLEXBot", "blexbot"},
-	}},
-	{Family: "dataforseo", NamesByUA: []UAName{
-		{"DataForSeoBot", "dataforseobot"},
-	}},
+	{"ahrefs", "AhrefsSiteAudit", "ahrefs-siteaudit"},
+	{"ahrefs", "AhrefsBot", "ahrefsbot"},
+
+	{"semrush", "SemrushBot-OCOB", "semrush-ocob"},
+	{"semrush", "SemrushBot-SI", "semrush-si"},
+	{"semrush", "SemrushBot-SWA", "semrush-swa"},
+	{"semrush", "SemrushBot-BA", "semrush-ba"},
+	{"semrush", "SemrushBot", "semrushbot"},
+
+	{"majestic", "MJ12bot", "mj12bot"},
+
+	{"moz", "rogerbot", "rogerbot"},
+	{"moz", "DotBot", "dotbot"},
+
+	{"webmeup", "BLEXBot", "blexbot"},
+
+	{"dataforseo", "DataForSeoBot", "dataforseobot"},
 
 	// ── Social / messenger link-preview fetchers ──────────────────────
-	{Family: "twitter", NamesByUA: []UAName{
-		{"Twitterbot", "twitterbot"},
-	}},
-	{Family: "linkedin", NamesByUA: []UAName{
-		{"LinkedInBot", "linkedinbot"},
-	}},
-	{Family: "pinterest", NamesByUA: []UAName{
-		{"Pinterestbot", "pinterestbot"},
-		{"Pinterest", "pinterest"},
-	}},
-	{Family: "slack", NamesByUA: []UAName{
-		{"Slackbot-LinkExpanding", "slack-linkexpanding"},
-		{"Slackbot", "slackbot"},
-	}},
-	{Family: "discord", NamesByUA: []UAName{
-		{"Discordbot", "discordbot"},
-	}},
-	{Family: "telegram", NamesByUA: []UAName{
-		{"TelegramBot", "telegrambot"},
-	}},
-	{Family: "whatsapp", NamesByUA: []UAName{
-		{"WhatsApp", "whatsapp"},
-	}},
-	{Family: "vk", NamesByUA: []UAName{
-		{"vkShare", "vkshare"},
-	}},
-	{Family: "skype", NamesByUA: []UAName{
-		{"SkypeUriPreview", "skype-preview"},
-	}},
+	{"twitter", "Twitterbot", "twitterbot"},
+
+	{"linkedin", "LinkedInBot", "linkedinbot"},
+
+	{"pinterest", "Pinterestbot", "pinterestbot"},
+	{"pinterest", "Pinterest", "pinterest"},
+
+	{"slack", "Slackbot-LinkExpanding", "slack-linkexpanding"},
+	{"slack", "Slackbot", "slackbot"},
+
+	{"discord", "Discordbot", "discordbot"},
+
+	{"telegram", "TelegramBot", "telegrambot"},
+
+	{"whatsapp", "WhatsApp", "whatsapp"},
+
+	{"vk", "vkShare", "vkshare"},
+
+	{"skype", "SkypeUriPreview", "skype-preview"},
 
 	// ── Web archive ───────────────────────────────────────────────────
-	{Family: "archive", NamesByUA: []UAName{
-		{"archive.org_bot", "archive-org"},
-		{"ia_archiver", "ia-archiver"},
-	}},
+	{"archive", "archive.org_bot", "archive-org"},
+	{"archive", "ia_archiver", "ia-archiver"},
 }
 
 // MatchUA returns the bot family and subtype for ua. Returns ("", "") when no
@@ -243,10 +190,8 @@ func MatchUA(ua string, extraPatterns []string) (family, name string) {
 		}
 	}
 	for _, b := range knownBots {
-		for _, p := range b.NamesByUA {
-			if strings.Contains(ua, p.Pat) {
-				return b.Family, refineSubtype(b.Family, p.Name, ua)
-			}
+		if strings.Contains(ua, b.Pat) {
+			return b.Family, refineSubtype(b.Family, b.Name, ua)
 		}
 	}
 	return "", ""
