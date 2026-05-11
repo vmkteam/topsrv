@@ -71,9 +71,16 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 		return
 	}
 
+	// Bot-log UI groups by actual URL, not the nginx-metrics-normalized form.
+	// Fall back to URI if the log format doesn't yield a raw path (legacy
+	// $uri after rewrite — less precise but still useful).
+	uri := p.RawPath
+	if uri == "" {
+		uri = p.URI
+	}
 	ev := BuildEvent(time.Now(), o.hostname, Fields{
 		Status:               p.Status,
-		URI:                  p.URI,
+		URI:                  uri,
 		BodyBytesSent:        p.BodyBytesSent,
 		RequestTime:          p.RequestTime,
 		UpstreamResponseTime: p.UpstreamResponseTime,

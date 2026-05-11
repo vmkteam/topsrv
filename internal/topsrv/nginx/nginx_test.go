@@ -115,14 +115,15 @@ type recordingObserver struct {
 }
 
 type recordedLine struct {
-	status string
-	uri    string
-	ua     string
-	path   string
+	status  string
+	uri     string
+	rawPath string
+	ua      string
+	path    string
 }
 
 func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
-	rl := recordedLine{status: p.Status, uri: p.URI, path: path}
+	rl := recordedLine{status: p.Status, uri: p.URI, rawPath: p.RawPath, path: path}
 	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
 		rl.ua = p.Extras[r.uaIdx]
 	}
@@ -161,6 +162,71 @@ func TestLogCollectorObserver(t *testing.T) {
 	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Mozilla/5.0"}, n: 1}])
 	assert.EqualValues(t, 1, c.taggedCounts[taggedStatusKey{status: "200", extra: [4]string{"Googlebot/2.1"}, n: 1}])
 	assert.EqualValues(t, 0, c.reqCount, "no timing field → no histogram update")
+}
+
+// Verifies the URI vs RawPath split: nginx-metrics keep the normalized form
+// (cardinality control), observers like botlog get the actual hit URL.
+func TestParsedLine_RawPathUnnormalized(t *testing.T) {
+	cases := []struct {
+		name        string
+		setup       func(c *LogCollector)
+		feed        func(c *LogCollector)
+		wantURI     string
+		wantRawPath string
+	}{
+		{
+			name: "text/$request with numeric segment",
+			setup: func(c *LogCollector) {
+				c.AddObserver(&recordingObserver{uaIdx: -1})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLineWith(c.defaultParser,
+					`1.2.3.4 [11/Apr/2026:17:15:23 +0300] "GET /news/12345/title?utm=x HTTP/1.1" 200 1234 "Bot/1"`,
+					"/var/log/nginx/access.log")
+			},
+			wantURI:     "/news/:id/:rest",
+			wantRawPath: "/news/12345/title",
+		},
+		{
+			name: "JSON request_uri with querystring",
+			setup: func(c *LogCollector) {
+				c.AddObserver(&recordingObserver{uaIdx: -1})
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/series/777/episodes?page=2","upstream_response_time":""}`)
+			},
+			wantURI:     "/series/:id/:rest",
+			wantRawPath: "/series/777/episodes",
+		},
+		{
+			name: "JSON with extra-labels path (map unmarshal)",
+			setup: func(c *LogCollector) {
+				c.extraFields = []string{"http_user_agent"}
+				c.AddObserver(&recordingObserver{uaIdx: 0})
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/user/42/comments","http_user_agent":"Bot/1"}`)
+			},
+			wantURI:     "/user/:id/:rest",
+			wantRawPath: "/user/42/comments",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewLogCollector(embedlog.Logger{}, LogConfig{
+				LogPaths:  []string{"/dev/null"},
+				LogFormat: `$remote_addr [$time_local] "$request" $status $body_bytes_sent "$http_user_agent"`,
+			})
+			tc.setup(c)
+			tc.feed(c)
+			rec := c.observers[0].(*recordingObserver)
+			require.Len(t, rec.lines, 1)
+			assert.Equal(t, tc.wantURI, rec.lines[0].uri, "URI must be normalized for nginx-metrics")
+			assert.Equal(t, tc.wantRawPath, rec.lines[0].rawPath, "RawPath must be the raw request path (querystring stripped)")
+		})
+	}
 }
 
 func TestLogCollectorCustomFormat(t *testing.T) {

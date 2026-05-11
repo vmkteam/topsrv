@@ -73,6 +73,40 @@ func TestObserver_EnqueuesBotEvent(t *testing.T) {
 	}
 }
 
+// Verifies the bot-logs UI fix: Event.URI must carry RawPath (un-normalized
+// hit URL), not the cardinality-collapsed ParsedLine.URI.
+func TestObserver_UsesRawPathOverURI(t *testing.T) {
+	o, p := newObserverPair(t)
+	pl := &nginx.ParsedLine{
+		Status:  "200",
+		URI:     "/news/:id/:rest",
+		RawPath: "/news/12345/some-title",
+		Extras:  [4]string{"GPTBot/1.0", "", "", ""},
+		NExtras: 1,
+	}
+	o.OnLogLine(pl, "")
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.Equal(t, "/news/12345/some-title", ev.URI)
+}
+
+// When the log format yields no RawPath (legacy $uri after rewrite), Observer
+// must fall back to ParsedLine.URI rather than emit an empty event URI.
+func TestObserver_FallsBackToURIWhenRawPathEmpty(t *testing.T) {
+	o, p := newObserverPair(t)
+	pl := &nginx.ParsedLine{
+		Status:  "200",
+		URI:     "/news/:id",
+		RawPath: "",
+		Extras:  [4]string{"GPTBot/1.0", "", "", ""},
+		NExtras: 1,
+	}
+	o.OnLogLine(pl, "")
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.Equal(t, "/news/:id", ev.URI)
+}
+
 func TestObserver_NonBotIgnored(t *testing.T) {
 	o, p := newObserverPair(t)
 
