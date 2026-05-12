@@ -155,6 +155,10 @@ Channel  = "stable"         # stable / beta
 # UATruncate    = 1024      # truncate user-agent at this length
 # URITruncate   = 2048      # truncate request URI at this length
 # ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
+# Field aliases — only set when discovery cannot infer the right name
+# (e.g. operator-defined `set $custom $http_referer;`). Empty falls back.
+# [BotLogs.FieldAliases]
+# Referer = "ref"
 ```
 
 | Parameter | Default | Description |
@@ -190,6 +194,7 @@ Channel  = "stable"         # stable / beta
 | `BotLogs.UATruncate` | `1024` | Max UA length per event |
 | `BotLogs.URITruncate` | `2048` | Max URI length per event |
 | `BotLogs.ExtraUAPatterns` | `[]` | Local additions to known-bots UA patterns |
+| `BotLogs.FieldAliases.*` | auto | Per-format field-name overrides (UserAgent/Host/ServerName/RemoteAddr/Referer). Discovery auto-detects from `log_format`; only set when operator uses non-standard variables nginx config |
 
 ### Environment variables
 

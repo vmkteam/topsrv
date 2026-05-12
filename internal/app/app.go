@@ -92,6 +92,11 @@ type App struct {
 	// Observer's positional field-index resolution.
 	extractFields []string
 
+	// Per-format field aliases resolved from discovered log_format strings.
+	// registerLogCollector picks one canonical set (warning on mismatch) and
+	// registerBotLogs hands it to NewObserver.
+	botlogAliases botlog.FieldAliases
+
 	// Tracks pusher/log collector/smart/updater so Shutdown can wait for
 	// their drain paths before the process exits.
 	bg sync.WaitGroup
@@ -356,12 +361,14 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 
 	cfg.ExtractFields = cfg.ExtraLabels
 	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
-		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields())
-		if !logHasUserAgent(cfg) {
+		a.botlogAliases = a.resolveBotlogAliases(ctx, cfg)
+		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields(a.botlogAliases))
+		if a.botlogAliases.UserAgent == "" {
 			a.warnConfig(ctx, "botlog_no_ua_field",
 				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
 				"log_paths", cfg.LogPaths)
 		}
+		a.Print(ctx, "botlog: resolved field aliases", "aliases", a.botlogAliases.String())
 	}
 
 	if dropped := capExtractFields(&cfg); len(dropped) > 0 {
@@ -417,16 +424,49 @@ func truncateList(s []string, n int) []string {
 	return append(append([]string(nil), s[:n]...), "…+more")
 }
 
-func logHasUserAgent(cfg nginx.LogConfig) bool {
-	if strings.Contains(cfg.LogFormat, "http_user_agent") {
-		return true
+// resolveBotlogAliases inspects every log_format paired with cfg's LogPaths
+// (default plus per-path overrides) and returns one canonical alias set for
+// the Observer. The TOML override from BotLogs.FieldAliases wins, then the
+// detected aliases, with DefaultAliases as the last-resort layer.
+//
+// Multi-format setups: if paths resolve to non-identical alias sets we keep
+// the first path's resolution and emit a config warning — the v2 plan is
+// per-path Observer wiring once an operator hits this in production.
+func (a *App) resolveBotlogAliases(ctx context.Context, cfg nginx.LogConfig) botlog.FieldAliases {
+	override := botlog.FieldAliases{}
+	if a.cfg.BotLogs != nil {
+		override = a.cfg.BotLogs.FieldAliases
 	}
-	for _, f := range cfg.LogFormats {
-		if strings.Contains(f, "http_user_agent") {
-			return true
+
+	formatFor := func(p string) (string, bool) {
+		if f, ok := cfg.LogFormats[p]; ok {
+			return f, cfg.JSONPaths[p]
+		}
+		return cfg.LogFormat, false
+	}
+
+	var canonical botlog.FieldAliases
+	var canonicalPath string
+	mismatched := make([]string, 0)
+	for _, p := range cfg.LogPaths {
+		format, isJSON := formatFor(p)
+		detected := botlog.DetectAliases(format, isJSON)
+		resolved := override.Merge(detected).Merge(botlog.DefaultAliases())
+		if canonicalPath == "" {
+			canonical = resolved
+			canonicalPath = p
+			continue
+		}
+		if resolved != canonical {
+			mismatched = append(mismatched, p)
 		}
 	}
-	return false
+	if len(mismatched) > 0 {
+		a.warnConfig(ctx, "botlog_alias_mismatch",
+			"log_formats across tailed paths resolve to different botlog aliases; using first path's resolution",
+			"canonical_path", canonicalPath, "mismatched_paths", truncateList(mismatched, 8))
+	}
+	return canonical
 }
 
 // highCardLabels returns the intersection of labels with the denylist.
@@ -516,7 +556,7 @@ func (a *App) registerBotLogs(ctx context.Context) {
 		return
 	}
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
-	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.extractFields)
+	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.extractFields, a.botlogAliases)
 	a.logCollector.AddObserver(obs)
 	a.goBackground(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)

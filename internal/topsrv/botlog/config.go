@@ -45,6 +45,12 @@ type Config struct {
 	URITruncate     int      // max URI length stored per event; default 2048
 	ExtraUAPatterns []string // local additions to knownBots (substring, case-sensitive)
 
+	// FieldAliases is an explicit override for the per-format auto-detection
+	// of nginx field names. Set when discovery cannot infer the right name
+	// (e.g. operator uses `set $custom $http_referer;` in nginx config).
+	// Empty fields mean "fall back to auto-detected (or default) name".
+	FieldAliases FieldAliases
+
 	parsedBatchInterval time.Duration // populated by Validate
 }
 

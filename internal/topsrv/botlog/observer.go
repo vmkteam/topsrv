@@ -18,13 +18,15 @@ const (
 	fieldReferer    = "http_referer"
 )
 
-// RequiredFields lists the nginx variables the LogCollector must read into
-// ParsedLine.Extras for the bot-log Observer to work. These are NOT promoted
-// to Prometheus labels — app.registerLogCollector merges them into
-// LogConfig.ExtractFields, leaving operator-supplied ExtraLabels (low
-// cardinality) as the only Prometheus label set.
-func RequiredFields() []string {
-	return []string{fieldUserAgent, fieldHost, fieldServerName, fieldRemoteAddr, fieldReferer}
+// RequiredFields returns the field names that LogCollector must read into
+// ParsedLine.Extras for the bot-log Observer to work, resolved via aliases.
+// Empty aliases (fields the operator's log_format doesn't carry) are dropped
+// — those Event fields ship empty. These names are NOT promoted to Prometheus
+// labels — app.registerLogCollector merges them into LogConfig.ExtractFields,
+// leaving operator-supplied ExtraLabels (low cardinality) as the only
+// Prometheus label set.
+func RequiredFields(aliases FieldAliases) []string {
+	return aliases.Names()
 }
 
 // maxHostLen caps the request Host header value retained on an Event. Picked
@@ -64,19 +66,32 @@ type Observer struct {
 // NewObserver wires an Observer against an already-constructed Pusher.
 // extractFields must mirror the LogCollector's ExtractFields slice — its
 // indices determine where each variable lands in ParsedLine.Extras.
-func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string) *Observer {
+// aliases is the per-format resolution of which field name carries which
+// semantic value (UA, Host, etc.); empty entries collapse to idx -1 and the
+// Event ships those fields empty.
+func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string, aliases FieldAliases) *Observer {
 	return &Observer{
 		pusher:        p,
 		hostname:      hostname,
 		uaTruncate:    cfg.UATruncate,
 		uriTruncate:   cfg.URITruncate,
 		extraPatterns: cfg.ExtraUAPatterns,
-		idxUA:         slices.Index(extractFields, fieldUserAgent),
-		idxHost:       slices.Index(extractFields, fieldHost),
-		idxServerName: slices.Index(extractFields, fieldServerName),
-		idxRemoteAddr: slices.Index(extractFields, fieldRemoteAddr),
-		idxReferer:    slices.Index(extractFields, fieldReferer),
+		idxUA:         indexOrSkip(extractFields, aliases.UserAgent),
+		idxHost:       indexOrSkip(extractFields, aliases.Host),
+		idxServerName: indexOrSkip(extractFields, aliases.ServerName),
+		idxRemoteAddr: indexOrSkip(extractFields, aliases.RemoteAddr),
+		idxReferer:    indexOrSkip(extractFields, aliases.Referer),
 	}
+}
+
+// indexOrSkip is slices.Index that maps "" to -1 directly, avoiding the
+// false-positive where an empty alias collides with a "" stub left in
+// extractFields.
+func indexOrSkip(extractFields []string, name string) int {
+	if name == "" {
+		return -1
+	}
+	return slices.Index(extractFields, name)
 }
 
 // OnLogLine satisfies nginx.LogObserver. Matches the UA first to skip Fields

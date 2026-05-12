@@ -59,32 +59,6 @@ func TestInstrumentedCollectorRecoversPanic(t *testing.T) {
 	assert.InDelta(t, 1.0, counterValue(t, panics), 1e-9, "panics counter must be incremented once")
 }
 
-func TestLogHasUserAgent(t *testing.T) {
-	cases := []struct {
-		name string
-		cfg  nginx.LogConfig
-		want bool
-	}{
-		{"empty", nginx.LogConfig{}, false},
-		{"single format with UA", nginx.LogConfig{LogFormat: "$remote_addr - $http_user_agent"}, true},
-		{"single format without UA", nginx.LogConfig{LogFormat: "$remote_addr $request_time"}, false},
-		{"map with UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$http_user_agent"}}, true},
-		{"map without UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$remote_addr"}}, false},
-		{"any-of map has UA", nginx.LogConfig{LogFormats: map[string]string{
-			"/a": "$remote_addr",
-			"/b": "$http_user_agent",
-		}}, true},
-		{"json with UA", nginx.LogConfig{LogFormats: map[string]string{
-			"/a": `{"ua":"$http_user_agent"}`,
-		}}, true},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, logHasUserAgent(tc.cfg))
-		})
-	}
-}
-
 // TestInstrumentedCollectorNormalCallNoPanicCount verifies the counter stays zero
 // for well-behaved collectors — panics_total must be signal, not noise.
 func TestInstrumentedCollectorNormalCallNoPanicCount(t *testing.T) {
