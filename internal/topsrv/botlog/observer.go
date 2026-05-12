@@ -53,6 +53,7 @@ type Observer struct {
 	pusher        *Pusher
 	hostname      string
 	uaTruncate    int
+	uriTruncate   int
 	extraPatterns []string
 
 	// Resolved at construction from the LogCollector's ExtractFields. -1 when
@@ -68,6 +69,7 @@ func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string)
 		pusher:        p,
 		hostname:      hostname,
 		uaTruncate:    cfg.UATruncate,
+		uriTruncate:   cfg.URITruncate,
 		extraPatterns: cfg.ExtraUAPatterns,
 		idxUA:         slices.Index(extractFields, fieldUserAgent),
 		idxHost:       slices.Index(extractFields, fieldHost),
@@ -100,7 +102,7 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 	}
 	ev := BuildEvent(time.Now(), o.hostname, Fields{
 		Status:               p.Status,
-		URI:                  uri,
+		URI:                  truncate(uri, o.uriTruncate),
 		BodyBytesSent:        p.BodyBytesSent,
 		RequestTime:          p.RequestTime,
 		UpstreamResponseTime: p.UpstreamResponseTime,

@@ -49,4 +49,5 @@ Channel  = "stable"      # stable / beta
 # SpoolDir      = ""        # default: [Push].SpoolDir
 # MaxSpoolMB    = 200       # WAL disk budget
 # UATruncate    = 1024      # truncate user-agent at this length
+# URITruncate   = 2048      # truncate request URI at this length
 # ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
