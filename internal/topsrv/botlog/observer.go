@@ -53,6 +53,7 @@ type Observer struct {
 	pusher        *Pusher
 	hostname      string
 	uaTruncate    int
+	uriTruncate   int
 	extraPatterns []string
 
 	// Resolved at construction from the LogCollector's ExtractFields. -1 when
@@ -68,6 +69,7 @@ func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string)
 		pusher:        p,
 		hostname:      hostname,
 		uaTruncate:    cfg.UATruncate,
+		uriTruncate:   cfg.URITruncate,
 		extraPatterns: cfg.ExtraUAPatterns,
 		idxUA:         slices.Index(extractFields, fieldUserAgent),
 		idxHost:       slices.Index(extractFields, fieldHost),
@@ -91,15 +93,16 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 	}
 
 	// Bot-log UI groups by actual URL, not the nginx-metrics-normalized form.
-	// Fall back to URI if the log format doesn't yield a raw path (legacy
-	// $uri after rewrite — less precise but still useful).
-	uri := p.RawPath
+	// RawURI keeps the query string so HasQueryParams on gatesrv works; the
+	// normalized URI is the last-resort fallback for log formats that yield
+	// neither $request nor $uri.
+	uri := p.RawURI
 	if uri == "" {
 		uri = p.URI
 	}
 	ev := BuildEvent(time.Now(), o.hostname, Fields{
 		Status:               p.Status,
-		URI:                  uri,
+		URI:                  truncate(uri, o.uriTruncate),
 		BodyBytesSent:        p.BodyBytesSent,
 		RequestTime:          p.RequestTime,
 		UpstreamResponseTime: p.UpstreamResponseTime,

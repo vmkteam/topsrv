@@ -347,7 +347,7 @@ func (c *LogCollector) parseLine(line string) {
 type ParsedLine struct {
 	Status               string
 	URI                  string // path normalized for nginx-metrics cardinality (/:id, /:rest)
-	RawPath              string // un-normalized request path (querystring stripped) — for observers that need the actual URL (e.g. botlog)
+	RawURI               string // un-normalized request URI (path + query) — for observers that need the full URL (e.g. botlog)
 	BodyBytesSent        string
 	RequestTime          string
 	UpstreamResponseTime string
@@ -371,10 +371,10 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 
 	if req, err := entry.Field("request"); err == nil {
 		p.URI = normalizeURI(req)
-		p.RawPath = rawPathFromRequest(req)
+		p.RawURI = rawURIFromRequest(req)
 	} else if u, err := entry.Field("uri"); err == nil {
 		p.URI = normalizePath(u)
-		p.RawPath = stripQuery(u)
+		p.RawURI = stripQuery(u)
 	}
 
 	for i, f := range c.extractFields {
@@ -408,7 +408,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		p.UpstreamResponseTime = m["upstream_response_time"]
 		p.UpstreamCacheStatus = m["upstream_cache_status"]
 		p.URI = normalizeRequestURI(m["request_uri"], m["request"])
-		p.RawPath = rawPathFromJSON(m["request_uri"], m["request"])
+		p.RawURI = rawURIFromJSON(m["request_uri"], m["request"])
 
 		for i, f := range c.extractFields {
 			if i >= len(p.Extras) {
@@ -434,7 +434,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		UpstreamResponseTime: entry.UpstreamResponseTime,
 		UpstreamCacheStatus:  entry.UpstreamCacheStatus,
 		URI:                  normalizeRequestURI(entry.RequestURI, entry.Request),
-		RawPath:              rawPathFromJSON(entry.RequestURI, entry.Request),
+		RawURI:               rawURIFromJSON(entry.RequestURI, entry.Request),
 	}
 
 	c.finishLine(&p, path)
@@ -475,24 +475,23 @@ func normalizeRequestURI(requestURI, request string) string {
 	return ""
 }
 
-// rawPathFromRequest extracts the un-normalized path from "$request" (e.g.
-// "GET /news/12345/title HTTP/1.1") with the querystring stripped. Returns ""
-// if request is malformed.
-func rawPathFromRequest(request string) string {
+// rawURIFromRequest extracts the un-normalized request URI (path + query) from
+// "$request" (e.g. "GET /news/12345?utm=x HTTP/1.1"). Returns "" if malformed.
+func rawURIFromRequest(request string) string {
 	parts := strings.SplitN(request, " ", 3)
 	if len(parts) < 2 {
 		return ""
 	}
-	return stripQuery(parts[1])
+	return parts[1]
 }
 
-// rawPathFromJSON picks request_uri (preferred — already path-only in most
-// log_formats) and falls back to parsing $request. Querystring is stripped.
-func rawPathFromJSON(requestURI, request string) string {
+// rawURIFromJSON picks request_uri (already carries query string from nginx)
+// and falls back to parsing $request. Querystring is preserved.
+func rawURIFromJSON(requestURI, request string) string {
 	if requestURI != "" {
-		return stripQuery(requestURI)
+		return requestURI
 	}
-	return rawPathFromRequest(request)
+	return rawURIFromRequest(request)
 }
 
 func stripQuery(p string) string {

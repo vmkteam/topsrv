@@ -75,31 +75,49 @@ func TestObserver_EnqueuesBotEvent(t *testing.T) {
 	}
 }
 
-// Verifies the bot-logs UI fix: Event.URI must carry RawPath (un-normalized
-// hit URL), not the cardinality-collapsed ParsedLine.URI.
-func TestObserver_UsesRawPathOverURI(t *testing.T) {
+// Verifies the bot-logs UI fix: Event.URI must carry RawURI (un-normalized
+// hit URL with query string), not the cardinality-collapsed ParsedLine.URI.
+func TestObserver_UsesRawURIOverURI(t *testing.T) {
 	o, p := newObserverPair(t)
 	pl := &nginx.ParsedLine{
 		Status:  "200",
 		URI:     "/news/:id/:rest",
-		RawPath: "/news/12345/some-title",
+		RawURI:  "/news/12345/some-title?utm=x",
 		Extras:  [nginx.MaxExtras]string{"GPTBot/1.0", "", "", ""},
 		NExtras: 1,
 	}
 	o.OnLogLine(pl, "")
 	require.Len(t, p.queue, 1)
 	ev := <-p.queue
-	assert.Equal(t, "/news/12345/some-title", ev.URI)
+	assert.Equal(t, "/news/12345/some-title?utm=x", ev.URI)
 }
 
-// When the log format yields no RawPath (legacy $uri after rewrite), Observer
+// Pathological bot probes regularly send 4-8KB URIs with base64/SQLi payloads.
+// Observer must cap Event.URI at Config.URITruncate before shipping.
+func TestObserver_TruncatesURI(t *testing.T) {
+	o, p := newObserverPair(t)
+	long := "/probe?p=" + strings.Repeat("A", 5000)
+	pl := &nginx.ParsedLine{
+		Status:  "200",
+		URI:     "/probe",
+		RawURI:  long,
+		Extras:  [nginx.MaxExtras]string{"GPTBot/1.0", "", "", ""},
+		NExtras: 1,
+	}
+	o.OnLogLine(pl, "")
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.Len(t, ev.URI, DefaultURITruncate)
+	assert.Equal(t, long[:DefaultURITruncate], ev.URI)
+}
+
+// When the log format yields no RawURI (legacy $uri after rewrite), Observer
 // must fall back to ParsedLine.URI rather than emit an empty event URI.
-func TestObserver_FallsBackToURIWhenRawPathEmpty(t *testing.T) {
+func TestObserver_FallsBackToURIWhenRawURIEmpty(t *testing.T) {
 	o, p := newObserverPair(t)
 	pl := &nginx.ParsedLine{
 		Status:  "200",
 		URI:     "/news/:id",
-		RawPath: "",
 		Extras:  [nginx.MaxExtras]string{"GPTBot/1.0", "", "", ""},
 		NExtras: 1,
 	}

@@ -103,7 +103,7 @@ func isPermanentFailure(err error) bool {
 }
 
 // gzipPool reuses gzip writers across flushes — gzip.NewWriter allocates ~256 KB
-// of internal buffers, which adds up at 5s flush cadence.
+// of internal buffers, which adds up at the default flush cadence.
 var gzipPool = sync.Pool{
 	New: func() any { return gzip.NewWriter(io.Discard) },
 }

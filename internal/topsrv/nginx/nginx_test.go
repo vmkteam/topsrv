@@ -115,15 +115,15 @@ type recordingObserver struct {
 }
 
 type recordedLine struct {
-	status  string
-	uri     string
-	rawPath string
-	ua      string
-	path    string
+	status string
+	uri    string
+	rawURI string
+	ua     string
+	path   string
 }
 
 func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
-	rl := recordedLine{status: p.Status, uri: p.URI, rawPath: p.RawPath, path: path}
+	rl := recordedLine{status: p.Status, uri: p.URI, rawURI: p.RawURI, path: path}
 	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
 		rl.ua = p.Extras[r.uaIdx]
 	}
@@ -164,15 +164,16 @@ func TestLogCollectorObserver(t *testing.T) {
 	assert.EqualValues(t, 0, c.reqCount, "no timing field → no histogram update")
 }
 
-// Verifies the URI vs RawPath split: nginx-metrics keep the normalized form
-// (cardinality control), observers like botlog get the actual hit URL.
-func TestParsedLine_RawPathUnnormalized(t *testing.T) {
+// Verifies the URI / RawURI split: nginx-metrics keep the normalized form
+// (cardinality control), observers like botlog get the full hit URL with
+// query string from RawURI.
+func TestParsedLine_RawURIUnnormalized(t *testing.T) {
 	cases := []struct {
-		name        string
-		setup       func(c *LogCollector)
-		feed        func(c *LogCollector)
-		wantURI     string
-		wantRawPath string
+		name       string
+		setup      func(c *LogCollector)
+		feed       func(c *LogCollector)
+		wantURI    string
+		wantRawURI string
 	}{
 		{
 			name: "text/$request with numeric segment",
@@ -184,8 +185,8 @@ func TestParsedLine_RawPathUnnormalized(t *testing.T) {
 					`1.2.3.4 [11/Apr/2026:17:15:23 +0300] "GET /news/12345/title?utm=x HTTP/1.1" 200 1234 "Bot/1"`,
 					"/var/log/nginx/access.log")
 			},
-			wantURI:     "/news/:id/:rest",
-			wantRawPath: "/news/12345/title",
+			wantURI:    "/news/:id/:rest",
+			wantRawURI: "/news/12345/title?utm=x",
 		},
 		{
 			name: "JSON request_uri with querystring",
@@ -196,8 +197,8 @@ func TestParsedLine_RawPathUnnormalized(t *testing.T) {
 				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
 					`"request_uri":"/series/777/episodes?page=2","upstream_response_time":""}`)
 			},
-			wantURI:     "/series/:id/:rest",
-			wantRawPath: "/series/777/episodes",
+			wantURI:    "/series/:id/:rest",
+			wantRawURI: "/series/777/episodes?page=2",
 		},
 		{
 			name: "JSON with extra-labels path (map unmarshal)",
@@ -209,8 +210,33 @@ func TestParsedLine_RawPathUnnormalized(t *testing.T) {
 				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
 					`"request_uri":"/user/42/comments","http_user_agent":"Bot/1"}`)
 			},
-			wantURI:     "/user/:id/:rest",
-			wantRawPath: "/user/42/comments",
+			wantURI:    "/user/:id/:rest",
+			wantRawURI: "/user/42/comments",
+		},
+		{
+			// Percent-encoded chars in query must survive verbatim so the
+			// gatesrv side can decode params (e.g. utm_term=hello%20world).
+			name: "text/$request with percent-encoded query",
+			setup: func(c *LogCollector) {
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`10.0.0.1 [01/Jan/2026:00:00:00 +0000] "GET /search?q=hello%20world&p=a%2Fb HTTP/1.1" 200 100 "Bot/1"`)
+			},
+			wantURI:    "/search",
+			wantRawURI: "/search?q=hello%20world&p=a%2Fb",
+		},
+		{
+			name: "JSON request_uri preserves percent-encoded query",
+			setup: func(c *LogCollector) {
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/api?token=ab%3Dcd%26ef"}`)
+			},
+			wantURI:    "/api",
+			wantRawURI: "/api?token=ab%3Dcd%26ef",
 		},
 	}
 	for _, tc := range cases {
@@ -224,7 +250,7 @@ func TestParsedLine_RawPathUnnormalized(t *testing.T) {
 			rec := c.observers[0].(*recordingObserver)
 			require.Len(t, rec.lines, 1)
 			assert.Equal(t, tc.wantURI, rec.lines[0].uri, "URI must be normalized for nginx-metrics")
-			assert.Equal(t, tc.wantRawPath, rec.lines[0].rawPath, "RawPath must be the raw request path (querystring stripped)")
+			assert.Equal(t, tc.wantRawURI, rec.lines[0].rawURI, "RawURI must be the raw request URI (path + query)")
 		})
 	}
 }

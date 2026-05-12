@@ -15,10 +15,16 @@ import (
 )
 
 const (
-	DefaultBatchSize     = 5000
-	DefaultBatchInterval = 5 * time.Second
+	DefaultBatchSize = 5000
+	// 30s gives the receiver larger batches on light bot traffic; a 5s
+	// interval was flushing ~50-event payloads every tick on quiet hosts.
+	DefaultBatchInterval = 30 * time.Second
 	DefaultMaxSpoolMB    = 200
 	DefaultUATruncate    = 1024
+	// 2048 covers >99% of legitimate URLs (IE legacy limit was 2083). Bot
+	// probes routinely send 4-8KB URIs with base64/SQLi payloads — capping
+	// keeps WAL writes and gatesrv payload size bounded.
+	DefaultURITruncate = 2048
 
 	// ingestPath is the control-plane handler that accepts ndjson bot-log batches.
 	ingestPath = "/v1/bot-logs"
@@ -32,10 +38,11 @@ type Config struct {
 	Endpoint        string   // ingest URL; default: [Push].Endpoint with path replaced by /v1/bot-logs
 	Token           string   // Bearer token; required when Enabled
 	BatchSize       int      // events per batch; default 5000
-	BatchInterval   string   // flush interval as Go duration; default "5s"
+	BatchInterval   string   // flush interval as Go duration; default "30s"
 	SpoolDir        string   // parent directory; subdir "botlog" is created inside; default = [Push].SpoolDir
 	MaxSpoolMB      int      // disk budget for spool subdir; default 200
 	UATruncate      int      // max UA length stored per event; default 1024
+	URITruncate     int      // max URI length stored per event; default 2048
 	ExtraUAPatterns []string // local additions to knownBots (substring, case-sensitive)
 
 	parsedBatchInterval time.Duration // populated by Validate
@@ -88,6 +95,9 @@ func (c *Config) Validate(push topsrv.PushConfig) error {
 	}
 	if c.UATruncate <= 0 {
 		c.UATruncate = DefaultUATruncate
+	}
+	if c.URITruncate <= 0 {
+		c.URITruncate = DefaultURITruncate
 	}
 	return nil
 }
