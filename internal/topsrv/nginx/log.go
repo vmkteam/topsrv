@@ -369,13 +369,10 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 	p.UpstreamResponseTime, _ = entry.Field("upstream_response_time")
 	p.UpstreamCacheStatus, _ = entry.Field("upstream_cache_status")
 
-	if req, err := entry.Field("request"); err == nil {
-		p.URI = normalizeURI(req)
-		p.RawURI = rawURIFromRequest(req)
-	} else if u, err := entry.Field("uri"); err == nil {
-		p.URI = normalizePath(u)
-		p.RawURI = stripQuery(u)
-	}
+	p.URI, p.RawURI = resolveURI(func(name string) string {
+		v, _ := entry.Field(name)
+		return v
+	})
 
 	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
@@ -407,8 +404,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		p.RequestTime = m["request_time"]
 		p.UpstreamResponseTime = m["upstream_response_time"]
 		p.UpstreamCacheStatus = m["upstream_cache_status"]
-		p.URI = normalizeRequestURI(m["request_uri"], m["request"])
-		p.RawURI = rawURIFromJSON(m["request_uri"], m["request"])
+		p.URI, p.RawURI = resolveURI(func(name string) string { return m[name] })
 
 		for i, f := range c.extractFields {
 			if i >= len(p.Extras) {
@@ -499,6 +495,52 @@ func stripQuery(p string) string {
 		return p[:i]
 	}
 	return p
+}
+
+// resolveURI walks the nginx URI variables an operator might log in priority
+// order — $request_uri (path+query, as received), then $request (combined
+// "METHOD URI HTTP"), then $uri (+ optional $args/$query_string for splits).
+// Returns the normalized URI (for metrics cardinality) and the un-normalized
+// RawURI (full path + query) for botlog. get returns "" for absent fields.
+func resolveURI(get func(string) string) (uri, rawURI string) {
+	if v := get("request_uri"); v != "" && v != "-" {
+		return normalizePath(stripQuery(v)), v
+	}
+	if v := get("request"); v != "" && v != "-" {
+		return normalizeURI(v), rawURIFromRequest(v)
+	}
+	if v := get("uri"); v != "" && v != "-" {
+		args := get("args")
+		if args == "" || args == "-" {
+			args = get("query_string")
+		}
+		// stripQuery on the metric URI is defensive — nginx $uri is path-only
+		// per spec, but operators occasionally log $request_uri under the
+		// "uri" field name and query strings must never reach metric labels.
+		metricURI := normalizePath(stripQuery(v))
+		if args != "" && args != "-" {
+			return metricURI, joinPathArgs(v, args)
+		}
+		// No separate args field — preserve v verbatim so RawURI keeps any
+		// accidental query string the operator's format carried through.
+		return metricURI, v
+	}
+	return "", ""
+}
+
+// joinPathArgs reattaches a separate $args / $query_string value onto an
+// $uri path. nginx's $uri is path-only and $args is the raw query string
+// without a leading '?'; some operators log them as distinct fields, which
+// strips the query unless we rejoin them here. stripQuery on path is
+// defensive — guards against operators who log $request_uri under the
+// "uri" field name by mistake.
+func joinPathArgs(path, args string) string {
+	path = stripQuery(path)
+	args = strings.TrimPrefix(args, "?")
+	if args == "" || args == "-" {
+		return path
+	}
+	return path + "?" + args
 }
 
 // recordLine updates all metric accumulators from a parsed log line. Must not be called concurrently.

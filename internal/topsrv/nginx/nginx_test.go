@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/satyrius/gonx"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vmkteam/embedlog"
@@ -237,6 +238,121 @@ func TestParsedLine_RawURIUnnormalized(t *testing.T) {
 			},
 			wantURI:    "/api",
 			wantRawURI: "/api?token=ab%3Dcd%26ef",
+		},
+		{
+			// Key=value log_format with separate $uri and $args fields.
+			// Without joining, RawURI would be path-only and gatesrv-side
+			// HasQueryParams stays false (the original bug).
+			name: "text key=value with separate $uri and $args",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`time="$time_iso8601" host="$host" uriPath="$uri" uriQuery="$args" httpStatus=$status bodyBytesSent=$body_bytes_sent`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`time="2026-05-12T12:09:45+03:00" host="en.example.com" uriPath="/movies/catalog/" uriQuery="page=11051" httpStatus=404 bodyBytesSent=11496`)
+			},
+			wantURI:    "/movies/catalog/",
+			wantRawURI: "/movies/catalog/?page=11051",
+		},
+		{
+			// Empty $args (the common case — most requests have no query).
+			// RawURI must NOT carry a trailing '?'.
+			name: "text key=value with empty $args",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`host="$host" uriPath="$uri" uriQuery="$args" httpStatus=$status bodyBytesSent=$body_bytes_sent`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`host="x.example" uriPath="/about/" uriQuery="" httpStatus=200 bodyBytesSent=100`)
+			},
+			wantURI:    "/about/",
+			wantRawURI: "/about/",
+		},
+		{
+			// $query_string is an alias of $args; some operators prefer it.
+			name: "text key=value with $query_string instead of $args",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`host="$host" uriPath="$uri" qs="$query_string" httpStatus=$status bodyBytesSent=$body_bytes_sent`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`host="x.example" uriPath="/search" qs="q=hello" httpStatus=200 bodyBytesSent=100`)
+			},
+			wantURI:    "/search",
+			wantRawURI: "/search?q=hello",
+		},
+		{
+			// $request_uri carries the original path+query, URL-encoded as
+			// received. Formats that log it directly need no rejoining.
+			name: "text key=value with $request_uri directly",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`host="$host" reqUri="$request_uri" httpStatus=$status bodyBytesSent=$body_bytes_sent`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`host="x.example" reqUri="/news/12345/title?utm=x" httpStatus=200 bodyBytesSent=100`)
+			},
+			wantURI:    "/news/:id/:rest",
+			wantRawURI: "/news/12345/title?utm=x",
+		},
+		{
+			// Hybrid format: "$request" + ru="$request_uri" + u="$uri".
+			// $request_uri wins so we ship what the client actually requested,
+			// not the post-rewrite $uri pointing at the FastCGI dispatcher.
+			name: "hybrid combined + key=value, internal rewrite",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" rt="$request_time" "$http_user_agent" "$http_x_forwarded_for" h="$host" sn="$server_name" ru="$request_uri" u="$uri"`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`192.0.2.9 - - [12/May/2026:00:00:30 +0000] "GET /events.ics HTTP/2.0" 200 900 "-" rt="0.098" "iOS/17.1 (21B74) dataaccessd/1.0" "-" h="example.com" sn="example.com" ru="/events.ics" u="/dispatch.php"`)
+			},
+			wantURI:    "/events.ics",
+			wantRawURI: "/events.ics",
+		},
+		{
+			// Same hybrid format with a long query containing commas — gonx
+			// must not get confused by literal commas inside the quoted value.
+			name: "hybrid format with comma-rich query string",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" rt="$request_time" "$http_user_agent" "$http_x_forwarded_for" h="$host" sn="$server_name" ru="$request_uri" u="$uri"`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`192.0.2.5 - - [12/May/2026:00:00:23 +0000] "GET /shared/minify.php?hash&files=/a.js,/b.js,/c.js HTTP/2.0" 200 80612 "https://example.com/" rt="0.004" "Mozilla/5.0" "-" h="example.com" sn="example.com" ru="/shared/minify.php?hash&files=/a.js,/b.js,/c.js" u="/shared/minify.php"`)
+			},
+			wantURI:    "/shared/:file.php",
+			wantRawURI: "/shared/minify.php?hash&files=/a.js,/b.js,/c.js",
+		},
+		{
+			// Operator misconfiguration: $request_uri logged under "uri" field
+			// name. RawURI keeps the query (that's the point); metric URI must
+			// be query-free — otherwise utm/session params blow up cardinality.
+			name: "metric URI stays query-free even if $uri field carries query",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`host="$host" uriPath="$uri" httpStatus=$status bodyBytesSent=$body_bytes_sent`)
+				c.AddObserver(&recordingObserver{})
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`host="x.example" uriPath="/news/12345?utm_source=tg&utm_campaign=spring" httpStatus=200 bodyBytesSent=100`)
+			},
+			wantURI:    "/news/:id",
+			wantRawURI: "/news/12345?utm_source=tg&utm_campaign=spring",
+		},
+		{
+			// JSON map path with a base64-like signed URL (file CDN style):
+			// "/get/<token>==,<numeric-id>/<asset-path>". RawURI ships verbatim;
+			// metric URI collapses the token+id and truncates deep paths.
+			name: "JSON map path with base64 token in request_uri",
+			setup: func(c *LogCollector) {
+				c.extractFields = []string{"http_user_agent"}
+				c.AddObserver(&recordingObserver{uaIdx: 0})
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"123456789","request_time":"42.000","request_uri":"/get/AbCdEf01234567_HiJkLmNo-PqRs==,1234567890/category/asset/files/example.zip","http_user_agent":"Mozilla/5.0"}`)
+			},
+			wantURI:    "/get/:token/:rest",
+			wantRawURI: "/get/AbCdEf01234567_HiJkLmNo-PqRs==,1234567890/category/asset/files/example.zip",
 		},
 	}
 	for _, tc := range cases {
