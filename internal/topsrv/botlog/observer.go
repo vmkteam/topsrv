@@ -91,13 +91,10 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 	}
 
 	// Bot-log UI groups by actual URL, not the nginx-metrics-normalized form.
-	// Prefer RawURI (path + query) so HasQueryParams on gatesrv side is meaningful;
-	// fall back to RawPath (legacy log formats), then to the normalized URI when
-	// nothing else is available.
+	// RawURI keeps the query string so HasQueryParams on gatesrv works; the
+	// normalized URI is the last-resort fallback for log formats that yield
+	// neither $request nor $uri.
 	uri := p.RawURI
-	if uri == "" {
-		uri = p.RawPath
-	}
 	if uri == "" {
 		uri = p.URI
 	}

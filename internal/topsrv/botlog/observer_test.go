@@ -82,7 +82,6 @@ func TestObserver_UsesRawURIOverURI(t *testing.T) {
 	pl := &nginx.ParsedLine{
 		Status:  "200",
 		URI:     "/news/:id/:rest",
-		RawPath: "/news/12345/some-title",
 		RawURI:  "/news/12345/some-title?utm=x",
 		Extras:  [nginx.MaxExtras]string{"GPTBot/1.0", "", "", ""},
 		NExtras: 1,
@@ -93,26 +92,9 @@ func TestObserver_UsesRawURIOverURI(t *testing.T) {
 	assert.Equal(t, "/news/12345/some-title?utm=x", ev.URI)
 }
 
-// When the log format yields no RawURI but populates RawPath (legacy parser
-// output), Observer must fall back to RawPath.
-func TestObserver_FallsBackToRawPathWhenRawURIEmpty(t *testing.T) {
-	o, p := newObserverPair(t)
-	pl := &nginx.ParsedLine{
-		Status:  "200",
-		URI:     "/news/:id/:rest",
-		RawPath: "/news/12345/some-title",
-		Extras:  [nginx.MaxExtras]string{"GPTBot/1.0", "", "", ""},
-		NExtras: 1,
-	}
-	o.OnLogLine(pl, "")
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
-	assert.Equal(t, "/news/12345/some-title", ev.URI)
-}
-
-// When the log format yields neither RawURI nor RawPath (legacy $uri after
-// rewrite), Observer must fall back to ParsedLine.URI rather than emit empty.
-func TestObserver_FallsBackToURIWhenRawEmpty(t *testing.T) {
+// When the log format yields no RawURI (legacy $uri after rewrite), Observer
+// must fall back to ParsedLine.URI rather than emit an empty event URI.
+func TestObserver_FallsBackToURIWhenRawURIEmpty(t *testing.T) {
 	o, p := newObserverPair(t)
 	pl := &nginx.ParsedLine{
 		Status:  "200",
