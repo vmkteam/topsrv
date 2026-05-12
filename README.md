@@ -149,10 +149,11 @@ Channel  = "stable"         # stable / beta
 # Token         = ""        # required — issued by topsrv.io per project
 # Endpoint      = ""        # default: [Push].Endpoint with /v1/bot-logs path
 # BatchSize     = 5000      # events per batch
-# BatchInterval = "5s"      # flush interval
+# BatchInterval = "30s"     # flush interval
 # SpoolDir      = ""        # default: [Push].SpoolDir; a "botlog/" subdir is created inside
 # MaxSpoolMB    = 200       # WAL disk budget
 # UATruncate    = 1024      # truncate user-agent at this length
+# URITruncate   = 2048      # truncate request URI at this length
 # ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
 ```
 
@@ -183,10 +184,11 @@ Channel  = "stable"         # stable / beta
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
 | `BotLogs.BatchSize` | `5000` | Events per batch |
-| `BotLogs.BatchInterval` | `5s` | Flush interval |
+| `BotLogs.BatchInterval` | `30s` | Flush interval |
 | `BotLogs.SpoolDir` | derived | Parent dir for WAL spool; `botlog/` subdir is created inside. Defaults to `[Push].SpoolDir` |
 | `BotLogs.MaxSpoolMB` | `200` | Disk budget for spool subdir |
 | `BotLogs.UATruncate` | `1024` | Max UA length per event |
+| `BotLogs.URITruncate` | `2048` | Max URI length per event |
 | `BotLogs.ExtraUAPatterns` | `[]` | Local additions to known-bots UA patterns |
 
 ### Environment variables
