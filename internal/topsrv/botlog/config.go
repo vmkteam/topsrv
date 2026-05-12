@@ -15,8 +15,10 @@ import (
 )
 
 const (
-	DefaultBatchSize     = 5000
-	DefaultBatchInterval = 5 * time.Second
+	DefaultBatchSize = 5000
+	// 30s gives the receiver larger batches on light bot traffic; a 5s
+	// interval was flushing ~50-event payloads every tick on quiet hosts.
+	DefaultBatchInterval = 30 * time.Second
 	DefaultMaxSpoolMB    = 200
 	DefaultUATruncate    = 1024
 
@@ -32,7 +34,7 @@ type Config struct {
 	Endpoint        string   // ingest URL; default: [Push].Endpoint with path replaced by /v1/bot-logs
 	Token           string   // Bearer token; required when Enabled
 	BatchSize       int      // events per batch; default 5000
-	BatchInterval   string   // flush interval as Go duration; default "5s"
+	BatchInterval   string   // flush interval as Go duration; default "30s"
 	SpoolDir        string   // parent directory; subdir "botlog" is created inside; default = [Push].SpoolDir
 	MaxSpoolMB      int      // disk budget for spool subdir; default 200
 	UATruncate      int      // max UA length stored per event; default 1024
