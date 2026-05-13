@@ -137,7 +137,7 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 		}, []string{"collector"}),
 		configWarnings: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_collector_config_warnings_total",
-			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field.",
+			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field|botlog_alias_mismatch.",
 		}, []string{"kind"}),
 	}
 	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics, a.configWarnings)
@@ -365,10 +365,9 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields(a.botlogAliases))
 		if a.botlogAliases.UserAgent == "" {
 			a.warnConfig(ctx, "botlog_no_ua_field",
-				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives",
+				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives, or set [BotLogs.FieldAliases].UserAgent to the custom field name",
 				"log_paths", cfg.LogPaths)
 		}
-		a.Print(ctx, "botlog: resolved field aliases", "aliases", a.botlogAliases.String())
 	}
 
 	if dropped := capExtractFields(&cfg); len(dropped) > 0 {
@@ -445,15 +444,29 @@ func (a *App) resolveBotlogAliases(ctx context.Context, cfg nginx.LogConfig) bot
 		return cfg.LogFormat, false
 	}
 
-	var canonical botlog.FieldAliases
+	// Memoise per (format, isJSON) — N paths sharing one log_format incur
+	// one DetectAliases call instead of N.
+	type formatKey struct {
+		format string
+		isJSON bool
+	}
+	detectCache := make(map[formatKey]botlog.FieldAliases)
+
+	var canonical, canonicalDetected botlog.FieldAliases
 	var canonicalPath string
 	mismatched := make([]string, 0)
 	for _, p := range cfg.LogPaths {
 		format, isJSON := formatFor(p)
-		detected := botlog.DetectAliases(format, isJSON)
-		resolved := override.Merge(detected).Merge(botlog.DefaultAliases())
+		key := formatKey{format, isJSON}
+		detected, ok := detectCache[key]
+		if !ok {
+			detected = botlog.DetectAliases(format, isJSON)
+			detectCache[key] = detected
+		}
+		resolved := override.WithFallback(detected).WithFallback(botlog.DefaultAliases())
 		if canonicalPath == "" {
 			canonical = resolved
+			canonicalDetected = detected
 			canonicalPath = p
 			continue
 		}
@@ -466,7 +479,38 @@ func (a *App) resolveBotlogAliases(ctx context.Context, cfg nginx.LogConfig) bot
 			"log_formats across tailed paths resolve to different botlog aliases; using first path's resolution",
 			"canonical_path", canonicalPath, "mismatched_paths", truncateList(mismatched, 8))
 	}
+	if canonicalPath != "" {
+		a.Print(ctx, "botlog: resolved field aliases",
+			"aliases", canonical.String(),
+			"sources", aliasSources(override, canonicalDetected),
+			"canonical_path", canonicalPath)
+	}
 	return canonical
+}
+
+// aliasSources renders per-field provenance: "override" if the operator set
+// the alias via [BotLogs.FieldAliases], "detected" if it came from
+// log_format inspection, "default" if neither matched and DefaultAliases
+// supplied the value. Mirrors FieldAliases.String() shape so log readers can
+// align the two lines.
+func aliasSources(override, detected botlog.FieldAliases) string {
+	src := func(o, d string) string {
+		switch {
+		case o != "":
+			return "override"
+		case d != "":
+			return "detected"
+		default:
+			return "default"
+		}
+	}
+	return fmt.Sprintf("ua=%s host=%s server=%s remote=%s referer=%s",
+		src(override.UserAgent, detected.UserAgent),
+		src(override.Host, detected.Host),
+		src(override.ServerName, detected.ServerName),
+		src(override.RemoteAddr, detected.RemoteAddr),
+		src(override.Referer, detected.Referer),
+	)
 }
 
 // highCardLabels returns the intersection of labels with the denylist.

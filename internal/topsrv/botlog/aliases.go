@@ -4,6 +4,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 )
 
 // FieldAliases resolves the per-format names of the five nginx variables
@@ -33,25 +34,26 @@ func DefaultAliases() FieldAliases {
 	}
 }
 
-// Merge returns a copy of a with each empty field replaced by the
-// corresponding non-empty value from other. Used to layer defaults under
-// auto-detected results, and explicit operator overrides on top.
-func (a FieldAliases) Merge(other FieldAliases) FieldAliases {
+// WithFallback returns a copy of a with each empty field replaced by the
+// corresponding value from fallback. Reads "use a, falling back to fallback
+// for fields a left empty" — supports layering chains like
+// `override.WithFallback(detected).WithFallback(DefaultAliases())`.
+func (a FieldAliases) WithFallback(fallback FieldAliases) FieldAliases {
 	out := a
 	if out.UserAgent == "" {
-		out.UserAgent = other.UserAgent
+		out.UserAgent = fallback.UserAgent
 	}
 	if out.Host == "" {
-		out.Host = other.Host
+		out.Host = fallback.Host
 	}
 	if out.ServerName == "" {
-		out.ServerName = other.ServerName
+		out.ServerName = fallback.ServerName
 	}
 	if out.RemoteAddr == "" {
-		out.RemoteAddr = other.RemoteAddr
+		out.RemoteAddr = fallback.RemoteAddr
 	}
 	if out.Referer == "" {
-		out.Referer = other.Referer
+		out.Referer = fallback.Referer
 	}
 	return out
 }
@@ -70,14 +72,14 @@ var (
 	uaCandidates      = []string{"http_user_agent"}
 	hostCandidates    = []string{"host", "http_host"}
 	serverCandidates  = []string{"server_name"}
-	remoteCandidates  = []string{"remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
+	remoteCandidates  = []string{"remote_addr", "realip_remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
 	refererCandidates = []string{"http_referer", "http_referrer", "referer"}
 )
 
 // DetectAliases inspects an nginx log_format string and returns the resolved
 // field name for each semantic field. Empty values for fields the format
-// doesn't carry — caller layers DefaultAliases under and explicit override on
-// top via Merge.
+// doesn't carry — caller layers DefaultAliases under and an explicit override
+// on top via WithFallback.
 //
 // For non-JSON formats (combined / key=value / logfmt / hybrid), the result
 // is the nginx variable name without the '$' prefix. For JSON formats, the
@@ -127,17 +129,33 @@ func detectJSONKey(format string, candidates []string) string {
 	return ""
 }
 
+// reCache memoises compiled regexes — DetectAliases runs once per log_format
+// at startup, and across N tailed paths that share a format we'd otherwise
+// compile the same patterns N times.
+var reCache sync.Map // string → *regexp.Regexp
+
+func cachedRegexp(key, pattern string) *regexp.Regexp {
+	if v, ok := reCache.Load(key); ok {
+		if re, ok := v.(*regexp.Regexp); ok {
+			return re
+		}
+	}
+	re := regexp.MustCompile(pattern)
+	reCache.Store(key, re)
+	return re
+}
+
 // textVarRe matches "$name" with a word boundary so http_referer does not
-// accidentally match the longer http_referrer. Cached per name across calls.
+// accidentally match the longer http_referrer.
 func textVarRe(name string) *regexp.Regexp {
-	return regexp.MustCompile(`\$` + regexp.QuoteMeta(name) + `\b`)
+	return cachedRegexp("t:"+name, `\$`+regexp.QuoteMeta(name)+`\b`)
 }
 
 // jsonKeyRe matches `"<key>":"$<name>"` (with optional whitespace around the
 // colon) and captures the JSON key. The variable side is word-boundaried so
 // $http_referer does not consume $http_referrer's key.
 func jsonKeyRe(name string) *regexp.Regexp {
-	return regexp.MustCompile(`"([^"]+)"\s*:\s*"\$` + regexp.QuoteMeta(name) + `\b`)
+	return cachedRegexp("j:"+name, `"([^"]+)"\s*:\s*"\$`+regexp.QuoteMeta(name)+`\b`)
 }
 
 // String renders aliases as a one-liner suitable for startup logging.

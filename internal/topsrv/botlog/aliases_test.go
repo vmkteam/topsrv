@@ -20,12 +20,12 @@ func TestFieldAliases_Names(t *testing.T) {
 	assert.Equal(t, []string{"ua", "sn", "ip", "ref"}, a.Names())
 }
 
-func TestFieldAliases_Merge(t *testing.T) {
+func TestFieldAliases_WithFallback(t *testing.T) {
 	base := DefaultAliases()
 	override := FieldAliases{Referer: "ref"}
-	got := override.Merge(base)
-	assert.Equal(t, "ref", got.Referer, "override wins")
-	assert.Equal(t, "http_user_agent", got.UserAgent, "empty falls back to base")
+	got := override.WithFallback(base)
+	assert.Equal(t, "ref", got.Referer, "non-empty stays")
+	assert.Equal(t, "http_user_agent", got.UserAgent, "empty falls back")
 	assert.Equal(t, "host", got.Host)
 }
 
@@ -75,9 +75,12 @@ func TestDetectAliases_TextHybridWithFallbacks(t *testing.T) {
 func TestDetectAliases_TextWordBoundary(t *testing.T) {
 	// $http_referrer must NOT be matched by the $http_referer candidate.
 	// Without word boundary, regex would match the prefix and report wrong.
+	// refererCandidates lists "http_referer" before "http_referrer", so a
+	// missing word boundary would silently return "http_referer" here.
 	format := `... "$http_referrer" ...`
 	got := DetectAliases(format, false)
 	assert.Equal(t, "http_referrer", got.Referer)
+	assert.NotEqual(t, "http_referer", got.Referer, "prefix-only match would be a regex bug")
 }
 
 func TestDetectAliases_JSONStandardKeys(t *testing.T) {
@@ -123,9 +126,42 @@ func TestDetectAliases_JSONFallbackToXFF(t *testing.T) {
 	assert.Equal(t, "client_ip", got.RemoteAddr)
 }
 
+func TestDetectAliases_TextRealipRemoteAddr(t *testing.T) {
+	// Angie/nginx realip style (mangoads.com): log_format carries only
+	// $realip_remote_addr, no $remote_addr. Before the fix the regex
+	// `\$remote_addr\b` did not match this variable (the prefix in front of
+	// `remote_addr` is `realip_`, not `$`), the alias stayed empty, and
+	// gatesrv fell back to the agent's peer IP (often 127.0.0.1).
+	format := `time="$time_iso8601" clientIp="$realip_remote_addr" ua="$http_user_agent"`
+	got := DetectAliases(format, false)
+	assert.Equal(t, "realip_remote_addr", got.RemoteAddr)
+}
+
+func TestDetectAliases_TextRemoteAddrWinsOverRealip(t *testing.T) {
+	// When log_format carries both variables, $remote_addr must win —
+	// it is already post real_ip substitution, while $realip_remote_addr
+	// holds the pre-substitution peer (CF edge / load balancer).
+	format := `addr="$remote_addr" peer="$realip_remote_addr" ua="$http_user_agent"`
+	got := DetectAliases(format, false)
+	assert.Equal(t, "remote_addr", got.RemoteAddr)
+}
+
 func TestDetectAliases_EmptyFormatGivesEmpty(t *testing.T) {
 	// Format with none of the candidates — every alias empty. Caller layers
 	// DefaultAliases or surfaces a startup warning.
 	got := DetectAliases(`$status $body_bytes_sent`, false)
 	assert.Equal(t, FieldAliases{}, got)
+}
+
+func TestFieldAliases_String(t *testing.T) {
+	// Startup log relies on this exact shape — dashboards or oncall grep for
+	// the "ua=… host=… server=… remote=… referer=…" tokens.
+	full := FieldAliases{UserAgent: "ua", Host: "h", ServerName: "sn", RemoteAddr: "ip", Referer: "ref"}
+	assert.Equal(t, "ua=ua host=h server=sn remote=ip referer=ref", full.String())
+
+	assert.Equal(t, "ua=- host=- server=- remote=- referer=-",
+		FieldAliases{}.String(), "empty fields render as -")
+
+	partial := FieldAliases{UserAgent: "http_user_agent", Referer: "http_referer"}
+	assert.Equal(t, "ua=http_user_agent host=- server=- remote=- referer=http_referer", partial.String())
 }
