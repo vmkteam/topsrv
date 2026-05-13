@@ -340,7 +340,7 @@ func testAppName(t *testing.T, c *Collector, reg *prometheus.Registry) {
 	var found bool
 	mapSize := len(c.appNames)
 	for qid, apps := range c.appNames {
-		if apps["test_app_ci"] {
+		if _, ok := apps["test_app_ci"]; ok {
 			found = true
 			foundQid = qid
 			break
