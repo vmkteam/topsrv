@@ -126,3 +126,37 @@ func TestEnsureReadyRetryable(t *testing.T) {
 
 	assert.False(t, pg.initDone, "initDone must stay false after failures so detectFeatures runs on recovery")
 }
+
+// TestPruneAppNamesEvictsStale is the regression test for the slow memory
+// leak that grew RSS by ~70MB/day on busy Postgres hosts: a never-cleared
+// map[queryid][application_name] accumulated forever as processes restarted
+// with new pid-suffixed app_names. pruneAppNames must drop entries older
+// than appNamesTTL and clean up newly-empty queryid sub-maps.
+func TestPruneAppNamesEvictsStale(t *testing.T) {
+	c := &Collector{appNames: make(map[int64]map[string]time.Time)}
+	now := time.Now()
+
+	c.appNames[1] = map[string]time.Time{
+		"fresh-app": now.Add(-time.Minute),
+		"stale-app": now.Add(-2 * appNamesTTL),
+	}
+	c.appNames[2] = map[string]time.Time{
+		"only-stale": now.Add(-2 * appNamesTTL),
+	}
+	c.appNames[3] = map[string]time.Time{
+		"only-fresh": now,
+	}
+
+	c.pruneAppNames(now)
+
+	assert.Len(t, c.appNames[1], 1, "qid=1 keeps the fresh app_name only")
+	_, hasStale := c.appNames[1]["stale-app"]
+	assert.False(t, hasStale, "stale entry must be dropped")
+	_, hasFresh := c.appNames[1]["fresh-app"]
+	assert.True(t, hasFresh, "fresh entry must survive")
+
+	_, qid2Present := c.appNames[2]
+	assert.False(t, qid2Present, "qid=2 had only stale entries — sub-map dropped entirely")
+
+	assert.Len(t, c.appNames[3], 1, "qid=3 untouched")
+}

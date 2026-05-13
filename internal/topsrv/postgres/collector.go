@@ -21,6 +21,13 @@ const (
 	versionPG18            = 180000 // pg_stat_wal.wal_write_time/wal_sync_time removed (moved into pg_stat_io)
 	settingRefreshInterval = time.Minute
 
+	// appNamesTTL bounds how long a (queryid, application_name) pair stays
+	// in memory after it was last seen in pg_stat_activity. Long enough
+	// (1h) that a query absent from a few scrapes still has its caller
+	// resolved; short enough that one-shot pids/uuids don't accumulate.
+	appNamesTTL         = time.Hour
+	appNamesSweepPeriod = 5 * time.Minute
+
 	// Relation names probed by relHasColumn. Kept as named constants so a
 	// rename or typo can't silently disable feature detection.
 	relPgStatStmts    = "pg_stat_statements"
@@ -50,10 +57,13 @@ type Collector struct {
 	queryMetaMu sync.RWMutex
 	queryMeta   []QueryMeta
 
-	// queryid → set of application_names (accumulated from pg_stat_activity samples).
-	// Sampled by a background ticker independent of Prometheus scrape to capture short queries.
+	// queryid → application_name → last-seen time. Sampled by a background
+	// ticker independent of Prometheus scrape to catch short-lived queries.
+	// Entries older than appNamesTTL are pruned by a separate sweeper so a
+	// rotating app_name (pid/uuid suffix per process restart) does not turn
+	// the map into a slow memory leak.
 	appNamesMu       sync.RWMutex
-	appNames         map[int64]map[string]bool
+	appNames         map[int64]map[string]time.Time
 	appSampleLastErr time.Time // rate-limit sampler error logs to 1/minute
 	appSampleCancel  context.CancelFunc
 	appSampleDone    chan struct{}
@@ -178,7 +188,7 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 		cfg:    cfg,
 		// statementsTimeCol stays "" until detectFeatures confirms pg_stat_statements
 		// is present with total_exec_time (PG13+/extension 1.8+).
-		appNames:      make(map[int64]map[string]bool),
+		appNames:      make(map[int64]map[string]time.Time),
 		prevStmts:     make(map[string]stmtPrev),
 		histBuckets:   newHistBuckets(),
 		settingsCache: map[string]float64{},

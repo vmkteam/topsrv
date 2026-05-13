@@ -297,6 +297,7 @@ func (c *Collector) sampleAppNames(ctx context.Context) {
 	}
 	defer rows.Close()
 
+	now := time.Now()
 	c.appNamesMu.Lock()
 	defer c.appNamesMu.Unlock()
 	for rows.Next() {
@@ -306,30 +307,55 @@ func (c *Collector) sampleAppNames(ctx context.Context) {
 			continue
 		}
 		if c.appNames[qid] == nil {
-			c.appNames[qid] = make(map[string]bool)
+			c.appNames[qid] = make(map[string]time.Time)
 		}
-		c.appNames[qid][app] = true
+		c.appNames[qid][app] = now
+	}
+}
+
+// pruneAppNames drops (queryid, application_name) pairs older than
+// appNamesTTL. Runs on its own ticker (appNamesSweepPeriod) so a quiet
+// queryid can't pin app_names in memory forever.
+func (c *Collector) pruneAppNames(now time.Time) {
+	cutoff := now.Add(-appNamesTTL)
+	c.appNamesMu.Lock()
+	defer c.appNamesMu.Unlock()
+	for qid, apps := range c.appNames {
+		for app, seen := range apps {
+			if seen.Before(cutoff) {
+				delete(apps, app)
+			}
+		}
+		if len(apps) == 0 {
+			delete(c.appNames, qid)
+		}
 	}
 }
 
 // startAppNamesSampler runs sampleAppNames on an independent ticker so short-lived queries
-// get captured between Prometheus scrapes. Cancelled via Close().
+// get captured between Prometheus scrapes, and a slower ticker prunes
+// (queryid, application_name) pairs whose lastSeen is older than appNamesTTL.
+// Cancelled via Close().
 func (c *Collector) startAppNamesSampler(interval time.Duration) {
 	var ctx context.Context
 	ctx, c.appSampleCancel = context.WithCancel(context.Background())
 	c.appSampleDone = make(chan struct{})
 	go func() {
 		defer close(c.appSampleDone)
-		t := time.NewTicker(interval)
-		defer t.Stop()
+		sampleT := time.NewTicker(interval)
+		defer sampleT.Stop()
+		pruneT := time.NewTicker(appNamesSweepPeriod)
+		defer pruneT.Stop()
 		for {
 			select {
 			case <-ctx.Done():
 				return
-			case <-t.C:
+			case <-sampleT.C:
 				sampleCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
 				c.sampleAppNames(sampleCtx)
 				cancel()
+			case <-pruneT.C:
+				c.pruneAppNames(time.Now())
 			}
 		}
 	}()
