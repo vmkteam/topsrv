@@ -71,10 +71,10 @@ func newHistBuckets() map[float64]uint64 {
 func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.Metric) {
 	// appName mapping is maintained by a background ticker (startAppNamesSampler).
 
-	// pg_stat_statements 1.8+ (PG13+) renamed total_time → total_exec_time
-	timeCol := "total_exec_time"
-	if c.statementsTimeCol != "" {
-		timeCol = c.statementsTimeCol
+	// Extension absent in the current database (or pre-1.8) — emit nothing
+	// rather than fire a query that will 42P01/42703 every scrape.
+	if c.statementsTimeCol == "" {
+		return
 	}
 
 	// PG17 (pg_stat_statements 1.11) renamed blk_read_time → shared_blk_read_time, blk_write_time → shared_blk_write_time
@@ -83,16 +83,8 @@ func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.
 		blkReadCol, blkWriteCol = "shared_blk_read_time", "shared_blk_write_time"
 	}
 
-	// pg_stat_statements 1.8+ (PG13+) renamed min_time → min_exec_time (same as total_time → total_exec_time).
-	minCol, maxCol := "min_exec_time", "max_exec_time"
-	if timeCol == "total_time" {
-		minCol, maxCol = "min_time", "max_time"
-	}
-
 	r := strings.NewReplacer(
-		"{time_col}", timeCol,
-		"{min_col}", minCol,
-		"{max_col}", maxCol,
+		"{time_col}", c.statementsTimeCol,
 		"{blk_read_col}", blkReadCol,
 		"{blk_write_col}", blkWriteCol,
 	)
@@ -118,7 +110,7 @@ func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.
 		sum(s.shared_blks_hit), sum(s.shared_blks_read), sum(s.shared_blks_dirtied),
 		sum(s.{blk_read_col}), sum(s.{blk_write_col}),
 		sum(s.temp_blks_read), sum(s.temp_blks_written),
-		min(s.{min_col}), max(s.{max_col})` + walBytesCol + `
+		min(s.min_exec_time), max(s.max_exec_time)` + walBytesCol + `
 	FROM pg_stat_statements s
 		JOIN pg_database d ON d.oid = s.dbid
 	WHERE s.userid != 0` + toplevelFilter + `
@@ -144,7 +136,7 @@ func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.
 	}
 
 	topMeta := c.selectTopStatements(all, topMetaN)
-	c.collectQueryMeta(ctx, topMeta, timeCol)
+	c.collectQueryMeta(ctx, topMeta)
 }
 
 // scanStatements reads all pg_stat_statements rows, computes deltas against previous snapshot,
@@ -244,7 +236,7 @@ func (c *Collector) addToBuckets(sec float64) {
 }
 
 // collectQueryMeta fetches full query texts for top queries and stores them for push to gatesrv.
-func (c *Collector) collectQueryMeta(ctx context.Context, topSet map[string]bool, timeCol string) {
+func (c *Collector) collectQueryMeta(ctx context.Context, topSet map[string]bool) {
 	if len(topSet) == 0 {
 		return
 	}
@@ -254,13 +246,12 @@ func (c *Collector) collectQueryMeta(ctx context.Context, topSet map[string]bool
 		toplevelFilter = " AND s.toplevel"
 	}
 
-	q := strings.NewReplacer("{time_col}", timeCol).Replace(
-		`SELECT s.dbid::text || ':' || s.queryid::text,
+	q := `SELECT s.dbid::text || ':' || s.queryid::text,
 			s.queryid::text, d.datname, s.query
 		FROM pg_stat_statements s
 			JOIN pg_database d ON d.oid = s.dbid
 		WHERE s.userid != 0` + toplevelFilter + `
-		ORDER BY s.{time_col} DESC`)
+		ORDER BY s.` + c.statementsTimeCol + ` DESC`
 	rows, err := c.pool.Query(ctx, q)
 	if err != nil {
 		return
