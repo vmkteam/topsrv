@@ -31,9 +31,10 @@ func TestNetstatCollectorTCPConnections(t *testing.T) {
 			continue
 		}
 
-		// Check direction labels: inbound/outbound.
+		// Check direction labels: inbound/outbound + remote_scope present.
 		directions := map[string]bool{}
 		states := map[string]bool{}
+		remoteScopes := map[string]bool{}
 		for _, m := range mf.GetMetric() {
 			for _, l := range m.GetLabel() {
 				switch l.GetName() {
@@ -41,14 +42,17 @@ func TestNetstatCollectorTCPConnections(t *testing.T) {
 					directions[l.GetValue()] = true
 				case "state":
 					states[l.GetValue()] = true
+				case "remote_scope":
+					remoteScopes[l.GetValue()] = true
 				}
 			}
 		}
 
-		// At least LISTEN should be present on any system.
+		// At least LISTEN should be present on any system; LISTEN ⇒ remote_scope=none.
 		assert.True(t, states["LISTEN"], "missing TCP state: LISTEN")
 		assert.True(t, directions["inbound"], "missing direction: inbound")
-		t.Logf("TCP states: %v, directions: %v", states, directions)
+		assert.True(t, remoteScopes["none"], "LISTEN sockets must carry remote_scope=none")
+		t.Logf("TCP states: %v, directions: %v, remote_scope: %v", states, directions, remoteScopes)
 		return
 	}
 	t.Log("topsrv_netstat_tcp_connections not found (may require elevated permissions)")
@@ -251,15 +255,17 @@ func TestNetstatCollectorListenPorts(t *testing.T) {
 		if mf.GetName() != "topsrv_netstat_listening_ports" {
 			continue
 		}
-		require.NotEmpty(t, mf.GetMetric(), "host must have at least one LISTEN socket")
+		require.NotEmpty(t, mf.GetMetric(), "host must have at least one listening socket")
 
 		// Verify the full label set is present on every series.
-		want := map[string]bool{"port": true, "family": true, "scope": true, "process": true}
+		want := map[string]bool{"proto": true, "port": true, "family": true, "scope": true, "process": true}
 		for _, m := range mf.GetMetric() {
 			got := make(map[string]bool, len(m.GetLabel()))
 			for _, l := range m.GetLabel() {
 				got[l.GetName()] = true
 				switch l.GetName() {
+				case "proto":
+					assert.Contains(t, []string{protoTCP, protoUDP}, l.GetValue())
 				case "family":
 					assert.Contains(t, []string{familyIPv4, familyIPv6}, l.GetValue())
 				case "scope":

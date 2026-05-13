@@ -32,9 +32,9 @@ type NetstatCollector struct {
 func NewNetstatCollector(logger embedlog.Logger) *NetstatCollector {
 	return &NetstatCollector{
 		Logger:            logger,
-		tcpConns:          prometheus.NewDesc("topsrv_netstat_tcp_connections", "TCP connections by state and direction.", []string{"state", "direction"}, nil),
+		tcpConns:          prometheus.NewDesc("topsrv_netstat_tcp_connections", "TCP connections by state, direction, and remote-peer scope. remote_scope=none for LISTEN sockets; otherwise loopback/private/public per the same taxonomy as listening_ports. Lets an operator alert on e.g. unexpected public inbound (scan exposure) or private→public outbound chatter (exfil signal).", []string{"state", "direction", "remote_scope"}, nil),
 		tcpConnsByPort:    prometheus.NewDesc("topsrv_netstat_tcp_connections_by_port", "TCP connections per listen port.", []string{"port"}, nil),
-		listenPorts:       prometheus.NewDesc("topsrv_netstat_listening_ports", "Active TCP listen sockets. value=1 per (port, family, scope, process) tuple. scope=loopback bound only to 127.0.0.0/8 or ::1; scope=private bound to an RFC1918/ULA/link-local address (reachable only on the private network); scope=public bound to a routable address or to the 0.0.0.0/:: wildcard (potentially reachable from anywhere). process is the owning binary name (empty when the PID is hidden by kernel ACL — root needed on Linux to read /proc/<pid>/comm of other users).", []string{"port", "family", "scope", "process"}, nil),
+		listenPorts:       prometheus.NewDesc("topsrv_netstat_listening_ports", "Active listening sockets. value=1 per (proto, port, family, scope, process) tuple. proto ∈ {tcp, udp}; UDP \"listening\" means a bound socket with no connected peer (Raddr empty). scope=loopback bound only to 127.0.0.0/8 or ::1; scope=private bound to an RFC1918/ULA/CGNAT/link-local address (reachable only on the private/carrier network); scope=public bound to a routable address or to the 0.0.0.0/:: wildcard (potentially reachable from anywhere). process is the owning binary name (empty when the PID is hidden by kernel ACL — root needed on Linux to read /proc/<pid>/comm of other users).", []string{"proto", "port", "family", "scope", "process"}, nil),
 		tcpRetrans:        prometheus.NewDesc("topsrv_netstat_tcp_retransmits_total", "Total TCP retransmitted segments.", nil, nil),
 		tcpInErrs:         prometheus.NewDesc("topsrv_netstat_tcp_in_errs_total", "Total TCP segments received in error.", nil, nil),
 		tcpOutRsts:        prometheus.NewDesc("topsrv_netstat_tcp_out_rsts_total", "Total TCP segments sent with RST.", nil, nil),
@@ -70,6 +70,9 @@ func (c *NetstatCollector) Collect(ch chan<- prometheus.Metric) {
 const (
 	tcpStateListen = "LISTEN"
 
+	protoTCP = "tcp"
+	protoUDP = "udp"
+
 	familyIPv4 = "ipv4"
 	familyIPv6 = "ipv6"
 
@@ -84,10 +87,12 @@ const (
 	maxListenSeries = 256
 )
 
-// listenKey is the label-tuple identity of a LISTEN socket. Two sockets with
-// the same port but different bind families (e.g. 0.0.0.0:80 and [::]:80)
-// emit two distinct series so dashboards see them both.
+// listenKey is the label-tuple identity of a listening socket. Two sockets
+// with the same port but different protocols (e.g. tcp/53 + udp/53) or bind
+// families (e.g. 0.0.0.0:80 and [::]:80) emit distinct series so dashboards
+// see them all.
 type listenKey struct {
+	proto   string // protoTCP | protoUDP
 	port    uint32
 	family  string // familyIPv4 | familyIPv6
 	scope   string // scopeLoopback | scopePrivate | scopePublic
@@ -95,51 +100,79 @@ type listenKey struct {
 }
 
 func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
-	conns, err := psnet.Connections("tcp")
+	tcpConns, err := psnet.Connections("tcp")
 	if err != nil {
 		c.Print(context.Background(), "netstat: Connections failed", "error", err)
 		return
 	}
 
-	// Find listen ports and capture each LISTEN socket's identity for the
-	// listening_ports metric.
 	listenPorts := make(map[uint32]bool, 32)
 	listenSet := make(map[listenKey]struct{}, 32)
 	procCache := make(map[int32]string, 32)
 	var truncated int
-	for _, conn := range conns {
-		if conn.Status != tcpStateListen {
-			continue
-		}
-		listenPorts[conn.Laddr.Port] = true
+
+	addListener := func(conn psnet.ConnectionStat, proto string) {
 		if len(listenSet) >= maxListenSeries {
 			truncated++
-			continue
+			return
 		}
 		family, scope := classifyAddr(conn.Laddr.IP)
 		listenSet[listenKey{
+			proto:   proto,
 			port:    conn.Laddr.Port,
 			family:  family,
 			scope:   scope,
 			process: c.resolveProcName(conn.Pid, procCache),
 		}] = struct{}{}
 	}
+
+	for _, conn := range tcpConns {
+		if conn.Status != tcpStateListen {
+			continue
+		}
+		listenPorts[conn.Laddr.Port] = true
+		addListener(conn, protoTCP)
+	}
+
+	// UDP listeners — a UDP socket is "listening" when it's bound but has
+	// no connected peer (Raddr empty). Connected UDP (client-side, after
+	// connect()) carries a non-zero Raddr — those are not listeners. UDP
+	// failure is non-fatal: TCP listeners are still worth emitting.
+	udpConns, udpErr := psnet.Connections("udp")
+	if udpErr != nil {
+		c.Print(context.Background(), "netstat: UDP Connections failed", "error", udpErr)
+	}
+	for _, conn := range udpConns {
+		if conn.Raddr.IP != "" || conn.Raddr.Port != 0 {
+			continue
+		}
+		addListener(conn, protoUDP)
+	}
+
 	if truncated > 0 {
 		c.Print(context.Background(), "netstat: listening_ports truncated",
 			"emitted", len(listenSet), "dropped", truncated, "cap", maxListenSeries)
 	}
 
-	// Count by state + direction.
-	type key struct{ state, direction string }
-	stateCounts := make(map[key]int, 20) // ~10 TCP states × 2 directions
+	// TCP connections by state + direction + remote scope. remote_scope
+	// answers "who's on the other end?" — none for LISTEN sockets (no
+	// peer), otherwise loopback/private/public via the same classifier as
+	// listening_ports. Lets an operator alert on e.g. unexpected public
+	// inbound or private→public outbound chatter.
+	type key struct{ state, direction, remoteScope string }
+	stateCounts := make(map[key]int, 32)
 	portCounts := make(map[uint32]int, len(listenPorts))
 
-	for _, conn := range conns {
+	for _, conn := range tcpConns {
 		direction := "outbound"
 		if conn.Status == tcpStateListen || listenPorts[conn.Laddr.Port] {
 			direction = "inbound"
 		}
-		stateCounts[key{conn.Status, direction}]++
+		remoteScope := "none"
+		if conn.Status != tcpStateListen {
+			_, remoteScope = classifyAddr(conn.Raddr.IP)
+		}
+		stateCounts[key{conn.Status, direction, remoteScope}]++
 
 		// Per-port: count non-LISTEN inbound connections.
 		if conn.Status != tcpStateListen && listenPorts[conn.Laddr.Port] {
@@ -148,14 +181,14 @@ func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 	}
 
 	for k, count := range stateCounts {
-		ch <- prometheus.MustNewConstMetric(c.tcpConns, prometheus.GaugeValue, float64(count), k.state, k.direction)
+		ch <- prometheus.MustNewConstMetric(c.tcpConns, prometheus.GaugeValue, float64(count), k.state, k.direction, k.remoteScope)
 	}
 	for port, count := range portCounts {
 		ch <- prometheus.MustNewConstMetric(c.tcpConnsByPort, prometheus.GaugeValue, float64(count), strconv.FormatUint(uint64(port), 10))
 	}
 	for k := range listenSet {
 		ch <- prometheus.MustNewConstMetric(c.listenPorts, prometheus.GaugeValue, 1,
-			strconv.FormatUint(uint64(k.port), 10), k.family, k.scope, k.process)
+			k.proto, strconv.FormatUint(uint64(k.port), 10), k.family, k.scope, k.process)
 	}
 }
 

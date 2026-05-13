@@ -46,9 +46,9 @@
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `topsrv_netstat_tcp_connections` | gauge | state, direction | TCP connections by state and direction (inbound/outbound) |
+| `topsrv_netstat_tcp_connections` | gauge | state, direction, remote_scope | TCP connections grouped by state, direction (inbound/outbound), and the scope of the remote peer. `remote_scope` is `none` for LISTEN sockets; otherwise `loopback` / `private` / `public` using the same taxonomy as `listening_ports`. Lets dashboards alert on e.g. unexpected `public` inbound (scan exposure) or `private`→`public` outbound chatter (exfil signal) |
 | `topsrv_netstat_tcp_connections_by_port` | gauge | port | TCP connections per listen port |
-| `topsrv_netstat_listening_ports` | gauge | port, family, scope, process | One series per active TCP LISTEN socket (`value=1`). `family` ∈ {`ipv4`, `ipv6`}. `scope` ∈ {`loopback` (127.0.0.0/8 or ::1, host-only), `private` (RFC1918, RFC4193 ULA, RFC6598 CGNAT, link-local — reachable only on private/carrier nets), `public` (routable address or 0.0.0.0/:: wildcard — potentially reachable from anywhere)}. `process` is the owning binary name; empty when the agent lacks permission to read `/proc/<pid>/comm` of other users (run as root for full visibility). Capped at 256 series per scrape — a warning log fires when exceeded |
+| `topsrv_netstat_listening_ports` | gauge | proto, port, family, scope, process | One series per active listening socket (`value=1`). `proto` ∈ {`tcp`, `udp`} — UDP "listening" means a bound socket with no connected peer. `family` ∈ {`ipv4`, `ipv6`}. `scope` ∈ {`loopback` (127.0.0.0/8 or ::1, host-only), `private` (RFC1918, RFC4193 ULA, RFC6598 CGNAT, link-local — reachable only on private/carrier nets), `public` (routable address or 0.0.0.0/:: wildcard — potentially reachable from anywhere)}. `process` is the owning binary name; empty when the agent lacks permission to read `/proc/<pid>/comm` of other users (run as root for full visibility). Capped at 256 series per scrape — a warning log fires when exceeded |
 | `topsrv_netstat_tcp_retransmits_total` | counter | — | TCP retransmitted segments |
 | `topsrv_netstat_tcp_in_errs_total` | counter | — | TCP segments received in error |
 | `topsrv_netstat_tcp_out_rsts_total` | counter | — | TCP RST segments sent |
@@ -63,13 +63,22 @@ Useful queries:
 # Inventory of publicly-reachable listeners across the fleet
 topsrv_netstat_listening_ports{scope="public"}
 
+# Same, UDP only — DNS / mDNS / WireGuard / unexpected UDP services
+topsrv_netstat_listening_ports{proto="udp", scope="public"}
+
 # Alert: a new public-bound port appeared in the last 10 minutes
 # (compare current set against the set seen 10 minutes ago — non-zero rows are new exposures)
 (topsrv_netstat_listening_ports{scope="public"} == 1)
-  unless on (instance, port, family) (topsrv_netstat_listening_ports{scope="public"} offset 10m == 1)
+  unless on (instance, proto, port, family) (topsrv_netstat_listening_ports{scope="public"} offset 10m == 1)
 
 # Count of distinct public-bound ports per host (capacity / drift watch)
 count by (instance) (topsrv_netstat_listening_ports{scope="public"} == 1)
+
+# Established TCP connections from the public internet — scan / unexpected exposure signal
+topsrv_netstat_tcp_connections{state="ESTABLISHED", direction="inbound", remote_scope="public"}
+
+# Outbound TCP to the public internet — exfil / unexpected egress watch
+sum by (instance) (topsrv_netstat_tcp_connections{direction="outbound", remote_scope="public"})
 ```
 
 ## Process (`topsrv_process_*`)
