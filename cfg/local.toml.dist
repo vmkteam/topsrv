@@ -51,3 +51,9 @@ Channel  = "stable"      # stable / beta
 # UATruncate    = 1024      # truncate user-agent at this length
 # URITruncate   = 2048      # truncate request URI at this length
 # ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
+# Field aliases — override only if discovery cannot infer the right name
+# (e.g. nginx `set $custom $http_referer;` puts $custom in your log_format).
+# Empty entries fall back to auto-detected, then to default nginx variable.
+# [BotLogs.FieldAliases]
+# Referer = "ref"
+# UserAgent = ""

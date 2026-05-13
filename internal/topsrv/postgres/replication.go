@@ -69,27 +69,35 @@ func (c *Collector) collectWAL(ctx context.Context, ch chan<- prometheus.Metric)
 	}
 }
 
-// collectStatWAL emits pg_stat_wal metrics (PG14+). wal_bytes is intentionally skipped —
-// it has different semantics than topsrv_pg_wal_bytes (LSN position from pg_current_wal_lsn).
+// collectStatWAL emits pg_stat_wal metrics (PG14+). wal_bytes is intentionally
+// skipped — it has different semantics than topsrv_pg_wal_bytes (LSN position
+// from pg_current_wal_lsn). PG18 removed wal_write_time/wal_sync_time from
+// pg_stat_wal (the timings moved to pg_stat_io); on those versions the
+// wal_io_time metric is skipped instead of breaking the whole query.
 func (c *Collector) collectStatWAL(ctx context.Context, ch chan<- prometheus.Metric) {
 	if c.versionNum < versionPG14 {
 		return
 	}
 	var records, fpi, buffersFull int64
 	var writeTime, syncTime float64
-	err := c.pool.QueryRow(ctx, `SELECT wal_records, wal_fpi, wal_buffers_full,
-		wal_write_time, wal_sync_time
-		FROM pg_stat_wal`).
-		Scan(&records, &fpi, &buffersFull, &writeTime, &syncTime)
-	if err != nil {
+	q := `SELECT wal_records, wal_fpi, wal_buffers_full`
+	scanArgs := []any{&records, &fpi, &buffersFull}
+	if c.hasWalIOTime {
+		q += `, wal_write_time, wal_sync_time`
+		scanArgs = append(scanArgs, &writeTime, &syncTime)
+	}
+	q += ` FROM pg_stat_wal`
+	if err := c.pool.QueryRow(ctx, q).Scan(scanArgs...); err != nil {
 		c.queryWarn("stat_wal", err)
 		return
 	}
 	ch <- prometheus.MustNewConstMetric(c.statWalRecords, prometheus.CounterValue, float64(records))
 	ch <- prometheus.MustNewConstMetric(c.statWalFpi, prometheus.CounterValue, float64(fpi))
 	ch <- prometheus.MustNewConstMetric(c.statWalBuffersFull, prometheus.CounterValue, float64(buffersFull))
-	ch <- prometheus.MustNewConstMetric(c.statWalIoTime, prometheus.CounterValue, writeTime*msToSec, "write")
-	ch <- prometheus.MustNewConstMetric(c.statWalIoTime, prometheus.CounterValue, syncTime*msToSec, "sync")
+	if c.hasWalIOTime {
+		ch <- prometheus.MustNewConstMetric(c.statWalIoTime, prometheus.CounterValue, writeTime*msToSec, "write")
+		ch <- prometheus.MustNewConstMetric(c.statWalIoTime, prometheus.CounterValue, syncTime*msToSec, "sync")
+	}
 }
 
 // collectArchiver emits pg_stat_archiver metrics. NULL last_*_time => metric is not emitted

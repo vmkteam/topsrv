@@ -1,8 +1,10 @@
 package app
 
 import (
+	"context"
 	"testing"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/botlog"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -59,30 +61,72 @@ func TestInstrumentedCollectorRecoversPanic(t *testing.T) {
 	assert.InDelta(t, 1.0, counterValue(t, panics), 1e-9, "panics counter must be incremented once")
 }
 
-func TestLogHasUserAgent(t *testing.T) {
-	cases := []struct {
-		name string
-		cfg  nginx.LogConfig
-		want bool
-	}{
-		{"empty", nginx.LogConfig{}, false},
-		{"single format with UA", nginx.LogConfig{LogFormat: "$remote_addr - $http_user_agent"}, true},
-		{"single format without UA", nginx.LogConfig{LogFormat: "$remote_addr $request_time"}, false},
-		{"map with UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$http_user_agent"}}, true},
-		{"map without UA", nginx.LogConfig{LogFormats: map[string]string{"/a": "$remote_addr"}}, false},
-		{"any-of map has UA", nginx.LogConfig{LogFormats: map[string]string{
-			"/a": "$remote_addr",
-			"/b": "$http_user_agent",
-		}}, true},
-		{"json with UA", nginx.LogConfig{LogFormats: map[string]string{
-			"/a": `{"ua":"$http_user_agent"}`,
-		}}, true},
+// newAliasTestApp builds the minimal App required to exercise
+// resolveBotlogAliases — Logger for warnConfig, configWarnings counter for
+// the warning side-effect, and a BotLogs config carrying the override.
+func newAliasTestApp(t *testing.T, override botlog.FieldAliases) *App {
+	t.Helper()
+	a := &App{
+		cfg: Config{BotLogs: &botlog.Config{FieldAliases: override}},
+		configWarnings: prometheus.NewCounterVec(prometheus.CounterOpts{
+			Name: "test_config_warnings_total", Help: "test",
+		}, []string{"kind"}),
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, logHasUserAgent(tc.cfg))
-		})
+	return a
+}
+
+func TestResolveBotlogAliases_SinglePathStandardFormat(t *testing.T) {
+	a := newAliasTestApp(t, botlog.FieldAliases{})
+	cfg := nginx.LogConfig{
+		LogPaths:  []string{"/var/log/nginx/a.log"},
+		LogFormat: `$remote_addr [$time_local] "$request" $status "$http_referer" "$http_user_agent"`,
 	}
+	got := a.resolveBotlogAliases(context.Background(), cfg)
+	assert.Equal(t, "http_user_agent", got.UserAgent)
+	assert.Equal(t, "http_referer", got.Referer)
+	assert.Equal(t, "remote_addr", got.RemoteAddr)
+}
+
+func TestResolveBotlogAliases_OverrideWins(t *testing.T) {
+	a := newAliasTestApp(t, botlog.FieldAliases{Referer: "ref"})
+	cfg := nginx.LogConfig{
+		LogPaths:  []string{"/var/log/nginx/a.log"},
+		LogFormat: `$remote_addr "$http_referer" "$http_user_agent"`,
+	}
+	got := a.resolveBotlogAliases(context.Background(), cfg)
+	assert.Equal(t, "ref", got.Referer, "explicit override beats auto-detected")
+	assert.Equal(t, "http_user_agent", got.UserAgent, "non-overridden fields keep detection")
+}
+
+func TestResolveBotlogAliases_MismatchEmitsWarning(t *testing.T) {
+	a := newAliasTestApp(t, botlog.FieldAliases{})
+	// Two paths, different formats with diverging detected aliases:
+	// path A uses $http_referer, path B uses $http_referrer.
+	cfg := nginx.LogConfig{
+		LogPaths: []string{"/var/log/a.log", "/var/log/b.log"},
+		LogFormats: map[string]string{
+			"/var/log/a.log": `$remote_addr "$http_referer" "$http_user_agent"`,
+			"/var/log/b.log": `$remote_addr "$http_referrer" "$http_user_agent"`,
+		},
+	}
+	got := a.resolveBotlogAliases(context.Background(), cfg)
+	assert.Equal(t, "http_referer", got.Referer, "first path's resolution wins")
+	assert.InDelta(t, 1.0, counterValue(t, a.configWarnings.WithLabelValues("botlog_alias_mismatch")), 1e-9)
+}
+
+func TestResolveBotlogAliases_AllPathsAgreeNoWarning(t *testing.T) {
+	a := newAliasTestApp(t, botlog.FieldAliases{})
+	// Two paths sharing the same format → no mismatch warning, no DetectAliases
+	// re-run (memoised by (format,isJSON)).
+	cfg := nginx.LogConfig{
+		LogPaths: []string{"/var/log/a.log", "/var/log/b.log"},
+		LogFormats: map[string]string{
+			"/var/log/a.log": `$remote_addr "$http_referer" "$http_user_agent"`,
+			"/var/log/b.log": `$remote_addr "$http_referer" "$http_user_agent"`,
+		},
+	}
+	a.resolveBotlogAliases(context.Background(), cfg)
+	assert.InDelta(t, 0.0, counterValue(t, a.configWarnings.WithLabelValues("botlog_alias_mismatch")), 1e-9)
 }
 
 // TestInstrumentedCollectorNormalCallNoPanicCount verifies the counter stays zero

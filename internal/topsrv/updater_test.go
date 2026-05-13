@@ -3,6 +3,7 @@ package topsrv
 import (
 	"archive/tar"
 	"compress/gzip"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -185,6 +186,217 @@ func TestStateLoadMissing(t *testing.T) {
 	u := &Updater{stateDir: t.TempDir()}
 	_, err := u.loadState()
 	assert.Error(t, err)
+}
+
+// TestCheckRollback_GracefulSkipsIncrement is the regression test for the
+// "ручные рестарты считаются как crash" bug. SIGTERM-driven shutdowns mark
+// the state graceful so the next start does not bump the counter.
+func TestCheckRollback_GracefulSkipsIncrement(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{
+		LastUpdate:   time.Now(),
+		RestartCount: 2,
+		Graceful:     true,
+	})
+
+	u.checkRollback()
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, 2, got.RestartCount, "graceful exit must not bump RestartCount")
+	assert.False(t, got.Graceful, "flag is consumed so a later real crash counts")
+}
+
+func TestCheckRollback_CrashWithinWindowIncrements(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{
+		LastUpdate:   time.Now(),
+		RestartCount: 1,
+	})
+
+	u.checkRollback()
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, 2, got.RestartCount)
+}
+
+func TestCheckRollback_OutsideWindowResets(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{
+		LastUpdate:      time.Now().Add(-2 * updateCrashWindow),
+		PreviousVersion: "1.0.0",
+		RestartCount:    2,
+		Graceful:        true,
+	})
+
+	u.checkRollback()
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, 0, got.RestartCount, "stale counter is cleared")
+	assert.False(t, got.Graceful, "stale graceful flag is cleared")
+	assert.Equal(t, "1.0.0", got.PreviousVersion, "other fields are preserved")
+}
+
+func TestCheckRollback_MissingStateNoop(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	assert.NotPanics(t, u.checkRollback, "missing state file must be tolerated")
+	_, err := u.loadState()
+	assert.Error(t, err, "checkRollback must not create state when there isn't one")
+}
+
+// TestCheckRollback_ThresholdAttemptsRollback drives the counter to the
+// threshold and verifies rollback is attempted. Backup is intentionally
+// absent so rollback exits via Errorf before reaching os.Exit — the
+// observable effect is that the counter reached updateMaxRestarts.
+func TestCheckRollback_ThresholdAttemptsRollback(t *testing.T) {
+	tmp := t.TempDir()
+	u := &Updater{
+		stateDir:  tmp,
+		backupDir: filepath.Join(tmp, "missing-backups"),
+	}
+	u.saveState(updateState{
+		LastUpdate:      time.Now(),
+		RestartCount:    updateMaxRestarts - 1,
+		PreviousVersion: "1.0.0",
+	})
+
+	u.checkRollback()
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.GreaterOrEqual(t, got.RestartCount, updateMaxRestarts,
+		"counter must reach the threshold so the rollback branch is taken")
+}
+
+func TestMarkGracefulSetsFlag(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{LastUpdate: time.Now(), RestartCount: 1})
+
+	u.markGraceful()
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.True(t, got.Graceful)
+	assert.Equal(t, 1, got.RestartCount, "markGraceful must not touch the counter")
+}
+
+// TestMarkGracefulIfCancelled_PanicLeavesFlagFalse is the panic-safety
+// regression: Run's defer must distinguish "ctx cancelled (real graceful
+// shutdown)" from "panic unwinding (real crash)". Without the ctx.Err()
+// guard, a panic in Run would write Graceful=true and mask itself from
+// crash-loop detection on the next start.
+func TestMarkGracefulIfCancelled_PanicLeavesFlagFalse(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{LastUpdate: time.Now()})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	// Live ctx — simulates panic-unwinding path where defer fires but ctx
+	// was never cancelled. Must NOT mark graceful.
+	u.markGracefulIfCancelled(ctx)
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.False(t, got.Graceful, "live ctx must not mark graceful (panic case)")
+
+	// Now cancel and call again — must mark graceful.
+	cancel()
+	u.markGracefulIfCancelled(ctx)
+	got, err = u.loadState()
+	require.NoError(t, err)
+	assert.True(t, got.Graceful, "cancelled ctx marks graceful")
+}
+
+func TestAttemptRollback_MissingBackup(t *testing.T) {
+	tmp := t.TempDir()
+	u := &Updater{
+		stateDir:  tmp,
+		backupDir: filepath.Join(tmp, "missing"),
+	}
+	u.saveState(updateState{LastUpdate: time.Now(), RestartCount: updateMaxRestarts})
+
+	err := u.attemptRollback("1.0.0")
+	require.ErrorIs(t, err, os.ErrNotExist, "missing backup must surface as not-exist for callers")
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, updateMaxRestarts, got.RestartCount,
+		"failed rollback must not touch state — operator needs the original counters for diagnosis")
+}
+
+func TestAttemptRollback_SuccessClosesWindow(t *testing.T) {
+	tmp := t.TempDir()
+	binPath := filepath.Join(tmp, "topsrv")
+	require.NoError(t, os.WriteFile(binPath, []byte("current"), 0o755))
+	backupDir := filepath.Join(tmp, "backups")
+	require.NoError(t, os.MkdirAll(backupDir, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(backupDir, "topsrv-1.0.0"), []byte("previous"), 0o755))
+
+	u := &Updater{
+		stateDir:  tmp,
+		backupDir: backupDir,
+		binPath:   binPath,
+	}
+	u.saveState(updateState{
+		LastUpdate:      time.Now(),
+		PreviousVersion: "1.0.0",
+		CurrentVersion:  "1.1.0",
+		RestartCount:    updateMaxRestarts,
+		Graceful:        true,
+	})
+
+	require.NoError(t, u.attemptRollback("1.0.0"))
+
+	// Binary replaced.
+	data, err := os.ReadFile(binPath)
+	require.NoError(t, err)
+	assert.Equal(t, "previous", string(data))
+
+	// State cleared enough to keep checkRollback out of the window on the
+	// next supervisor restart, but version history is preserved for
+	// post-mortem.
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.True(t, got.LastUpdate.IsZero(), "window closed")
+	assert.Equal(t, 0, got.RestartCount)
+	assert.False(t, got.Graceful)
+	assert.Equal(t, "1.0.0", got.PreviousVersion, "version history preserved")
+	assert.Equal(t, "1.1.0", got.CurrentVersion)
+}
+
+func TestMarkStableAfterResetsCounter(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{LastUpdate: time.Now(), RestartCount: 2})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	done := make(chan struct{})
+	go func() {
+		u.markStableAfter(ctx, 10*time.Millisecond)
+		close(done)
+	}()
+	<-done
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, 0, got.RestartCount, "uptime threshold resets counter")
+}
+
+func TestMarkStableAfterCancelled(t *testing.T) {
+	u := &Updater{stateDir: t.TempDir()}
+	u.saveState(updateState{LastUpdate: time.Now(), RestartCount: 2})
+
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+
+	u.markStableAfter(ctx, time.Hour) // returns immediately via ctx
+
+	got, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, 2, got.RestartCount, "cancelled threshold must not reset")
 }
 
 func TestCompareVersionedNames(t *testing.T) {

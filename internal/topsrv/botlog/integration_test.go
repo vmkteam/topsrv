@@ -97,9 +97,9 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 	logC := nginx.NewLogCollector(embedlog.Logger{}, nginx.LogConfig{
 		LogPaths:      []string{logPath},
 		JSONPaths:     map[string]bool{logPath: true},
-		ExtractFields: RequiredFields(),
+		ExtractFields: RequiredFields(DefaultAliases()),
 	})
-	obs := NewObserver(p, cfg, "smoke-host", RequiredFields())
+	obs := NewObserver(p, cfg, "smoke-host", RequiredFields(DefaultAliases()), DefaultAliases())
 	logC.AddObserver(obs)
 
 	ctx, cancel := context.WithCancel(context.Background())

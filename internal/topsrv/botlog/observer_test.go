@@ -18,12 +18,19 @@ import (
 )
 
 func TestRequiredFieldsContents(t *testing.T) {
-	// RequiredFields contract: nginx variables botlog needs read into
-	// ParsedLine.Extras. Order is no longer load-bearing (Observer resolves
-	// indices at runtime), but the set must stay stable across versions.
+	// RequiredFields contract: with default aliases, the returned set covers
+	// the five canonical nginx variables botlog needs read into Extras. Order
+	// is not load-bearing (Observer resolves indices at runtime), but the set
+	// must stay stable across versions.
 	assert.ElementsMatch(t,
 		[]string{fieldUserAgent, fieldHost, fieldServerName, fieldRemoteAddr, fieldReferer},
-		RequiredFields())
+		RequiredFields(DefaultAliases()))
+}
+
+func TestRequiredFieldsHonoursAliases(t *testing.T) {
+	// Custom JSON keys → RequiredFields returns the aliased names.
+	a := FieldAliases{UserAgent: "ua", Host: "h", ServerName: "sn", RemoteAddr: "ip", Referer: "ref"}
+	assert.ElementsMatch(t, []string{"ua", "h", "sn", "ip", "ref"}, RequiredFields(a))
 }
 
 func newObserverPair(t *testing.T) (*Observer, *Pusher) {
@@ -36,9 +43,9 @@ func newObserverPair(t *testing.T) (*Observer, *Pusher) {
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
 	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
-	// Tests use the canonical RequiredFields() order: ua, host, server_name,
-	// remote_addr, referer (see botParsedLine).
-	o := NewObserver(p, cfg, "web01", RequiredFields())
+	// Tests use the canonical default aliases — ExtractFields and Observer
+	// indices line up with botParsedLine's Extras layout.
+	o := NewObserver(p, cfg, "web01", RequiredFields(DefaultAliases()), DefaultAliases())
 	return o, p
 }
 
@@ -195,9 +202,9 @@ func TestObserver_PluggableThroughLogCollector(t *testing.T) {
 	logC := nginx.NewLogCollector(embedlog.Logger{}, nginx.LogConfig{
 		LogPaths:      []string{logPath},
 		JSONPaths:     map[string]bool{logPath: true},
-		ExtractFields: RequiredFields(),
+		ExtractFields: RequiredFields(DefaultAliases()),
 	})
-	obs := NewObserver(p, cfg, "web01", RequiredFields())
+	obs := NewObserver(p, cfg, "web01", RequiredFields(DefaultAliases()), DefaultAliases())
 	logC.AddObserver(obs)
 
 	logC.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1","request_uri":"/a",` +
@@ -219,7 +226,7 @@ func TestObserver_IndicesResolvedAtRuntime(t *testing.T) {
 
 	// Operator labels first, botlog's required fields after — UA at index 2.
 	extract := []string{"server_name", "http_platform", fieldUserAgent, fieldRemoteAddr, fieldReferer}
-	obs := NewObserver(p, cfg, "host1", extract)
+	obs := NewObserver(p, cfg, "host1", extract, DefaultAliases())
 
 	pl := &nginx.ParsedLine{
 		Status:  "200",
@@ -246,7 +253,7 @@ func TestObserver_MissingFieldsSafe(t *testing.T) {
 	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
 
 	// Only UA — no server_name / remote_addr / referer fields tailed.
-	obs := NewObserver(p, cfg, "host1", []string{fieldUserAgent})
+	obs := NewObserver(p, cfg, "host1", []string{fieldUserAgent}, DefaultAliases())
 	pl := &nginx.ParsedLine{
 		Status:  "200",
 		URI:     "/a",

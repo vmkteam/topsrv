@@ -32,6 +32,19 @@ const (
 	updateMaxBackups = 5
 	updateExitCode   = 42
 	updateStateFile  = "update-state.json"
+	backupPrefix     = "topsrv-"
+
+	// updateCrashWindow bounds how long after an update we treat restarts
+	// as potentially crash-loop-relevant. After it, the counter is reset.
+	updateCrashWindow = 5 * time.Minute
+
+	// updateStableThreshold is how long the new binary must run before we
+	// declare it stable and zero RestartCount. Picked so a fast-crashing
+	// binary cannot beat the threshold even with k8s/systemd restart-backoff.
+	updateStableThreshold = 60 * time.Second
+
+	// updateMaxRestarts is the crash count that triggers a rollback.
+	updateMaxRestarts = 3
 )
 
 // UpdateConfig contains auto-update settings.
@@ -56,6 +69,10 @@ type updateState struct {
 	PreviousVersion string    `json:"previous_version"`
 	CurrentVersion  string    `json:"current_version"`
 	RestartCount    int       `json:"restart_count"`
+	// Graceful is set on ctx.Done so the next checkRollback skips the
+	// crash increment. Cleared on every checkRollback so a subsequent
+	// real crash still counts.
+	Graceful bool `json:"graceful,omitempty"`
 }
 
 // Updater checks for new agent versions and performs self-update.
@@ -131,8 +148,18 @@ func deriveUpdateEndpoint(pushEndpoint string) string {
 }
 
 // Run starts the update check loop. Blocks until ctx is cancelled.
+//
+// Crash-loop bookkeeping has two complementary signals:
+//   - markStable, called after the binary has been alive for
+//     updateStableThreshold, zeroes RestartCount so a healthy process
+//     accumulates nothing.
+//   - markGraceful, called on ctx.Done, lets the next start skip the
+//     RestartCount bump — manual / supervised restarts are not crashes.
 func (u *Updater) Run(ctx context.Context) {
 	u.checkRollback()
+	defer u.markGracefulIfCancelled(ctx)
+
+	go u.markStableAfter(ctx, updateStableThreshold)
 
 	jitter := time.Duration(rand.IntN(60)) * time.Second
 	u.Printf("update: started, endpoint=%s, interval=%s, jitter=%s", u.endpoint, u.interval, jitter)
@@ -157,6 +184,50 @@ func (u *Updater) Run(ctx context.Context) {
 			u.check(ctx)
 		}
 	}
+}
+
+// markStableAfter zeroes RestartCount once the new binary survives the
+// threshold. Cancelled if ctx fires first — a fast graceful shutdown should
+// not be treated as proof of stability.
+func (u *Updater) markStableAfter(ctx context.Context, after time.Duration) {
+	select {
+	case <-time.After(after):
+	case <-ctx.Done():
+		return
+	}
+	state, err := u.loadState()
+	if err != nil {
+		return
+	}
+	if state.RestartCount == 0 {
+		return
+	}
+	state.RestartCount = 0
+	u.saveState(state)
+	u.Printf("update: stable after %s, restart counter reset", after)
+}
+
+// markGracefulIfCancelled writes the Graceful flag only when ctx has
+// fired — i.e. SIGTERM / systemctl stop / k8s drain. A panic-driven exit
+// leaves ctx un-cancelled and must not mask itself as a clean shutdown.
+func (u *Updater) markGracefulIfCancelled(ctx context.Context) {
+	if ctx.Err() == nil {
+		return
+	}
+	u.markGraceful()
+}
+
+// markGraceful records that this process is exiting via ctx.Done — the
+// next start of checkRollback skips its increment. Best-effort: loadState
+// errors mean there is no post-update state to mark.
+func (u *Updater) markGraceful() {
+	state, err := u.loadState()
+	if err != nil || state.Graceful {
+		return
+	}
+	state.Graceful = true
+	u.saveState(state)
+	u.Printf("update: graceful shutdown marked")
 }
 
 func (u *Updater) check(ctx context.Context) {
@@ -373,7 +444,7 @@ func (u *Updater) backup() error {
 		return err
 	}
 
-	dest := filepath.Join(u.backupDir, "topsrv-"+u.version)
+	dest := filepath.Join(u.backupDir, backupPrefix+u.version)
 	src, err := os.Open(u.binPath)
 	if err != nil {
 		return err
@@ -443,7 +514,7 @@ func compareVersionedNames(a, b string) int {
 
 // extractVersion extracts version string from backup filename like "topsrv-0.0.9" or "topsrv-v0.0.9".
 func extractVersion(name string) string {
-	_, after, ok := strings.Cut(name, "topsrv-")
+	_, after, ok := strings.Cut(name, backupPrefix)
 	if !ok {
 		return ""
 	}
@@ -477,43 +548,69 @@ func (u *Updater) replace(newBinPath string) error {
 	return os.Rename(tmpPath, u.binPath)
 }
 
-// checkRollback detects crash-loop after update and rolls back.
+// checkRollback rolls back to PreviousVersion on a crash-loop. The Graceful
+// flag and markStable keep supervised / healthy restarts from counting.
 func (u *Updater) checkRollback() {
 	state, err := u.loadState()
 	if err != nil {
 		return
 	}
 
-	if time.Since(state.LastUpdate) < 5*time.Minute {
-		state.RestartCount++
-		u.saveState(state)
-
-		if state.RestartCount >= 3 {
-			u.Printf("update: crash-loop detected (%d restarts in %s), rolling back to %s",
-				state.RestartCount, time.Since(state.LastUpdate).Round(time.Second), state.PreviousVersion)
-			u.rollback(state.PreviousVersion)
+	// Outside the post-update window — nothing to track; tidy the counter
+	// if a previous run left one behind.
+	if time.Since(state.LastUpdate) >= updateCrashWindow {
+		if state.RestartCount != 0 || state.Graceful {
+			state.RestartCount = 0
+			state.Graceful = false
+			u.saveState(state)
 		}
-	} else if state.RestartCount > 0 {
-		// Stable — reset counter.
-		state.RestartCount = 0
+		return
+	}
+
+	// Previous shutdown was graceful — clear the flag and skip the bump.
+	// Always clear so the next start, if it crashes, is counted normally.
+	if state.Graceful {
+		state.Graceful = false
 		u.saveState(state)
+		return
+	}
+
+	state.RestartCount++
+	u.saveState(state)
+
+	if state.RestartCount >= updateMaxRestarts {
+		u.Printf("update: crash-loop detected (%d restarts in %s), rolling back to %s",
+			state.RestartCount, time.Since(state.LastUpdate).Round(time.Second), state.PreviousVersion)
+		u.rollback(state.PreviousVersion)
 	}
 }
 
 func (u *Updater) rollback(version string) {
-	backupPath := filepath.Join(u.backupDir, "topsrv-"+version)
-	if _, err := os.Stat(backupPath); err != nil {
-		u.Errorf("update: rollback failed, backup not found: %s", backupPath)
+	if err := u.attemptRollback(version); err != nil {
+		u.Errorf("update: rollback failed: %v", err)
 		return
 	}
-
-	if err := u.replace(backupPath); err != nil {
-		u.Errorf("update: rollback replace failed: %v", err)
-		return
-	}
-
 	u.Printf("update: rolled back to %s, restarting", version)
 	os.Exit(updateExitCode)
+}
+
+// attemptRollback does the rollback work without os.Exit so the success
+// path is unit-testable. On success the post-update window is closed so
+// the supervisor's restart after our os.Exit cannot trip checkRollback
+// into another rollback of the same binary — version history is left in
+// place for post-mortem.
+func (u *Updater) attemptRollback(version string) error {
+	backupPath := filepath.Join(u.backupDir, backupPrefix+version)
+	if err := u.replace(backupPath); err != nil {
+		return fmt.Errorf("replace %s: %w", backupPath, err)
+	}
+
+	state, _ := u.loadState()
+	state.LastUpdate = time.Time{}
+	state.RestartCount = 0
+	state.Graceful = false
+	u.saveState(state)
+	return nil
 }
 
 func (u *Updater) loadState() (updateState, error) {

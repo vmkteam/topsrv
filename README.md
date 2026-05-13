@@ -155,6 +155,10 @@ Channel  = "stable"         # stable / beta
 # UATruncate    = 1024      # truncate user-agent at this length
 # URITruncate   = 2048      # truncate request URI at this length
 # ExtraUAPatterns = ["MyCustomCrawler/"]  # local additions to the bot list
+# Field aliases — only set when discovery cannot infer the right name
+# (e.g. operator-defined `set $custom $http_referer;`). Empty falls back.
+# [BotLogs.FieldAliases]
+# Referer = "ref"
 ```
 
 | Parameter | Default | Description |
@@ -190,6 +194,7 @@ Channel  = "stable"         # stable / beta
 | `BotLogs.UATruncate` | `1024` | Max UA length per event |
 | `BotLogs.URITruncate` | `2048` | Max URI length per event |
 | `BotLogs.ExtraUAPatterns` | `[]` | Local additions to known-bots UA patterns |
+| `BotLogs.FieldAliases.*` | auto | Per-format field-name overrides (UserAgent/Host/ServerName/RemoteAddr/Referer). Discovery auto-detects from `log_format`; only set when operator uses non-standard variables nginx config |
 
 ### Environment variables
 
@@ -380,11 +385,19 @@ Enabling `[BotLogs]` extends nginx auto-discovery to log_formats *without*
 timing histograms are simply skipped per-line for those. Installs without
 `[BotLogs]` keep the original behavior.
 
-**Required log_format variables**: `$http_user_agent`, `$server_name`,
-`$remote_addr`, `$http_referer`. Any user-supplied `[Nginx].ExtraLabels`
-are dropped while bot-logs is enabled (ParsedLine has only four label slots)
-— this is logged on startup. Missing variables surface as empty strings;
-events still ship.
+**Required log_format variables**: `$http_user_agent`, `$host` /
+`$server_name`, `$remote_addr`, `$http_referer`. Field names are
+auto-detected from each tailed `log_format` — common alternates work
+out of the box (`http_host`, `realip_remote_addr`, `http_x_real_ip`,
+`http_x_forwarded_for`, `http_referrer` typo, custom JSON keys). The
+resolution and its provenance (override / detected / default) are
+emitted as a `botlog: resolved field aliases` log line at startup.
+When discovery cannot infer the right name (e.g. operator-defined
+`set $custom $http_referer;`), override via `[BotLogs.FieldAliases]`.
+If a format genuinely lacks UA, a `botlog_no_ua_field` warning is
+raised and `topsrv_collector_config_warnings_total{kind=...}` ticks.
+Operator-supplied `[Nginx].ExtraLabels` are kept on metrics labels;
+required botlog fields are unioned into `ExtractFields` for parsing.
 
 Metrics: `topsrv_botlog_events_total{state=enqueued|sent|spooled|dropped}`,
 `topsrv_botlog_match_total{family}`, `topsrv_botlog_send_errors_total{kind}`,

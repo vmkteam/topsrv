@@ -18,7 +18,21 @@ const (
 	collectTimeout         = 10 * time.Second
 	versionPG14            = 140000 // pg_stat_wal introduced
 	versionPG17            = 170000 // pg_stat_checkpointer, pg_stat_wal.stats_reset introduced
+	versionPG18            = 180000 // pg_stat_wal.wal_write_time/wal_sync_time removed (moved into pg_stat_io)
 	settingRefreshInterval = time.Minute
+
+	// appNamesTTL bounds how long a (queryid, application_name) pair stays
+	// in memory after it was last seen in pg_stat_activity. Long enough
+	// (1h) that a query absent from a few scrapes still has its caller
+	// resolved; short enough that one-shot pids/uuids don't accumulate.
+	appNamesTTL         = time.Hour
+	appNamesSweepPeriod = 5 * time.Minute
+
+	// Relation names probed by relHasColumn. Kept as named constants so a
+	// rename or typo can't silently disable feature detection.
+	relPgStatStmts    = "pg_stat_statements"
+	relPgStatWal      = "pg_stat_wal"
+	relPgStatActivity = "pg_stat_activity"
 )
 
 // Collector collects PostgreSQL metrics via SQL queries.
@@ -32,9 +46,10 @@ type Collector struct {
 	pool               *pgxpool.Pool   // nil until first successful ensureReady
 	versionNum         int             // server_version_num, cached
 	database           string          // current_database() — scope for per-DB views (pg_stat_user_tables/indexes)
-	statementsTimeCol  string          // "total_exec_time" (PG13+) or "total_time" (PG12-)
+	statementsTimeCol  string          // "total_exec_time" (PG13+); empty iff pg_stat_statements unavailable
 	hasWalBytes        bool            // pg_stat_statements has wal_bytes column
 	hasToplevel        bool            // pg_stat_statements has toplevel column (PG14+)
+	hasWalIOTime       bool            // pg_stat_wal has wal_write_time/wal_sync_time (PG14..PG17)
 	archiveEnabled     bool            // archive_mode is 'on' or 'always'
 	hasActivityQID     bool            // pg_stat_activity.query_id column present (PG14+)
 
@@ -42,10 +57,13 @@ type Collector struct {
 	queryMetaMu sync.RWMutex
 	queryMeta   []QueryMeta
 
-	// queryid → set of application_names (accumulated from pg_stat_activity samples).
-	// Sampled by a background ticker independent of Prometheus scrape to capture short queries.
+	// queryid → application_name → last-seen time. Sampled by a background
+	// ticker independent of Prometheus scrape to catch short-lived queries.
+	// Entries older than appNamesTTL are pruned by a separate sweeper so a
+	// rotating app_name (pid/uuid suffix per process restart) does not turn
+	// the map into a slow memory leak.
 	appNamesMu       sync.RWMutex
-	appNames         map[int64]map[string]bool
+	appNames         map[int64]map[string]time.Time
 	appSampleLastErr time.Time // rate-limit sampler error logs to 1/minute
 	appSampleCancel  context.CancelFunc
 	appSampleDone    chan struct{}
@@ -166,13 +184,14 @@ func NewCollector(logger embedlog.Logger, dsn string) (*Collector, error) {
 	cfg.ConnConfig.RuntimeParams["application_name"] = "topsrv"
 
 	c := &Collector{
-		Logger:            logger,
-		cfg:               cfg,
-		statementsTimeCol: "total_exec_time", // refined by detectFeatures once reachable
-		appNames:          make(map[int64]map[string]bool),
-		prevStmts:         make(map[string]stmtPrev),
-		histBuckets:       newHistBuckets(),
-		settingsCache:     map[string]float64{},
+		Logger: logger,
+		cfg:    cfg,
+		// statementsTimeCol stays "" until detectFeatures confirms pg_stat_statements
+		// is present with total_exec_time (PG13+/extension 1.8+).
+		appNames:      make(map[int64]map[string]time.Time),
+		prevStmts:     make(map[string]stmtPrev),
+		histBuckets:   newHistBuckets(),
+		settingsCache: map[string]float64{},
 	}
 	c.initDescriptors()
 	return c, nil
@@ -228,19 +247,27 @@ func (c *Collector) detectFeatures(ctx context.Context) error {
 
 	_ = c.pool.QueryRow(ctx, "SELECT current_database()").Scan(&c.database)
 
-	// pg_stat_statements column probes (extension views aren't in information_schema).
-	hasCol := func(col string) bool {
-		var ok int
-		return c.pool.QueryRow(ctx,
-			"SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid WHERE c.relname = 'pg_stat_statements' AND a.attname = $1", col).Scan(&ok) == nil
+	// pg_stat_statements: probe the canonical column. relHasColumn returns
+	// false both when the relation is absent (switchToLargestDB landed in a
+	// DB without CREATE EXTENSION) and when it exists but is pre-1.8 (no
+	// total_exec_time — pre-PG13, unsupported). statementsTimeCol == ""
+	// thereafter signals "skip collectStatements" everywhere.
+	if c.relHasColumn(ctx, relPgStatStmts, "total_exec_time") {
+		c.statementsTimeCol = "total_exec_time"
+		c.hasWalBytes = c.relHasColumn(ctx, relPgStatStmts, "wal_bytes")
+		c.hasToplevel = c.relHasColumn(ctx, relPgStatStmts, "toplevel")
+		c.Print(ctx, "postgres: pg_stat_statements detected", "database", c.database, "wal_bytes", c.hasWalBytes, "toplevel", c.hasToplevel)
+	} else {
+		c.Print(ctx, "postgres: pg_stat_statements disabled", "database", c.database, "reason", "relation or total_exec_time column missing")
 	}
-	if !hasCol("total_exec_time") {
-		c.statementsTimeCol = "total_time"
-	}
-	c.hasWalBytes = hasCol("wal_bytes")
-	c.hasToplevel = hasCol("toplevel")
-	if c.hasToplevel {
-		c.Print(ctx, "postgres: pg_stat_statements toplevel filter enabled")
+
+	// pg_stat_wal.wal_write_time / wal_sync_time removed in PG18 (moved to
+	// pg_stat_io). Probe instead of version-gating — survives backports.
+	if c.versionNum >= versionPG14 {
+		c.hasWalIOTime = c.relHasColumn(ctx, relPgStatWal, "wal_write_time")
+		if !c.hasWalIOTime {
+			c.Print(ctx, "postgres: pg_stat_wal write/sync timing columns absent — wal_io_time metric will not be emitted", "version", c.versionNum)
+		}
 	}
 
 	// archive_mode ('on' and 'always' both produce archiver stats).
@@ -253,9 +280,7 @@ func (c *Collector) detectFeatures(ctx context.Context) error {
 	}
 
 	// pg_stat_activity.query_id (PG14+) — required for the app-name sampler.
-	_ = c.pool.QueryRow(ctx,
-		`SELECT EXISTS (SELECT 1 FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
-			WHERE c.relname = 'pg_stat_activity' AND a.attname = 'query_id')`).Scan(&c.hasActivityQID)
+	c.hasActivityQID = c.relHasColumn(ctx, relPgStatActivity, "query_id")
 
 	if c.hasActivityQID {
 		c.startAppNamesSampler(1 * time.Second)
@@ -263,6 +288,18 @@ func (c *Collector) detectFeatures(ctx context.Context) error {
 		c.Print(ctx, "postgres: app-name sampling disabled", "reason", "pg_stat_activity.query_id not present (PG<14)")
 	}
 	return nil
+}
+
+// relHasColumn reports whether the given relation has the given column. It
+// uses to_regclass so a missing relation simply yields false instead of an
+// SQL exception — callers can probe extensions/views that may or may not
+// exist in the current database.
+func (c *Collector) relHasColumn(ctx context.Context, rel, col string) bool {
+	var ok int
+	err := c.pool.QueryRow(ctx,
+		"SELECT 1 FROM pg_attribute WHERE attrelid = to_regclass($1) AND attname = $2",
+		rel, col).Scan(&ok)
+	return err == nil
 }
 
 // Name returns a human-readable collector name.
