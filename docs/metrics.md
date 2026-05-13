@@ -48,6 +48,7 @@
 |--------|------|--------|-------------|
 | `topsrv_netstat_tcp_connections` | gauge | state, direction | TCP connections by state and direction (inbound/outbound) |
 | `topsrv_netstat_tcp_connections_by_port` | gauge | port | TCP connections per listen port |
+| `topsrv_netstat_listening_ports` | gauge | port, family, scope, process | One series per active TCP LISTEN socket (`value=1`). `family` ∈ {`ipv4`, `ipv6`}. `scope` ∈ {`loopback` (127.0.0.0/8 or ::1, host-only), `private` (RFC1918, RFC4193 ULA, RFC6598 CGNAT, link-local — reachable only on private/carrier nets), `public` (routable address or 0.0.0.0/:: wildcard — potentially reachable from anywhere)}. `process` is the owning binary name; empty when the agent lacks permission to read `/proc/<pid>/comm` of other users (run as root for full visibility). Capped at 256 series per scrape — a warning log fires when exceeded |
 | `topsrv_netstat_tcp_retransmits_total` | counter | — | TCP retransmitted segments |
 | `topsrv_netstat_tcp_in_errs_total` | counter | — | TCP segments received in error |
 | `topsrv_netstat_tcp_out_rsts_total` | counter | — | TCP RST segments sent |
@@ -55,6 +56,21 @@
 | `topsrv_netstat_udp_in_errors_total` | counter | — | UDP receive errors |
 | `topsrv_netstat_udp_sndbuf_errors_total` | counter | — | UDP send buffer errors |
 | `topsrv_netstat_ip_unknown_protos_total` | counter | — | IP datagrams with unknown protocol |
+
+Useful queries:
+
+```promql
+# Inventory of publicly-reachable listeners across the fleet
+topsrv_netstat_listening_ports{scope="public"}
+
+# Alert: a new public-bound port appeared in the last 10 minutes
+# (compare current set against the set seen 10 minutes ago — non-zero rows are new exposures)
+(topsrv_netstat_listening_ports{scope="public"} == 1)
+  unless on (instance, port, family) (topsrv_netstat_listening_ports{scope="public"} offset 10m == 1)
+
+# Count of distinct public-bound ports per host (capacity / drift watch)
+count by (instance) (topsrv_netstat_listening_ports{scope="public"} == 1)
+```
 
 ## Process (`topsrv_process_*`)
 

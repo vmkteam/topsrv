@@ -52,7 +52,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **System** | CPU per-core, memory, load, swap, uptime, host info, context switches | node_exporter |
 | **Disk** | IO (read/write bytes/ops/time), filesystem (space/inodes) | node_exporter |
 | **Network** | IO per interface, interface info (MAC/IP/MTU/status) | node_exporter |
-| **Netstat** | TCP connections by state/direction/port, TCP retransmits, UDP/IP errors | node_exporter |
+| **Netstat** | TCP connections by state/direction/port, listening ports by scope (loopback/private/public) and owning process, TCP retransmits, UDP/IP errors | node_exporter |
 | **Process** | CPU, memory, disk IO, threads, FDs, worst_fd_ratio per process group | process-exporter |
 | **PostgreSQL** | Connections (by state/addr/app), transactions, longest transaction age, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
