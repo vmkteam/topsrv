@@ -727,6 +727,17 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 			a.addCollector(nginx.NewSSLCollector(a.Logger, discovered.SSLCertificates))
 			a.Print(ctx, "angie: monitoring SSL certificates", "count", len(discovered.SSLCertificates))
 		}
+		// Operator-facing diagnostic: acme_client directives configured but
+		// no certs at the default state-path most likely means a custom
+		// acme_client_path build option we don't auto-discover. Expiry
+		// metric will be missing for those certs until pinned via static
+		// ssl_certificate /full/path.
+		if discovered.ACMEDirectives > discovered.ACMECertsFound {
+			a.Print(ctx, "angie: ACME certs missing at default state path",
+				"directives", discovered.ACMEDirectives,
+				"found_on_disk", discovered.ACMECertsFound,
+				"default_path", "/var/lib/angie/acme/<name>/certificate.pem")
+		}
 
 		a.Print(ctx, "angie: auto-discovered access logs", "count", len(angieCfg.AccessLogs), "config", svc.ConfigPath)
 	} else {
@@ -740,6 +751,14 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 	// Register API collector (preferred) or stub_status fallback.
 	if angieCfg.StatusURL != "" {
 		a.addCollector(angie.NewAPICollector(a.Logger, angieCfg.StatusURL))
+		// ACME collector polls /status/http/acme_clients/?date=epoch on the
+		// same angie process; it's a no-op (404) when acme_client isn't
+		// configured, so it's safe to register unconditionally.
+		if acme, err := angie.NewACMECollector(a.Logger, angieCfg.StatusURL); err == nil {
+			a.addCollector(acme)
+		} else {
+			a.Error(ctx, "angie: ACME collector init failed", "error", err)
+		}
 	} else if angieCfg.StubStatusURL != "" {
 		a.addCollector(nginx.NewStubCollector(a.Logger, angieCfg.StubStatusURL))
 	}

@@ -1,5 +1,7 @@
 # Metrics reference
 
+For example PromQL queries and alert recipes, see [promql-recipes.md](promql-recipes.md).
+
 ## System (`topsrv_cpu_*`, `topsrv_memory_*`, `topsrv_load_*`, `topsrv_swap_*`)
 
 | Metric | Type | Labels | Description |
@@ -56,30 +58,6 @@
 | `topsrv_netstat_udp_in_errors_total` | counter | — | UDP receive errors |
 | `topsrv_netstat_udp_sndbuf_errors_total` | counter | — | UDP send buffer errors |
 | `topsrv_netstat_ip_unknown_protos_total` | counter | — | IP datagrams with unknown protocol |
-
-Useful queries:
-
-```promql
-# Inventory of publicly-reachable listeners across the fleet
-topsrv_netstat_listening_ports{scope="public"}
-
-# Same, UDP only — DNS / mDNS / WireGuard / unexpected UDP services
-topsrv_netstat_listening_ports{proto="udp", scope="public"}
-
-# Alert: a new public-bound port appeared in the last 10 minutes
-# (compare current set against the set seen 10 minutes ago — non-zero rows are new exposures)
-(topsrv_netstat_listening_ports{scope="public"} == 1)
-  unless on (instance, proto, port, family) (topsrv_netstat_listening_ports{scope="public"} offset 10m == 1)
-
-# Count of distinct public-bound ports per host (capacity / drift watch)
-count by (instance) (topsrv_netstat_listening_ports{scope="public"} == 1)
-
-# Established TCP connections from the public internet — scan / unexpected exposure signal
-topsrv_netstat_tcp_connections{state="ESTABLISHED", direction="inbound", remote_scope="public"}
-
-# Outbound TCP to the public internet — exfil / unexpected egress watch
-sum by (instance) (topsrv_netstat_tcp_connections{direction="outbound", remote_scope="public"})
-```
 
 ## Process (`topsrv_process_*`)
 
@@ -291,6 +269,17 @@ Metrics from Angie JSON API (`/status/`). Requires `api /status/;` directive in 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `topsrv_angie_slab_pages` | gauge | zone, state | Slab pages (used/free) |
+
+### ACME clients
+
+Polled from `/status/http/acme_clients/?date=epoch` on angie 1.5+ when the `acme_client` directive is configured. Endpoint absent (404) silently — no metrics emitted on hosts without ACME. Per [angie http_acme docs](https://en.angie.software/angie/docs/configuration/modules/http/http_acme/) `state` ∈ {`ready`, `requesting`, `disabled`, `failed`}; `certificate` ∈ {`valid`, `expired`, `missing`, `mismatch`, `error`}.
+
+These metrics expose the ACME state machine. **Certificate expiry (NotAfter) for ACME-managed certs is covered by the same `topsrv_ssl_certificate_expiry_seconds` metric as static certs** — discovery scans `/var/lib/angie/acme/<client>/certificate.pem` for every `acme_client` directive and includes the file in the SSL collector. ACME and pinned certs end up indistinguishable in that metric (operator-controllable filter via `path` label).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_angie_acme_state` | gauge | name, state, certificate | `value=1` per active acme_client tuple. `name` is the directive's client name. `state` is the operator-facing state-machine value (`ready`, `renewing`, `error`, …); `certificate` is the cert validity (`valid`, `invalid`, `pending`, …). Exact enum surface evolves with angie releases — label values pass through verbatim. Alert on `certificate!="valid"` or `state="error"` |
+| `topsrv_angie_acme_next_run_seconds` | gauge | name | Unix timestamp of the next scheduled action (renewal attempt / state-machine tick) for this client |
 
 ## Bot-logs (`topsrv_botlog_*`)
 
