@@ -21,6 +21,13 @@ type DiscoverResult struct {
 	APIStatusPath   string   // e.g. "/status/", empty if not found (Angie api directive)
 	APIStatusPort   int      // listen port of the server with api directive
 	APIStatusHost   string   // listen host of the server with api directive (empty = 127.0.0.1)
+
+	// ACMEDirectives counts acme_client directives we saw; ACMECertsFound
+	// counts how many of their certificate.pem files were on disk at the
+	// default state-path. Caller logs a warning when the gap suggests a
+	// custom acme_client_path the parser doesn't know about.
+	ACMEDirectives int
+	ACMECertsFound int
 }
 
 // AccessLogEntry represents a single access_log directive from nginx config.
@@ -38,7 +45,17 @@ var (
 	locationRe     = regexp.MustCompile(`location\s+(?:=\s+)?(\S+)\s*\{`)
 	listenRe       = regexp.MustCompile(`listen\s+(?:(\S+):)?(\d+)`)
 	sslCertRe      = regexp.MustCompile(`ssl_certificate\s+(?:"([^"]+)"|(\S+))\s*;`)
+	acmeClientRe   = regexp.MustCompile(`^\s*acme_client\s+(\S+)\s+`)
 )
+
+// Angie's package-install default for ACME state: each acme_client name gets
+// a subdir containing certificate.pem. Overridable per-client via the
+// acme_client_path directive, which we don't parse — operators with custom
+// paths can pin a static ssl_certificate /full/path directive instead.
+// Exposed as var (not const) for test isolation.
+var defaultACMEStatePath = "/var/lib/angie/acme"
+
+const acmeCertFileName = "certificate.pem"
 
 // DiscoverConfig parses nginx.conf and all includes, extracting log_format and access_log directives.
 func DiscoverConfig(configPath string) (*DiscoverResult, error) {
@@ -57,6 +74,7 @@ func DiscoverConfig(configPath string) (*DiscoverResult, error) {
 	extractStubStatus(content, result)
 	extractAPIStatus(content, result)
 	extractSSLCertificates(content, dir, result)
+	result.ACMEDirectives, result.ACMECertsFound = extractACMECertificates(content, result)
 
 	// Extract access_log directives.
 	for _, m := range accessLogRe.FindAllStringSubmatch(content, -1) {
@@ -251,6 +269,59 @@ func extractSSLCertificates(content, baseDir string, result *DiscoverResult) {
 		seen[path] = true
 		result.SSLCertificates = append(result.SSLCertificates, path)
 	}
+}
+
+// extractACMECertificates finds acme_client <name> directives and adds the
+// resulting <defaultACMEStatePath>/<name>/certificate.pem path to
+// SSLCertificates so the SSL collector picks up ACME-managed certs the
+// same way it picks up static ones — angie writes the PEM here as part
+// of normal renewal. ssl_certificate $acme_cert_<name> uses a runtime
+// variable that the static-path regex skips, so without this step the
+// cert is invisible to file-based discovery.
+//
+// Missing files are silently skipped: angie may not have issued a cert
+// yet at discovery time. The SSLCollector itself re-reads every 5
+// minutes, so once the cert lands the expiry metric appears at next
+// agent restart.
+//
+// Returns the number of acme_client directives seen and the number of
+// matching cert files found on disk so the caller can warn when the
+// state_path doesn't match angie's default (build-time override).
+func extractACMECertificates(content string, result *DiscoverResult) (found, picked int) {
+	seen := make(map[string]bool, len(result.SSLCertificates))
+	for _, p := range result.SSLCertificates {
+		seen[p] = true
+	}
+	for _, line := range strings.Split(content, "\n") {
+		l := strings.TrimSpace(line)
+		if strings.HasPrefix(l, "#") {
+			continue
+		}
+		m := acmeClientRe.FindStringSubmatch(l)
+		if m == nil {
+			continue
+		}
+		name := m[1]
+		// Reject path-traversal: acme_client name is forwarded into a
+		// filepath.Join, so a malicious config could otherwise escape
+		// the state path. Names with slashes or .. components are not
+		// valid angie identifiers anyway.
+		if name == "" || name == "." || name == ".." || strings.ContainsAny(name, `/\`) {
+			continue
+		}
+		found++
+		path := filepath.Join(defaultACMEStatePath, name, acmeCertFileName)
+		if seen[path] {
+			continue
+		}
+		if _, err := os.Stat(path); err != nil {
+			continue
+		}
+		seen[path] = true
+		result.SSLCertificates = append(result.SSLCertificates, path)
+		picked++
+	}
+	return found, picked
 }
 
 // extractQuotedParts extracts content from single-quoted strings in a line.

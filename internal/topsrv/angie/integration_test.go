@@ -71,3 +71,37 @@ func TestIntegrationAngieAPI(t *testing.T) {
 
 	t.Logf("angie integration: %d metric families", len(mfs))
 }
+
+// TestIntegrationACMECollectorSurvivesNoACME — angie:minimal in docker-compose
+// has no acme_client configured, so /status/http/acme_clients/ returns 404.
+// The collector must stay silent: no panic, no ERROR-level logs, no series
+// emitted. This is the realistic "host with angie but no ACME" path.
+func TestIntegrationACMECollectorSurvivesNoACME(t *testing.T) {
+	url := angieAPIURL()
+
+	resp, err := http.Get(url)
+	require.NoError(t, err, "angie API not reachable at %s", url)
+	resp.Body.Close()
+	require.Equal(t, 200, resp.StatusCode)
+
+	c, err := NewACMECollector(embedlog.Logger{}, url)
+	require.NoError(t, err)
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	require.NotPanics(t, func() {
+		_, err := reg.Gather()
+		require.NoError(t, err)
+	}, "ACME collector must not panic on a 404'ing endpoint")
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "topsrv_angie_acme_state", "topsrv_angie_acme_next_run_seconds":
+			assert.Empty(t, mf.GetMetric(),
+				"%s must yield zero series when acme_client isn't configured", mf.GetName())
+		}
+	}
+}

@@ -346,3 +346,125 @@ func TestDiscoverSSLRelativePath(t *testing.T) {
 	require.Len(t, result.SSLCertificates, 1)
 	assert.Equal(t, filepath.Join(dir, "ssl/myshows.me.fullchain.cer"), result.SSLCertificates[0])
 }
+
+// withTestACMEStatePath redirects defaultACMEStatePath to a t.TempDir with cleanup.
+func withTestACMEStatePath(t *testing.T) string {
+	t.Helper()
+	tmp := t.TempDir()
+	orig := defaultACMEStatePath
+	defaultACMEStatePath = tmp
+	t.Cleanup(func() { defaultACMEStatePath = orig })
+	return tmp
+}
+
+// writeACMEClientCert plants a self-signed certificate.pem in the angie
+// state-path layout: <statePath>/<client>/certificate.pem.
+func writeACMEClientCert(t *testing.T, statePath, client, cn string) {
+	t.Helper()
+	dir := filepath.Join(statePath, client)
+	require.NoError(t, os.MkdirAll(dir, 0o755))
+	certFile := filepath.Join(dir, "certificate.pem")
+
+	src := generateTestCert(t, cn, time.Now().Add(60*24*time.Hour))
+	data, err := os.ReadFile(src)
+	require.NoError(t, err)
+	require.NoError(t, os.WriteFile(certFile, data, 0o600))
+}
+
+// TestExtractACMECertificatesPicksUpRealLayout — regression: `ssl_certificate
+// $var` defeats the static-path regex, so we must fall through to the
+// default state-path layout to find ACME-managed certs.
+func TestExtractACMECertificatesPicksUpRealLayout(t *testing.T) {
+	tmp := withTestACMEStatePath(t)
+
+	// Plant two ACME client certs the way angie actually lays them out
+	// (verified on a real angie 1.x install).
+	writeACMEClientCert(t, tmp, "client_alpha", "alpha.example")
+	writeACMEClientCert(t, tmp, "client_beta", "beta.example")
+
+	// Minimal angie.conf with two acme_client directives + the variable-
+	// based ssl_certificate that defeats static-path discovery.
+	content := strings.Join([]string{
+		"acme_client client_alpha https://acme-v02.api.letsencrypt.org/directory;",
+		"acme_client client_beta https://acme-v02.api.letsencrypt.org/directory;",
+		"ssl_certificate $acme_cert_client_alpha;",
+	}, "\n")
+
+	result := &DiscoverResult{}
+	extractACMECertificates(content, result)
+
+	assert.ElementsMatch(t, []string{
+		filepath.Join(tmp, "client_alpha", "certificate.pem"),
+		filepath.Join(tmp, "client_beta", "certificate.pem"),
+	}, result.SSLCertificates)
+}
+
+// TestExtractACMECertificatesSkipsMissingFiles — acme_client exists in the
+// config but the cert isn't on disk yet (e.g. angie hasn't issued it).
+// Discovery must silently skip rather than emitting a bad path.
+func TestExtractACMECertificatesSkipsMissingFiles(t *testing.T) {
+	withTestACMEStatePath(t) // empty tmp — no certs on disk
+
+	content := "acme_client absent_client https://acme-v02.api.letsencrypt.org/directory;"
+	result := &DiscoverResult{}
+	extractACMECertificates(content, result)
+
+	assert.Empty(t, result.SSLCertificates)
+}
+
+// TestExtractACMECertificatesDedupes — if the same cert path is already
+// present (e.g. operator pinned it via a literal ssl_certificate too),
+// don't add it twice.
+func TestExtractACMECertificatesDedupes(t *testing.T) {
+	tmp := withTestACMEStatePath(t)
+	writeACMEClientCert(t, tmp, "shared", "shared.example")
+	pinnedPath := filepath.Join(tmp, "shared", "certificate.pem")
+
+	content := "acme_client shared https://acme-v02.api.letsencrypt.org/directory;"
+	result := &DiscoverResult{SSLCertificates: []string{pinnedPath}}
+	extractACMECertificates(content, result)
+
+	assert.Equal(t, []string{pinnedPath}, result.SSLCertificates)
+}
+
+// TestExtractACMECertificatesSkipsCommented — operators frequently leave
+// commented-out `# acme_client old_name ...;` lines after migration; the
+// regex must not match them, otherwise a stale cert directory left on
+// disk would resurrect as a monitored series.
+func TestExtractACMECertificatesSkipsCommented(t *testing.T) {
+	tmp := withTestACMEStatePath(t)
+	writeACMEClientCert(t, tmp, "old_client", "old.example")
+
+	content := strings.Join([]string{
+		"# acme_client old_client https://acme-v02.api.letsencrypt.org/directory;",
+		"  #acme_client also_commented https://acme-v02.api.letsencrypt.org/directory;",
+	}, "\n")
+
+	result := &DiscoverResult{}
+	found, picked := extractACMECertificates(content, result)
+
+	assert.Empty(t, result.SSLCertificates)
+	assert.Zero(t, found, "commented directives must not count")
+	assert.Zero(t, picked)
+}
+
+// TestExtractACMECertificatesRejectsTraversal — defense in depth: a name
+// containing path separators or .. would let a misconfigured acme_client
+// escape defaultACMEStatePath when filepath.Join cleans the path. Skip
+// such names rather than serving up arbitrary paths.
+func TestExtractACMECertificatesRejectsTraversal(t *testing.T) {
+	withTestACMEStatePath(t)
+
+	content := strings.Join([]string{
+		"acme_client ../escape https://acme-v02.api.letsencrypt.org/directory;",
+		"acme_client a/b https://acme-v02.api.letsencrypt.org/directory;",
+		`acme_client a\b https://acme-v02.api.letsencrypt.org/directory;`,
+		"acme_client . https://acme-v02.api.letsencrypt.org/directory;",
+	}, "\n")
+
+	result := &DiscoverResult{}
+	found, _ := extractACMECertificates(content, result)
+
+	assert.Empty(t, result.SSLCertificates)
+	assert.Zero(t, found, "traversal-shaped names must be rejected before counting")
+}
