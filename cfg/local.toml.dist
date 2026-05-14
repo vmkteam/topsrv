@@ -32,6 +32,17 @@ Channel  = "stable"      # stable / beta
 # ExtraLabels   = ["server_name"]
 # AccessLogs    = ["/var/log/angie/access.log"]
 
+# Package inventory (optional — auto-discovery detects dpkg/rpm/apk via files).
+# Sends a periodic snapshot to /v1/inventory with kind="packages".
+# On /metrics only aggregates are exposed (counts, upgradable, scan duration).
+# [Packages]
+# Disabled       = false      # set true to fully skip the collector
+# Interval       = "6h"       # snapshot scan period (±10% jitter to avoid herds)
+# Managers       = []         # auto-detect by default; e.g. ["dpkg","rpm"] to force a subset
+# DisablePush    = false      # set true to skip POSTing snapshots to /v1/inventory (kept on /metrics aggregates)
+# MaxPackages    = 10000      # safety cap; logs a warning and truncates if exceeded
+# CheckUpgrades  = false      # (Phase 4, not wired yet) — will populate topsrv_packages_upgradable from local apt/dnf cache
+
 # Bot-logs ingest to topsrv.io (optional — ships bot traffic events for analytics).
 # When enabled, botlog reads four nginx variables (http_user_agent, server_name,
 # remote_addr, http_referer) from each access-log line. These are NOT added to

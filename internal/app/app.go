@@ -17,6 +17,7 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv/angie"
 	"github.com/vmkteam/topsrv/internal/topsrv/botlog"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
+	"github.com/vmkteam/topsrv/internal/topsrv/packages"
 	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
 	"github.com/vmkteam/topsrv/internal/topsrv/smart"
 
@@ -36,6 +37,7 @@ type Config struct {
 	Angie    *AngieConfig        `toml:"Angie,omitempty"`
 	Smart    *smart.Config       `toml:"Smart,omitempty"`
 	BotLogs  *botlog.Config      `toml:"BotLogs,omitempty"`
+	Packages *packages.Config    `toml:"Packages,omitempty"`
 }
 
 type ServerConfig struct {
@@ -265,6 +267,9 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 
 	// S.M.A.R.T. disk monitoring — always enabled, [Smart] overrides interval.
 	a.registerSmart(ctx)
+
+	// Package inventory — opt-out, [Packages].Disabled=true to skip.
+	a.registerPackages(ctx)
 }
 
 // discoverAccessLogs extracts access logs from a DiscoverResult and returns a LogConfig.
@@ -617,6 +622,27 @@ func (a *App) registerSmart(ctx context.Context) {
 	c := smart.NewCollector(a.Logger, interval)
 	a.addCollector(c)
 	a.goBackground(func() { c.Run(ctx) })
+}
+
+func (a *App) registerPackages(ctx context.Context) {
+	cfg := a.cfg.Packages
+	if cfg != nil && cfg.Disabled {
+		return
+	}
+	if cfg == nil {
+		cfg = &packages.Config{}
+	}
+	if err := cfg.Validate(); err != nil {
+		a.Error(ctx, "packages: invalid config", "error", err)
+		return
+	}
+	c := packages.NewCollector(a.Logger, *cfg)
+	a.addCollector(c)
+	a.goBackground(func() { c.Run(ctx) })
+
+	if a.pusher != nil && !cfg.DisablePush {
+		a.pusher.AddInventoryProvider(c)
+	}
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

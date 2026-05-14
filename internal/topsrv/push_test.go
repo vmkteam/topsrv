@@ -108,7 +108,8 @@ func TestPusherSpoolTrim(t *testing.T) {
 	}
 
 	p := NewPusher(embedlog.Logger{}, "topsrv", "test", PushConfig{SpoolDir: dir}, nil)
-	p.trimSpool()
+	// spool() writes one more file then trims down to pushMaxSpoolSize.
+	p.spool(context.Background(), []byte("data"))
 
 	files, _ := filepath.Glob(filepath.Join(dir, "*.gz"))
 	assert.Len(t, files, pushMaxSpoolSize)

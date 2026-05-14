@@ -60,6 +60,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **S.M.A.R.T.** | Disk health (ATA attributes, NVMe health log, temperature, wear, errors) | smartctl_exporter |
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
 | **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
+| **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching | apt-prom-exporter / pkg-exporter |
 
 ## Auto-discovery
 
@@ -143,6 +144,16 @@ Channel  = "stable"         # stable / beta
 # Disabled = true    # set to disable
 # Interval = "5m"
 
+# Package inventory (optional — auto-discovery detects dpkg/rpm/apk via files).
+# On /metrics only aggregates are exposed (counts, scan duration, error counter).
+# Full per-package snapshot is pushed to /v1/inventory with kind="packages".
+# [Packages]
+# Disabled      = false      # set to fully skip the collector
+# Interval      = "6h"       # snapshot scan period (±10% jitter to avoid herds)
+# Managers      = []         # auto-detect by default; e.g. ["dpkg","rpm"] to force a subset
+# DisablePush   = false      # set to skip POSTing snapshots to /v1/inventory (keep /metrics only)
+# MaxPackages   = 10000      # safety cap; logs a warning and truncates if exceeded
+
 # Bot-logs (optional — ships UA-classified bot events to topsrv.io for analytics)
 # [BotLogs]
 # Enabled       = true
@@ -184,6 +195,11 @@ Channel  = "stable"         # stable / beta
 | `Angie.AccessLogs` | `[]` | Paths to access log files |
 | `Smart.Disabled` | `false` | Disable S.M.A.R.T. collector |
 | `Smart.Interval` | `5m` | S.M.A.R.T. polling interval |
+| `Packages.Disabled` | `false` | Disable package inventory collector |
+| `Packages.Interval` | `6h` | Inventory scan period (±10% jitter); pushed to `/v1/inventory` |
+| `Packages.Managers` | `[]` | Force subset of managers (`dpkg`/`rpm`/`apk`); empty = auto-detect |
+| `Packages.DisablePush` | `false` | Skip POSTing snapshots to `/v1/inventory` (keeps `/metrics` aggregates) |
+| `Packages.MaxPackages` | `10000` | Truncate snapshot if exceeded (logs a warning) |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |

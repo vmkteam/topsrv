@@ -313,6 +313,20 @@ Alerting guidance:
   - `rate(topsrv_botlog_events_total{state="dropped", reason="spool_evict"}[5m]) > 0` — WAL budget exceeded; raise `MaxSpoolMB` or investigate why receiver isn't catching up
 - `rate(topsrv_botlog_events_total{state="sent"}[5m]) == 0` while `match_total` grows — pipeline stuck between observer and ingest
 
+## Packages (`topsrv_packages_*`)
+
+Installed-package inventory by manager (dpkg / rpm / apk). The full per-package snapshot is NOT exposed here — it ships to gatesrv via `/v1/inventory` (see `docs/packages-collector-implementation.md`). On `/metrics` only low-cardinality aggregates are kept (manager × small set of gauges ⇒ 5–8 series per host).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_packages_installed` | gauge | manager | Number of installed packages by manager |
+| `topsrv_packages_held` | gauge | manager | Packages held back (dpkg hold / dnf versionlock) |
+| `topsrv_packages_scan_duration_seconds` | gauge | manager | Duration of the last inventory scan. Alert: `> 5s` on hosts with <5000 packages = degraded disk or BDB mid-write |
+| `topsrv_packages_scan_errors_total` | counter | manager | Cumulative scan failures by manager. Alert: `increase(... [1h]) > 0` = parser/permission/IO error — check logs |
+| `topsrv_packages_last_scan_timestamp_seconds` | gauge | manager | Unix ts of last successful scan. Alert: `time() - X > 12h` (Interval=6h default + 2× slack) = collector stuck |
+| `topsrv_packages_last_push_timestamp_seconds` | gauge | kind | Unix ts of last successful inventory push to `/v1/inventory`, by kind (`packages`, future `repos`/`packageHistory`). Alert: `time() - X > 24h` = gatesrv unreachable |
+| `topsrv_packages_manager_info` | gauge | manager, os_id, os_version | Always 1 — labels carry distro context for joining with other metrics |
+
 ## Self-monitoring (`topsrv_collector_*`)
 
 Per-collector instrumentation. Any collector registered via `addCollector` is wrapped to record its last scrape duration and recover from panics without breaking `/metrics`.
