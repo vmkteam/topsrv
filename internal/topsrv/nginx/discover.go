@@ -18,9 +18,11 @@ type DiscoverResult struct {
 	StubStatusPath  string   // e.g. "/stub_status", empty if not found
 	StubStatusPort  int      // listen port of the server with stub_status
 	StubStatusHost  string   // listen host of the server with stub_status (empty = 127.0.0.1)
+	StubStatusIsSSL bool     // selected listen is ssl-only — http scrape will fail
 	APIStatusPath   string   // e.g. "/status/", empty if not found (Angie api directive)
 	APIStatusPort   int      // listen port of the server with api directive
 	APIStatusHost   string   // listen host of the server with api directive (empty = 127.0.0.1)
+	APIStatusIsSSL  bool     // selected listen is ssl-only — http scrape will fail
 
 	// ACMEDirectives counts acme_client directives we saw; ACMECertsFound
 	// counts how many of their certificate.pem files were on disk at the
@@ -126,14 +128,24 @@ func resolveIncludes(path, baseDir string) (string, error) {
 
 // directiveMatch holds the result of findDirective.
 type directiveMatch struct {
-	path string
-	port int
-	host string // IP from listen directive (e.g. "10.10.1.1"), empty when listen has port only
+	path  string
+	port  int
+	host  string // IP from listen directive (e.g. "10.10.1.1"), empty when listen has port only
+	isSSL bool   // selected listen carried the `ssl` flag — caller may warn about http scrape
 }
+
+// listenSSLRe matches the `ssl` flag of a listen directive (as a separate
+// token, so `listen 443 ssl;` matches but `listen 8443;` doesn't).
+var listenSSLRe = regexp.MustCompile(`\bssl\b`)
 
 // findDirective scans content for a directive matching re, tracking the current
 // location and listen port. pathFn extracts the path from the matched line and
 // the current location context.
+//
+// When a server block has multiple listen directives, prefer the non-ssl one:
+// the api/stub_status URL is fetched over plain http, so picking a ssl-only
+// listen (e.g. `listen 443 ssl`) makes angie return HTTP 400. An ssl listen is
+// still recorded if it's the only one — better than port 0.
 func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentLocation string) string) *directiveMatch {
 	if !re.MatchString(content) {
 		return nil
@@ -143,6 +155,7 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 	var currentLocation string
 	var currentPort int
 	var currentHost string
+	var currentIsSSL bool
 
 	for _, line := range lines {
 		l := strings.TrimSpace(line)
@@ -152,8 +165,14 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 
 		if m := listenRe.FindStringSubmatch(l); m != nil {
 			if p, err := strconv.Atoi(m[2]); err == nil {
-				currentPort = p
-				currentHost = m[1] // IP or empty when listen has port only
+				isSSL := listenSSLRe.MatchString(l)
+				// Update when: new is non-ssl (always wins), nothing yet,
+				// or current is ssl (replace — last ssl wins for ssl-only blocks).
+				if !isSSL || currentPort == 0 || currentIsSSL {
+					currentPort = p
+					currentHost = m[1] // IP or empty when listen has port only
+					currentIsSSL = isSSL
+				}
 			}
 		}
 		if m := locationRe.FindStringSubmatch(l); m != nil {
@@ -161,9 +180,10 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 		}
 		if re.MatchString(l) {
 			return &directiveMatch{
-				path: pathFn(l, currentLocation),
-				port: currentPort,
-				host: currentHost,
+				path:  pathFn(l, currentLocation),
+				port:  currentPort,
+				host:  currentHost,
+				isSSL: currentIsSSL,
 			}
 		}
 	}
@@ -178,6 +198,7 @@ func extractStubStatus(content string, result *DiscoverResult) {
 		result.StubStatusPath = m.path
 		result.StubStatusPort = m.port
 		result.StubStatusHost = m.host
+		result.StubStatusIsSSL = m.isSSL
 	}
 }
 
@@ -197,6 +218,7 @@ func extractAPIStatus(content string, result *DiscoverResult) {
 		result.APIStatusPath = m.path
 		result.APIStatusPort = m.port
 		result.APIStatusHost = m.host
+		result.APIStatusIsSSL = m.isSSL
 	}
 }
 

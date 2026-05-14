@@ -309,7 +309,7 @@ Two collectors:
 - `topsrv_nginx_response_bytes_by_uri_total{uri}` — response bytes by normalized URI
 - **Custom labels** — `ExtraLabels` adds log fields as metric labels (server_name, http_platform, etc.)
 
-**SSL certificates** — auto-discovered `ssl_certificate` paths from config, expiry as Unix timestamp gauge. Re-reads every 5 minutes to detect Let's Encrypt renewals.
+**SSL certificates** — auto-discovered `ssl_certificate` paths from config. `topsrv_ssl_certificate_expiry_seconds{path,cn,issuer}` exposes NotAfter as Unix timestamp (one series per cert file); `topsrv_ssl_certificate_san_info{path,domain}` enumerates every DNS name in `CN ∪ SANs` so multi-host (SAN) certs aren't reduced to their CN in dashboards. Re-reads every 5 minutes to detect Let's Encrypt renewals.
 
 ## Angie
 

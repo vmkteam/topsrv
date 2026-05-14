@@ -204,9 +204,10 @@ Only critical attribute IDs are exported: 5 (Reallocated Sectors), 187 (Reported
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
-| `topsrv_ssl_certificate_expiry_seconds` | gauge | path, cn, issuer | Certificate NotAfter as Unix timestamp |
+| `topsrv_ssl_certificate_expiry_seconds` | gauge | path, cn, issuer | Certificate NotAfter as Unix timestamp (one series per cert file) |
+| `topsrv_ssl_certificate_san_info` | gauge | path, domain | Info metric (value=1); one series per DNS name in CN ∪ SANs. Join with expiry by `path` to enumerate every domain a SAN-cert serves |
 
-Auto-discovered from `ssl_certificate` directives in nginx/angie config. Re-read every 5 minutes.
+Auto-discovered from `ssl_certificate` directives in nginx/angie config. Re-read every 5 minutes. SAN-multi-host certs (typical for angie ACME, which packs several subdomains into one cert) are surfaced through `san_info` so dashboards aren't limited to the CN. Join example: `topsrv_ssl_certificate_expiry_seconds * on(path) group_left() topsrv_ssl_certificate_san_info`.
 
 ## Angie (`topsrv_angie_*`)
 
