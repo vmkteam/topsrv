@@ -98,8 +98,8 @@ func TestSSLCollectorSANInfo(t *testing.T) {
 	expiry := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
 	// CN duplicated in DNSNames is common in real certs (e.g. Let's Encrypt);
 	// must be deduplicated.
-	certPath := generateTestCertSAN(t, "bugs.meetty.com",
-		[]string{"bugs.meetty.com", "meetty.com", "www.meetty.com"}, expiry)
+	certPath := generateTestCertSAN(t, "a.example.com",
+		[]string{"a.example.com", "example.com", "www.example.com"}, expiry)
 
 	c := NewSSLCollector(embedlog.Logger{}, []string{certPath})
 	reg := prometheus.NewRegistry()
@@ -127,7 +127,7 @@ func TestSSLCollectorSANInfo(t *testing.T) {
 	}
 	assert.Equal(t, 1, expiryCount, "expiry stays one series per cert regardless of SAN count")
 	assert.ElementsMatch(t,
-		[]string{"bugs.meetty.com", "meetty.com", "www.meetty.com"}, sanDomains,
+		[]string{"a.example.com", "example.com", "www.example.com"}, sanDomains,
 		"expected one san_info per unique CN/SAN domain")
 }
 
