@@ -654,6 +654,9 @@ func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {
 		if discovered.StubStatusPath != "" {
 			ngxCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Print(ctx, "nginx: auto-detected stub_status", "url", ngxCfg.StubStatusURL)
+			if discovered.StubStatusIsSSL {
+				a.Print(ctx, "nginx: stub_status on ssl-only listen, scrape will likely fail with HTTP 400", "url", ngxCfg.StubStatusURL)
+			}
 		}
 
 		if len(discovered.SSLCertificates) > 0 {
@@ -717,10 +720,18 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 		if discovered.APIStatusPath != "" && angieCfg.StatusURL == "" {
 			angieCfg.StatusURL = statusURL(discovered.APIStatusHost, discovered.APIStatusPort, discovered.APIStatusPath)
 			a.Print(ctx, "angie: auto-detected API", "url", angieCfg.StatusURL)
+			// statusURL builds an http:// URL; an ssl-only listen will return 400.
+			// Operator fix: add a plain http listen or pin StatusURL via config.
+			if discovered.APIStatusIsSSL {
+				a.Print(ctx, "angie: api endpoint on ssl-only listen, scrape will likely fail with HTTP 400", "url", angieCfg.StatusURL)
+			}
 		}
 		if discovered.StubStatusPath != "" && angieCfg.StubStatusURL == "" {
 			angieCfg.StubStatusURL = statusURL(discovered.StubStatusHost, discovered.StubStatusPort, discovered.StubStatusPath)
 			a.Print(ctx, "angie: auto-detected stub_status", "url", angieCfg.StubStatusURL)
+			if discovered.StubStatusIsSSL {
+				a.Print(ctx, "angie: stub_status on ssl-only listen, scrape will likely fail with HTTP 400", "url", angieCfg.StubStatusURL)
+			}
 		}
 
 		if len(discovered.SSLCertificates) > 0 {

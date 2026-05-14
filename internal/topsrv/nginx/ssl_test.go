@@ -23,6 +23,13 @@ import (
 // generateTestCert creates a self-signed certificate PEM file and returns its path.
 func generateTestCert(t *testing.T, cn string, notAfter time.Time) string {
 	t.Helper()
+	return generateTestCertSAN(t, cn, nil, notAfter)
+}
+
+// generateTestCertSAN creates a self-signed certificate with the given SAN
+// DNSNames in addition to CN. Used to exercise multi-host (SAN) certificates.
+func generateTestCertSAN(t *testing.T, cn string, dnsNames []string, notAfter time.Time) string {
+	t.Helper()
 
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	require.NoError(t, err)
@@ -33,6 +40,7 @@ func generateTestCert(t *testing.T, cn string, notAfter time.Time) string {
 		Issuer:       pkix.Name{CommonName: "topsrv-test CA"},
 		NotBefore:    time.Now().Add(-time.Hour),
 		NotAfter:     notAfter,
+		DNSNames:     dnsNames,
 	}
 
 	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
@@ -80,6 +88,74 @@ func TestSSLCollector(t *testing.T) {
 		assert.Equal(t, "example.com", labels["issuer"]) // self-signed: issuer == subject
 	}
 	assert.True(t, found, "topsrv_ssl_certificate_expiry_seconds not found")
+}
+
+// TestSSLCollectorSANInfo — multi-host (SAN) cert emits one san_info series
+// per unique DNS name (CN ∪ DNSNames). Without this, angie ACME multi-domain
+// certs show only the CN in dashboards even though the cert serves N domains.
+// expiry metric stays one series per cert (NotAfter value isn't duplicated).
+func TestSSLCollectorSANInfo(t *testing.T) {
+	expiry := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	// CN duplicated in DNSNames is common in real certs (e.g. Let's Encrypt);
+	// must be deduplicated.
+	certPath := generateTestCertSAN(t, "a.example.com",
+		[]string{"a.example.com", "example.com", "www.example.com"}, expiry)
+
+	c := NewSSLCollector(embedlog.Logger{}, []string{certPath})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	var expiryCount int
+	var sanDomains []string
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "topsrv_ssl_certificate_expiry_seconds":
+			expiryCount = len(mf.GetMetric())
+		case "topsrv_ssl_certificate_san_info":
+			for _, m := range mf.GetMetric() {
+				assert.InDelta(t, 1.0, m.GetGauge().GetValue(), 0, "san_info value must be 1")
+				for _, l := range m.GetLabel() {
+					if l.GetName() == "domain" {
+						sanDomains = append(sanDomains, l.GetValue())
+					}
+				}
+			}
+		}
+	}
+	assert.Equal(t, 1, expiryCount, "expiry stays one series per cert regardless of SAN count")
+	assert.ElementsMatch(t,
+		[]string{"a.example.com", "example.com", "www.example.com"}, sanDomains,
+		"expected one san_info per unique CN/SAN domain")
+}
+
+// TestSSLCollectorNoCNorSAN — pathological cert (empty CN, empty SANs) still
+// emits expiry so path/issuer stay visible; san_info is suppressed because
+// there are no names to enumerate.
+func TestSSLCollectorNoCNorSAN(t *testing.T) {
+	expiry := time.Now().Add(30 * 24 * time.Hour).Truncate(time.Second)
+	certPath := generateTestCertSAN(t, "", nil, expiry)
+
+	c := NewSSLCollector(embedlog.Logger{}, []string{certPath})
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+
+	var expiryCount, sanCount int
+	for _, mf := range mfs {
+		switch mf.GetName() {
+		case "topsrv_ssl_certificate_expiry_seconds":
+			expiryCount = len(mf.GetMetric())
+		case "topsrv_ssl_certificate_san_info":
+			sanCount = len(mf.GetMetric())
+		}
+	}
+	assert.Equal(t, 1, expiryCount, "expiry visible even without CN/SAN")
+	assert.Equal(t, 0, sanCount, "san_info suppressed when no domains")
 }
 
 func TestSSLCollectorMultipleCerts(t *testing.T) {

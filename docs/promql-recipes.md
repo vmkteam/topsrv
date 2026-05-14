@@ -42,3 +42,26 @@ topsrv_angie_acme_state{certificate!="valid"}
 # Time until next ACME action (seconds; negative = overdue / stuck)
 topsrv_angie_acme_next_run_seconds - time()
 ```
+
+## SSL certificates
+
+`topsrv_ssl_certificate_expiry_seconds` is one series per `.pem` file with the cert's NotAfter. `topsrv_ssl_certificate_san_info` is an info metric (value=1) enumerating every DNS name in `CN ∪ SANs` — needed for multi-host certs where the CN alone hides most served domains.
+
+```promql
+# Days until expiry per cert file
+(topsrv_ssl_certificate_expiry_seconds - time()) / 86400
+
+# Alert: any cert expiring in the next 14 days
+topsrv_ssl_certificate_expiry_seconds - time() < 14 * 86400
+
+# Every DNS name served by every cert (one row per domain)
+topsrv_ssl_certificate_san_info
+
+# Join: days-left enriched with each SAN domain (one row per domain)
+(topsrv_ssl_certificate_expiry_seconds - time()) / 86400
+  * on (instance, path) group_right() topsrv_ssl_certificate_san_info
+
+# Find certs about to expire, listed by each SAN domain they cover
+(topsrv_ssl_certificate_expiry_seconds - time() < 14 * 86400)
+  * on (instance, path) group_right() topsrv_ssl_certificate_san_info
+```

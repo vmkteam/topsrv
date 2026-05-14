@@ -95,7 +95,7 @@ func TestDiscoverAngieEdgeCases(t *testing.T) {
 			wantAPI: "/status", wantAPIPort: 8080,
 		},
 		{
-			name: "multiple listen — last wins",
+			name: "multiple listen — non-ssl wins over ssl",
 			conf: `http {
     server {
         listen 80;
@@ -105,7 +105,33 @@ func TestDiscoverAngieEdgeCases(t *testing.T) {
         }
     }
 }`,
-			wantAPI: "/status/", wantAPIPort: 443,
+			wantAPI: "/status/", wantAPIPort: 80,
+		},
+		{
+			name: "ssl listen declared first — non-ssl still wins",
+			conf: `http {
+    server {
+        listen 443 ssl;
+        listen 80;
+        location /status/ {
+            api /status/;
+        }
+    }
+}`,
+			wantAPI: "/status/", wantAPIPort: 80,
+		},
+		{
+			name: "ssl flag among other listen params (http2)",
+			conf: `http {
+    server {
+        listen 443 ssl http2;
+        listen 80;
+        location /status/ {
+            api /status/;
+        }
+    }
+}`,
+			wantAPI: "/status/", wantAPIPort: 80,
 		},
 		{
 			name: "location with = prefix",
