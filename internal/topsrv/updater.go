@@ -28,8 +28,12 @@ import (
 )
 
 const (
-	updateTimeout    = 60 * time.Second
-	updateMaxBackups = 5
+	updateTimeout = 60 * time.Second
+	// updateMaxBackups bounds .topsrv-backup/ size. Two suffices: the
+	// current binary is always staged for crash-loop rollback, and the
+	// previous one covers a manual revert. Older copies just consume
+	// disk on hosts with frequent updates.
+	updateMaxBackups = 2
 	updateExitCode   = 42
 	updateStateFile  = "update-state.json"
 	backupPrefix     = "topsrv-"
