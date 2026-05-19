@@ -551,9 +551,16 @@ func TestNormalizeURI(t *testing.T) {
 		{"GET /people/tommy-brewster-6401345/ HTTP/1.1", "/people/:slug/"},
 		// hex hashes in media URLs — truncated by depth
 		{"GET /media/roles/e/ef/d763d0a80cfe86a9fcc378db4d5935bf.jpg HTTP/1.1", "/media/roles/:rest"},
+		// Garbage $request with no spaces (TLS handshake hitting plain HTTP port,
+		// raw SSH probe, etc.) must NOT bypass normalization and pollute the uri
+		// label — pre-0.1.3 it was returned verbatim and blew past the 256-byte
+		// Prometheus label cap downstream.
+		{"\x06\x00\x00\x003_xgDcA\x00\x00\x00\x00\x00\x00\x00\xB0(\xC7\xEF~", invalidMarker},
+		{"", invalidMarker},
+		{"GET", invalidMarker},
 	}
 	for _, tt := range tests {
-		assert.Equal(t, tt.want, normalizeURI(tt.request), tt.request)
+		assert.Equal(t, tt.want, normalizeURI(tt.request), "%q", tt.request)
 	}
 }
 
