@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/satyrius/gonx"
@@ -614,6 +615,18 @@ func TestNormalizePath(t *testing.T) {
 		{"\x16\x03\x01\x00{\x01", "/:invalid"},
 		{"/page\x00inject", "/:invalid"},
 
+		// nginx-escaped binary (control bytes rendered as literal `\xHH`) → /:invalid
+		{`/\x16\x03\x01\x00\xCA\x01`, "/:invalid"},
+		{`/\xDE\xAD\xBE\xEF`, "/:invalid"},
+		// over-long raw input → /:invalid (sanity cap)
+		{"/" + strings.Repeat("a", maxRawPathBytes), "/:invalid"},
+
+		// long mixed-case base64url-ish segment → /:rest (random token, not a slug)
+		{"/NrEvh6tMN89fyP8TglRaD5mwSRlVEej3QpFsmTeWO5ruhygoPovMxET15o3xAj4cuXrnNSo", "/:rest"},
+		// long all-lowercase segment is treated as a slug (hyphen pattern wins),
+		// NOT collapsed by longBase64Token — locks the hasUpper heuristic
+		{"/abcdefghijklmnopqrstuvwxyz0123456789-something-long", "/:slug"},
+
 		// scanner probe suffixes → /:bot-scanners
 		{"/.env", "/:bot-scanners"},
 		{"/.git/config", "/:bot-scanners"},
@@ -636,6 +649,52 @@ func TestNormalizePath(t *testing.T) {
 	}
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, normalizePath(tt.path), tt.path)
+	}
+}
+
+// TestNormalizePath_ByteCap covers the 240-byte hard cap with UTF-8 awareness.
+// A long Cyrillic slug must be cut on a rune boundary so the result remains
+// valid UTF-8 (Prometheus rejects invalid UTF-8 in label values).
+func TestNormalizePath_ByteCap(t *testing.T) {
+	// 300 Cyrillic 2-byte runes — well past 240B but within the 1KB raw cap.
+	long := "/" + strings.Repeat("я", 300)
+	out := normalizePath(long)
+	if !strings.HasSuffix(out, "/:rest") {
+		t.Fatalf("want suffix /:rest, got %q", out)
+	}
+	if len(out) > 240 {
+		t.Fatalf("cap exceeded: len=%d, got %q", len(out), out)
+	}
+	if !utf8.ValidString(out) {
+		t.Fatalf("mid-rune cut produced invalid UTF-8: %q", out)
+	}
+}
+
+func TestTruncateAtRune(t *testing.T) {
+	tests := []struct {
+		in   string
+		n    int
+		want string
+	}{
+		{"hello", 3, "hel"},
+		{"hello", 10, "hello"}, // n >= len → unchanged
+		{"hello", 0, ""},
+		{"hello", -1, ""},
+		{"яяя", 1, ""},  // 1 byte mid-rune → rewind to 0
+		{"яяя", 2, "я"}, // 2 bytes = one rune
+		{"яяя", 3, "я"}, // 3 bytes mid-rune of second → rewind
+		{"яяя", 4, "яя"},
+		{"a" + "я" + "b", 2, "a"}, // cut into the middle of `я`
+		{"a" + "я" + "b", 3, "aя"},
+	}
+	for _, tt := range tests {
+		got := truncateAtRune(tt.in, tt.n)
+		if got != tt.want {
+			t.Errorf("truncateAtRune(%q, %d) = %q, want %q", tt.in, tt.n, got, tt.want)
+		}
+		if !utf8.ValidString(got) {
+			t.Errorf("truncateAtRune(%q, %d) produced invalid UTF-8: %q", tt.in, tt.n, got)
+		}
 	}
 }
 
