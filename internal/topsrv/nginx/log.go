@@ -635,8 +635,13 @@ func (c *LogCollector) recordLine(p *ParsedLine) { //nolint:gocognit,nestif
 
 func normalizeURI(request string) string {
 	parts := strings.SplitN(request, " ", 3)
+	// A well-formed $request is "METHOD URI HTTP/x.y" — at least one space.
+	// Binary handshakes (TLS ClientHello hitting an HTTP port, SSH probes, etc.)
+	// arrive as a single space-less blob; without this guard they bypassed
+	// normalizePath entirely and pushed raw bytes into the uri label, blowing
+	// past Prometheus' 256-byte cap.
 	if len(parts) < 2 {
-		return request
+		return invalidMarker
 	}
 	path := parts[1]
 	if i := strings.IndexByte(path, '?'); i >= 0 {
