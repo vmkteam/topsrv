@@ -27,9 +27,18 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 // DefaultLogFormat — combined + request_time + upstream_response_time.
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
-const maxCardinalityURI = 1000   // cap uri5xx map to prevent unbounded growth
-const maxCardinalityTagged = 500 // cap taggedCounts (status × extra labels) to prevent unbounded growth
-const maxPathDepth = 2           // collapse URI segments beyond this depth to :rest
+const maxCardinalityURI = 1000    // cap uri5xx map to prevent unbounded growth
+const maxCardinalityTagged = 500  // cap taggedCounts (status × extra labels) to prevent unbounded growth
+const maxPathDepth = 2            // collapse URI segments beyond this depth
+const maxNormalizedURIBytes = 240 // hard byte cap; Prometheus exposition rejects label values >256 bytes
+const maxRawPathBytes = 1024      // sanity cap on incoming $uri; anything larger is garbage / DoS amplification
+
+// Sentinel labels for normalizePath outcomes. Kept as consts so call sites and
+// truncation arithmetic (s[:N-len(restMarker)]) stay in sync.
+const (
+	restMarker    = "/:rest"
+	invalidMarker = "/:invalid"
+)
 
 var (
 	// numericSegment matches path segments that are pure digits.
@@ -48,6 +57,11 @@ var (
 	xenForoSlug = regexp.MustCompile(`/[\w][\w-]*\.\d+/`)
 	// base64Token matches base64-encoded tokens with padding (containing = or ==).
 	base64Token = regexp.MustCompile(`[A-Za-z0-9_+-]{6,}={1,2}[^/]*`)
+	// longBase64Token matches a single path segment of 32+ base64url-charset
+	// characters. The uppercase requirement (random tokens are mixed-case,
+	// product slugs are not) is enforced inside the replacement func in
+	// normalizePath — keep in sync with the `hasUpper` gate there.
+	longBase64Token = regexp.MustCompile(`/[A-Za-z0-9_-]{32,}`)
 	// fileNumericSuffix matches _digits patterns in filenames (e.g. "_10778" in "show_10778.jpeg").
 	fileNumericSuffix = regexp.MustCompile(`_\d{3,}`)
 	// phpFile matches .php filename in the last path segment.
@@ -632,20 +646,44 @@ func normalizeURI(request string) string {
 }
 
 func normalizePath(path string) string {
+	// Sanity cap on input: nginx limits $uri via large_client_header_buffers
+	// (default 8KB) but we shouldn't trust upstream. 1KB covers any real URL;
+	// longer payloads are garbage and would amplify the regex pipeline below.
+	if len(path) > maxRawPathBytes {
+		return invalidMarker
+	}
 	// Non-printable / invalid UTF-8 — TLS handshake garbage, SSH probes, etc.
 	if !utf8.ValidString(path) {
-		return "/:invalid"
+		return invalidMarker
 	}
+	// Single byte-scan covering three checks at once:
+	//  - control bytes (< 0x20): raw binary in $uri (rare; mostly caught by utf8 above)
+	//  - `\x` literal escape: nginx writes non-printable bytes as printable
+	//    `\xHH` text before logging, defeating the control-byte check above
+	//  - hasUpper: gates two downstream allocations on the all-lowercase path
+	//    (longBase64Token regex below, and the strings.ToLower call right after).
+	hasUpper := false
 	for i := range len(path) {
-		if path[i] < 0x20 {
-			return "/:invalid"
+		c := path[i]
+		if c < 0x20 {
+			return invalidMarker
+		}
+		if c == '\\' && i+1 < len(path) && path[i+1] == 'x' {
+			return invalidMarker
+		}
+		if c >= 'A' && c <= 'Z' {
+			hasUpper = true
 		}
 	}
 
-	// Scanner probe suffixes (.env, .git, .aws, etc.)
-	lower := strings.ToLower(path)
+	// Scanner probe suffixes (.env, .git, .aws, etc.) — case-insensitive scan,
+	// but lower-casing the path allocates a copy; skip when already lowercase.
+	haystack := path
+	if hasUpper {
+		haystack = strings.ToLower(path)
+	}
 	for _, suffix := range scannerSuffixes {
-		if strings.Contains(lower, suffix) {
+		if strings.Contains(haystack, suffix) {
 			return "/:bot-scanners"
 		}
 	}
@@ -662,10 +700,50 @@ func normalizePath(path string) string {
 	path = slugWithID.ReplaceAllString(path, "/:slug/")
 	path = hyphenSlug.ReplaceAllString(path, "/:slug")
 	path = fileNumericSuffix.ReplaceAllString(path, "_:id")
-	return truncatePath(path, maxPathDepth)
+
+	// Long base64-ish segments (mixed case = random token, not a slug) → /:rest.
+	// Slug heuristic: hyphenated all-lowercase strings are product/article URLs
+	// and stay readable; anything with uppercase is treated as a random token.
+	if hasUpper {
+		path = longBase64Token.ReplaceAllStringFunc(path, func(m string) string {
+			for i := 1; i < len(m); i++ { // skip leading `/`
+				if m[i] >= 'A' && m[i] <= 'Z' {
+					return restMarker
+				}
+			}
+			return m
+		})
+	}
+
+	out := truncatePath(path, maxPathDepth)
+	// Hard byte cap: even after all the above, a single segment can carry
+	// 256+ bytes (long transliterated slugs, concatenated normalized markers).
+	// Prometheus rejects label values >256 bytes, so trim with restMarker
+	// as a final guard. truncateAtRune walks back to a rune boundary so a
+	// multi-byte UTF-8 tail (Cyrillic, CJK) is never cut mid-rune.
+	if len(out) > maxNormalizedURIBytes {
+		return truncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
+	}
+	return out
 }
 
-// truncatePath collapses path segments beyond maxDepth into /:rest.
+// truncateAtRune returns s[:n] adjusted backwards to a UTF-8 rune boundary.
+// Guarantees the result is valid UTF-8 when s is. Used to avoid emitting
+// label values with truncated multi-byte sequences.
+func truncateAtRune(s string, n int) string {
+	if n >= len(s) {
+		return s
+	}
+	if n < 0 {
+		return ""
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// truncatePath collapses path segments beyond maxDepth into restMarker.
 // Trailing slash is not counted as an extra segment.
 func truncatePath(path string, maxDepth int) string {
 	trimmed := strings.TrimRight(path, "/")
@@ -674,7 +752,7 @@ func truncatePath(path string, maxDepth int) string {
 		if trimmed[i] == '/' {
 			depth++
 			if depth >= maxDepth {
-				return trimmed[:i] + "/:rest"
+				return trimmed[:i] + restMarker
 			}
 		}
 	}
