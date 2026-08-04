@@ -44,3 +44,11 @@ changelog:
 
 sboms:
   - artifacts: archive
+
+release:
+  # Without this a -rc tag ships as a full release and GitHub marks it "Latest",
+  # displacing the last stable one. Agents on the stable channel would then
+  # auto-update onto a release candidate. "auto" flags any tag carrying a semver
+  # prerelease suffix (-rc.1, -beta.2) as a prerelease, which GitHub never
+  # marks as Latest.
+  prerelease: auto
