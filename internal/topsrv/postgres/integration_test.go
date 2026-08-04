@@ -40,9 +40,17 @@ func TestIntegrationPostgres(t *testing.T) {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(c)
 
+	// Three scrapes with statement activity between them: scrape 1 builds the delta
+	// baseline, scrape 2 puts the seeded statements into the top-set, scrape 3 emits
+	// them (per-query metrics are debounced to two consecutive top appearances).
 	_, err = reg.Gather()
 	require.NoError(t, err)
 
+	seedStatStatements(t)
+	_, err = reg.Gather()
+	require.NoError(t, err)
+
+	seedStatStatements(t)
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	require.NotEmpty(t, mfs, "postgres collector returned no metrics")
@@ -61,6 +69,9 @@ func TestIntegrationPostgres(t *testing.T) {
 		"topsrv_pg_database_size_bytes",
 		"topsrv_pg_xact_total",
 		"topsrv_pg_locks",
+		// Guards the three-scrape sequence above: without it the debounce could
+		// suppress per-query metrics forever and this test would stay green.
+		"topsrv_pg_query_calls_total",
 	} {
 		assert.True(t, names[name], "missing metric: %s", name)
 	}
@@ -391,6 +402,37 @@ func must[T any](v T, err error) T {
 		panic(err)
 	}
 	return v
+}
+
+// The registry is Gathered by both the /metrics handler and the push ticker, so
+// Collect calls overlap in production. Before stmtMu that raced on prevStmts and
+// histBuckets — a concurrent map write, which is a fatal error the collector's
+// recover() cannot catch. Run under -race to see the regression.
+func TestIntegrationPostgresConcurrentScrape(t *testing.T) {
+	c, err := NewCollector(embedlog.Logger{}, pgDSN())
+	require.NoError(t, err)
+	defer c.Close()
+
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	seedStatStatements(t)
+
+	const gatherers = 4
+	errs := make(chan error, gatherers)
+	start := make(chan struct{})
+	for range gatherers {
+		go func() {
+			<-start
+			_, gErr := reg.Gather()
+			errs <- gErr
+		}()
+	}
+	close(start)
+
+	for range gatherers {
+		require.NoError(t, <-errs)
+	}
 }
 
 // TestIntegrationBuildDSN verifies that BuildDSN with a token produces a working DSN.

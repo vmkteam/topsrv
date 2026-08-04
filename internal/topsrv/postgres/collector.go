@@ -68,11 +68,21 @@ type Collector struct {
 	appSampleCancel  context.CancelFunc
 	appSampleDone    chan struct{}
 
+	// guards the whole statements phase — prevStmts, the histogram counters and
+	// prevTopKeys below. The registry is Gathered by both the /metrics handler and
+	// the push ticker, so two Collect calls can overlap.
+	stmtMu sync.Mutex
+
 	// histogram state — cumulative counters for query duration distribution
 	prevStmts   map[string]stmtPrev
 	histCount   uint64
 	histSum     float64
 	histBuckets map[float64]uint64
+
+	// top-set from the previous scrape; a statement must hold a top spot on two
+	// consecutive scrapes before its metrics emit (see debounceTop). Replaced
+	// wholesale each scrape, so the zero value is a valid starting state.
+	prevTopKeys map[string]bool
 
 	up *prometheus.Desc
 	// connections
