@@ -11,9 +11,9 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
@@ -27,11 +27,25 @@ jobs:
         env:
           GOEXPERIMENT: jsonv2
 
+      # staticcheck-action's own caching is disabled below because it pins
+      # actions/cache v4.3.0, which is node20 — a runtime the runners drop in
+      # autumn 2026. Upstream has a fix open (dominikh/staticcheck-action#23)
+      # but the repo has been dormant since March, so we cache the same
+      # directory ourselves on a current version. Same key strategy as upstream:
+      # store under a unique key, restore from the newest earlier entry.
+      - name: Staticcheck cache
+        uses: actions/cache@v6
+        with:
+          path: ${{ runner.temp }}/staticcheck
+          key: staticcheck-${{ runner.os }}-${{ github.sha }}
+          restore-keys: staticcheck-${{ runner.os }}-
+
       - name: Staticcheck
         uses: dominikh/staticcheck-action@v1
         with:
           version: "latest"
           install-go: false
+          use-cache: false
         env:
           GOEXPERIMENT: jsonv2
 
@@ -41,7 +55,7 @@ jobs:
           GOEXPERIMENT: jsonv2
 
       - name: GoReleaser check
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           args: check
 
@@ -57,18 +71,18 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
 
       - uses: anchore/sbom-action/download-syft@v0
 
       - name: Release
-        uses: goreleaser/goreleaser-action@v6
+        uses: goreleaser/goreleaser-action@v7
         with:
           args: release --clean
         env:

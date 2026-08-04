@@ -75,6 +75,11 @@ func TestNetstatCollectorProtoCounters(t *testing.T) {
 		requireMetric(t, reg, "topsrv_netstat_tcp_retransmits_total")
 		requireMetric(t, reg, "topsrv_netstat_tcp_in_errs_total")
 		requireMetric(t, reg, "topsrv_netstat_tcp_out_rsts_total")
+		// Denominators live in the same Tcp: line of /proc/net/snmp as RetransSegs,
+		// so a host reporting retransmits must report these too. An alert dividing
+		// by a missing out_segs silently drops the series instead of firing.
+		requireMetric(t, reg, "topsrv_netstat_tcp_in_segs_total")
+		requireMetric(t, reg, "topsrv_netstat_tcp_out_segs_total")
 		t.Log("protocol counters present")
 	} else {
 		t.Log("protocol counters not available on this system, skipping")
