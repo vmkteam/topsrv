@@ -12,8 +12,8 @@ import (
 )
 
 const (
-	topStatementsN = 20 // top-N per dimension (time, calls, blks_read) for metrics
-	topMetaN       = 30 // top-N per dimension for query meta push — wider than metrics to capture queries mercating on the top-N boundary
+	topStatementsN = 20 // top-N per dimension for metrics — dimensions listed on selectTopStatements
+	topMetaN       = 30 // top-N per dimension for query meta push — wider than metrics to capture queries hovering on the top-N boundary
 )
 
 // queryDurationBuckets — histogram buckets for per-query execution time (seconds).
@@ -77,6 +77,15 @@ func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.
 		return
 	}
 
+	// One statements phase at a time: prevStmts and histBuckets are plain maps, and
+	// a concurrent map write is a fatal error that instrumentedCollector's recover()
+	// cannot catch. Skip rather than wait — the loser would recompute deltas over a
+	// near-zero window, which produces no top-set and wipes the debounce state.
+	if !c.stmtMu.TryLock() {
+		return
+	}
+	defer c.stmtMu.Unlock()
+
 	// PG17 (pg_stat_statements 1.11) renamed blk_read_time → shared_blk_read_time, blk_write_time → shared_blk_write_time
 	blkReadCol, blkWriteCol := "blk_read_time", "blk_write_time"
 	if c.versionNum >= versionPG17 {
@@ -128,14 +137,15 @@ func (c *Collector) collectStatements(ctx context.Context, ch chan<- prometheus.
 		ch <- prometheus.MustNewConstHistogram(c.queryDuration, c.histCount, c.histSum, c.histBuckets)
 	}
 
-	topMetrics := c.selectTopStatements(all, topStatementsN)
+	topMetrics, topMeta := c.selectTopStatements(all)
+
+	emit := c.debounceTop(topMetrics)
 	for _, sc := range all {
-		if topMetrics[sc.key] {
+		if emit[sc.key] {
 			c.emitStatementMetrics(ch, sc)
 		}
 	}
 
-	topMeta := c.selectTopStatements(all, topMetaN)
 	c.collectQueryMeta(ctx, topMeta)
 }
 
@@ -398,29 +408,64 @@ func (c *Collector) emitStatementMetrics(ch chan<- prometheus.Metric, sc stmtCur
 	}
 }
 
-// selectTopStatements returns a set of keys for the top-N statements by delta time, delta calls, and delta blks_read.
-// On the first scrape (no previous snapshot), falls back to cumulative values.
-func (c *Collector) selectTopStatements(all []stmtCurrent, topN int) map[string]bool {
-	result := make(map[string]bool, topN*5)
+// debounceTop returns the subset of top that was also in the previous scrape's
+// top-set and remembers top for the next scrape. Emitting a statement only after
+// it holds a top spot on two consecutive scrapes keeps one-off statements
+// (migrations, tests, ad-hoc queries) out of the TSDB: every unique queryid
+// creates one series per topsrv_pg_query_* metric in the per-day index, and
+// top-set flapping multiplied that ~10x against the live series count.
+func (c *Collector) debounceTop(top map[string]bool) map[string]bool {
+	emit := make(map[string]bool, len(top))
+	for key := range top {
+		if c.prevTopKeys[key] {
+			emit[key] = true
+		}
+	}
+	c.prevTopKeys = top
+	return emit
+}
 
-	addTopN := func(lessFunc func(a, b stmtCurrent) int) {
-		sorted := make([]stmtCurrent, len(all))
-		copy(sorted, all)
-		slices.SortFunc(sorted, lessFunc)
-		for i := range min(topN, len(sorted)) {
-			result[sorted[i].key] = true
+// selectTopStatements ranks statements by each dimension — delta time, delta calls,
+// delta blks_read, delta blks_dirtied, delta wal_bytes — and returns the union of the
+// per-dimension leaders in two widths: topStatementsN for metrics and topMetaN for the
+// meta push. The metrics set is a subset of the meta set, so one ranking fills both.
+// Entries with a non-positive delta never qualify: among all-zero deltas (first
+// scrape, idle database, stats reset) sort order is arbitrary and used to pull
+// random queryids into the top-set.
+func (c *Collector) selectTopStatements(all []stmtCurrent) (metrics, meta map[string]bool) {
+	metrics = make(map[string]bool, topStatementsN*5)
+	meta = make(map[string]bool, topMetaN*5)
+
+	// Rank an index slice rather than copies of stmtCurrent: the struct is ~200 bytes,
+	// and sorting it five times per scrape allocated megabytes of short-lived garbage.
+	idx := make([]int32, len(all))
+
+	addTopN := func(value func(sc *stmtCurrent) float64) {
+		for i := range idx {
+			idx[i] = int32(i)
+		}
+		slices.SortFunc(idx, func(a, b int32) int { return cmp.Compare(value(&all[b]), value(&all[a])) })
+		for rank := range min(topMetaN, len(idx)) {
+			sc := &all[idx[rank]]
+			if value(sc) <= 0 {
+				break
+			}
+			meta[sc.key] = true
+			if rank < topStatementsN {
+				metrics[sc.key] = true
+			}
 		}
 	}
 
-	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaTime, a.deltaTime) })
-	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaCalls, a.deltaCalls) })
-	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlksRead, a.deltaBlksRead) })
-	addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaBlksDirtied, a.deltaBlksDirtied) })
+	addTopN(func(sc *stmtCurrent) float64 { return sc.deltaTime })
+	addTopN(func(sc *stmtCurrent) float64 { return float64(sc.deltaCalls) })
+	addTopN(func(sc *stmtCurrent) float64 { return float64(sc.deltaBlksRead) })
+	addTopN(func(sc *stmtCurrent) float64 { return float64(sc.deltaBlksDirtied) })
 	if c.hasWalBytes {
-		addTopN(func(a, b stmtCurrent) int { return cmp.Compare(b.deltaWalBytes, a.deltaWalBytes) })
+		addTopN(func(sc *stmtCurrent) float64 { return float64(sc.deltaWalBytes) })
 	}
 
-	return result
+	return metrics, meta
 }
 
 // QueryMeta returns the latest collected query metadata (thread-safe).
