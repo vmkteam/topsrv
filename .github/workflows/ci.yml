@@ -32,6 +32,13 @@ jobs:
         with:
           version: "latest"
           install-go: false
+          # This composite action pins actions/cache v4.3.0, which is node20.
+          # Node 20 is removed from runners in autumn 2026, and that would take
+          # the required "test" check down with it. use-cache skips the step
+          # entirely; upstream has a fix open (dominikh/staticcheck-action#23)
+          # but the repo has been dormant since March, so we cannot wait on it.
+          # Drop this line once that lands.
+          use-cache: false
         env:
           GOEXPERIMENT: jsonv2
 
