@@ -145,6 +145,20 @@ For example PromQL queries and alert recipes, see [promql-recipes.md](promql-rec
 | `topsrv_pg_setting` | gauge | name | Selected GUCs (shared_buffers, effective_cache_size, work_mem, maintenance_work_mem, max_wal_size, min_wal_size, checkpoint_timeout, wal_buffers, random_page_cost). Normalized: memory/WAL in bytes, time in seconds |
 | `topsrv_pg_stats_reset_timestamp_seconds` | gauge | scope | Unix time of last pg_stat_* reset. `scope=database` (oldest across DBs), `bgwriter`, `wal` (PG17+), `archiver` (if `archive_mode=on`) |
 
+### How `topsrv_pg_query_*` statements are selected
+
+Ranking uses per-scrape deltas, not cumulative counters, and a statement must hold a
+top-20 spot on **two consecutive scrapes** before its metrics appear. This keeps one-off
+queries (migrations, ad-hoc statements) from creating a series per `queryid` in the
+per-day index. Two consequences worth knowing on call:
+
+- A query that alternates in and out of the top-20 never emits at all.
+- After a topsrv restart or `pg_stat_statements_reset()` the first per-query metrics
+  appear on the **third** scrape — the first only builds the delta baseline.
+
+The aggregate `topsrv_pg_query_duration_seconds` histogram is fed from every statement
+regardless of ranking, so latency percentiles have no such gap.
+
 ## Nginx (`topsrv_nginx_*`)
 
 | Metric | Type | Labels | Description |
