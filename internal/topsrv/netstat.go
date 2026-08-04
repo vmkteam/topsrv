@@ -20,6 +20,8 @@ type NetstatCollector struct {
 	listenPorts    *prometheus.Desc
 
 	// Protocol counters from /proc/net/snmp (Linux) or netstat -s (macOS).
+	tcpInSegs         *prometheus.Desc
+	tcpOutSegs        *prometheus.Desc
 	tcpRetrans        *prometheus.Desc
 	tcpInErrs         *prometheus.Desc
 	tcpOutRsts        *prometheus.Desc
@@ -35,6 +37,8 @@ func NewNetstatCollector(logger embedlog.Logger) *NetstatCollector {
 		tcpConns:          prometheus.NewDesc("topsrv_netstat_tcp_connections", "TCP connections by state, direction, and remote-peer scope. remote_scope=none for LISTEN sockets; otherwise loopback/private/public per the same taxonomy as listening_ports. Lets an operator alert on e.g. unexpected public inbound (scan exposure) or private→public outbound chatter (exfil signal).", []string{"state", "direction", "remote_scope"}, nil),
 		tcpConnsByPort:    prometheus.NewDesc("topsrv_netstat_tcp_connections_by_port", "TCP connections per listen port.", []string{"port"}, nil),
 		listenPorts:       prometheus.NewDesc("topsrv_netstat_listening_ports", "Active listening sockets. value=1 per (proto, port, family, scope, process) tuple. proto ∈ {tcp, udp}; UDP \"listening\" means a bound socket with no connected peer (Raddr empty). scope=loopback bound only to 127.0.0.0/8 or ::1; scope=private bound to an RFC1918/ULA/CGNAT/link-local address (reachable only on the private/carrier network); scope=public bound to a routable address or to the 0.0.0.0/:: wildcard (potentially reachable from anywhere). process is the owning binary name (empty when the PID is hidden by kernel ACL — root needed on Linux to read /proc/<pid>/comm of other users).", []string{"proto", "port", "family", "scope", "process"}, nil),
+		tcpInSegs:         prometheus.NewDesc("topsrv_netstat_tcp_in_segs_total", "Total TCP segments received. Denominator for the share of segments received in error (tcp_in_errs_total).", nil, nil),
+		tcpOutSegs:        prometheus.NewDesc("topsrv_netstat_tcp_out_segs_total", "Total TCP segments sent, retransmits included. Denominator for the retransmit ratio — unlike network_packets_total{direction=\"tx\"} it counts TCP only, so the ratio against tcp_retransmits_total is comparable to the 1-2% industry threshold.", nil, nil),
 		tcpRetrans:        prometheus.NewDesc("topsrv_netstat_tcp_retransmits_total", "Total TCP retransmitted segments.", nil, nil),
 		tcpInErrs:         prometheus.NewDesc("topsrv_netstat_tcp_in_errs_total", "Total TCP segments received in error.", nil, nil),
 		tcpOutRsts:        prometheus.NewDesc("topsrv_netstat_tcp_out_rsts_total", "Total TCP segments sent with RST.", nil, nil),
@@ -53,6 +57,8 @@ func (c *NetstatCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.tcpConns
 	ch <- c.tcpConnsByPort
 	ch <- c.listenPorts
+	ch <- c.tcpInSegs
+	ch <- c.tcpOutSegs
 	ch <- c.tcpRetrans
 	ch <- c.tcpInErrs
 	ch <- c.tcpOutRsts
@@ -269,6 +275,8 @@ func (c *NetstatCollector) collectProtoCounters(ch chan<- prometheus.Metric) {
 	for _, proto := range counters {
 		switch proto.Protocol {
 		case "tcp":
+			c.emitCounter(ch, c.tcpInSegs, proto.Stats, "InSegs")
+			c.emitCounter(ch, c.tcpOutSegs, proto.Stats, "OutSegs")
 			c.emitCounter(ch, c.tcpRetrans, proto.Stats, "RetransSegs")
 			c.emitCounter(ch, c.tcpInErrs, proto.Stats, "InErrs")
 			c.emitCounter(ch, c.tcpOutRsts, proto.Stats, "OutRsts")
