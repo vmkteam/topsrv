@@ -104,7 +104,7 @@ func TestLogCollectorParseLine(t *testing.T) {
 	assert.EqualValues(t, 4, c.reqCount)
 	assert.EqualValues(t, 2, c.upCount)
 	assert.EqualValues(t, 1, c.statusCounts["503"])
-	assert.EqualValues(t, 1, c.uri5xx[statusURI{"503", "/slow"}])
+	assert.EqualValues(t, 1, c.uri5xx.m[statusURI{"503", "/slow"}].count)
 	assert.EqualValues(t, 1323, c.bytesTotal.Load())
 }
 
@@ -425,8 +425,8 @@ func TestLogCollectorJSONParseLine(t *testing.T) {
 	assert.EqualValues(t, 2, c.statusCounts["200"])
 	assert.EqualValues(t, 1, c.statusCounts["503"])
 	assert.EqualValues(t, 1, c.statusCounts["404"])
-	assert.Len(t, c.uri5xx, 1, "one 503 URI")
-	assert.Len(t, c.uri4xx, 1, "one 404 URI")
+	assert.Len(t, c.uri5xx.m, 1, "one 503 URI")
+	assert.Len(t, c.uri4xx.m, 1, "one 404 URI")
 	assert.Equal(t, int64(10939722+1043200+221239839+162), c.bytesTotal.Load())
 }
 
@@ -515,28 +515,33 @@ func TestLogCollectorTail(t *testing.T) {
 func TestLogCollectorCardinalityCap(t *testing.T) {
 	c := NewLogCollector(embedlog.Logger{}, LogConfig{LogPaths: []string{"/dev/null"}, LogFormat: DefaultLogFormat})
 
-	// Fill uri5xx, uri4xx, bytesByURI to maxCardinalityURI with unique URIs.
+	// Fill uri5xx, uri4xx, bytesByURI to maxCardinalityURI with unique, still
+	// active URIs (lastSeen = now — idle ones would simply be evicted).
+	now := nowUnix()
 	for i := range maxCardinalityURI {
 		uri := "/section" + strconv.Itoa(i) + "/page"
-		c.uri5xx[statusURI{"500", uri}] = 1
-		c.uri4xx[statusURI{"404", uri}] = 1
-		c.bytesByURI[uri] = 1
+		c.uri5xx.m[statusURI{"500", uri}] = uriCounter{count: 1, lastSeen: now}
+		c.uri4xx.m[statusURI{"404", uri}] = uriCounter{count: 1, lastSeen: now}
+		c.bytesByURI.m[uri] = uriCounter{count: 1, lastSeen: now}
 	}
-	assert.Len(t, c.uri5xx, maxCardinalityURI)
-	assert.Len(t, c.uri4xx, maxCardinalityURI)
-	assert.Len(t, c.bytesByURI, maxCardinalityURI)
+	assert.Len(t, c.uri5xx.m, maxCardinalityURI)
+	assert.Len(t, c.uri4xx.m, maxCardinalityURI)
+	assert.Len(t, c.bytesByURI.m, maxCardinalityURI)
 
 	// Parse a line with a URI that normalizes to an EXISTING entry — counters must still grow.
 	existingURI := "/section0/page"
 	c.parseLine(`1.2.3.4 - - [11/Apr/2026:17:15:23 +0300] "GET ` + existingURI + ` HTTP/1.1" 500 999 "-" "test" 0.1 0.1`)
-	assert.EqualValues(t, 2, c.uri5xx[statusURI{"500", existingURI}], "existing 5xx URI counter must increment")
-	assert.EqualValues(t, 1000, c.bytesByURI[existingURI], "existing bytes URI counter must increment")
+	assert.EqualValues(t, 2, c.uri5xx.m[statusURI{"500", existingURI}].count, "existing 5xx URI counter must increment")
+	assert.EqualValues(t, 1000, c.bytesByURI.m[existingURI].count, "existing bytes URI counter must increment")
 
-	// Parse a line with a NEW URI — must be rejected (cap reached).
+	// Parse a line with a NEW URI while every slot is active — it lands in the
+	// per-status overflow bucket instead of vanishing, and the cap holds.
 	c.parseLine(`1.2.3.4 - - [11/Apr/2026:17:15:24 +0300] "GET /brand-new HTTP/1.1" 503 500 "-" "test" 0.2 0.2`)
-	_, exists := c.uri5xx[statusURI{"503", "/brand-new"}]
-	assert.False(t, exists, "new URI must not be added when cap is reached")
-	assert.Len(t, c.uri5xx, maxCardinalityURI)
+	_, exists := c.uri5xx.m[statusURI{"503", "/brand-new"}]
+	assert.False(t, exists, "new URI must not get its own slot when cap is reached")
+	assert.EqualValues(t, 1, c.uri5xx.m[statusURI{"503", overflowMarker}].count, "overflow bucket counts the request")
+	assert.EqualValues(t, 500, c.bytesByURI.m[overflowMarker].count)
+	assert.Len(t, c.uri5xx.m, maxCardinalityURI+1, "only the bucket sits above the cap")
 }
 
 func TestNormalizeURI(t *testing.T) {

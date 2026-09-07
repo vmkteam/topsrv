@@ -27,7 +27,7 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 // DefaultLogFormat — combined + request_time + upstream_response_time.
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
-const maxCardinalityURI = 1000    // cap uri5xx map to prevent unbounded growth
+const maxCardinalityURI = 1000    // cap on uri4xx/uri5xx/bytesByURI keys; eviction policy in uricounters.go
 const maxCardinalityTagged = 500  // cap taggedCounts (status × extra labels) to prevent unbounded growth
 const maxPathDepth = 2            // collapse URI segments beyond this depth
 const maxNormalizedURIBytes = 240 // hard byte cap; Prometheus exposition rejects label values >256 bytes
@@ -45,14 +45,16 @@ var (
 	numericSegment = regexp.MustCompile(`/\d+`)
 	// uuidSegment matches UUID v4 format (8-4-4-4-12 hex, case-insensitive).
 	uuidSegment = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	// hexHash matches 32-char hex strings (md5 hashes in media URLs).
-	hexHash = regexp.MustCompile(`[a-f0-9]{32}`)
+	// hexHash matches 32+ char hex strings (md5 hashes in media URLs; longer
+	// tokens too — a 48-hex name used to leave a 16-hex tail after :hash).
+	hexHash = regexp.MustCompile(`[a-f0-9]{32,}`)
 	// slugWithID matches slug-style segments ending with digits (e.g. "tommy-brewster-6401345").
 	slugWithID = regexp.MustCompile(`/[a-z][\w-]*-\d{4,}/`)
 	// hyphenSlug matches hyphenated slugs with 1+ hyphens (people, articles, products).
 	hyphenSlug = regexp.MustCompile(`/[a-z][a-z0-9]*(?:-[a-z0-9]+)+`)
-	// urlEncodedSegment matches path segments containing percent-encoded characters.
-	urlEncodedSegment = regexp.MustCompile(`/[^/]*%[0-9A-Fa-f]{2}[^/]*`)
+	// urlEncodedSegment matches path segments containing percent-encoded characters,
+	// including the non-standard %uXXXX form scanners use (/%u002f%u002eenv).
+	urlEncodedSegment = regexp.MustCompile(`/[^/]*%(?:[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})[^/]*`)
 	// xenForoSlug matches XenForo-style segments: text.digits (threads, attachments, blogs, members).
 	xenForoSlug = regexp.MustCompile(`/[\w][\w-]*\.\d+/`)
 	// base64Token matches base64-encoded tokens with padding (containing = or ==).
@@ -105,9 +107,9 @@ type LogCollector struct {
 	statusCounts map[string]uint64          // status → count (no extra labels)
 	taggedCounts map[taggedStatusKey]uint64 // status+labels → count
 	cacheCounts  map[string]uint64
-	uri5xx       map[statusURI]uint64
-	uri4xx       map[statusURI]uint64
-	bytesByURI   map[string]uint64
+	uri5xx       uriCounters[statusURI] // bounded, idle keys evicted, overflow → /:other (uricounters.go)
+	uri4xx       uriCounters[statusURI]
+	bytesByURI   uriCounters[string]
 	bytesTotal   atomic.Int64
 
 	observers []LogObserver // set-once before Run; iterated lock-free on the parse goroutine
@@ -204,18 +206,18 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		httpRequests:     prometheus.NewDesc("topsrv_nginx_http_requests_total", "HTTP requests by status code.", reqLabels, nil),
 		responseBytes:    prometheus.NewDesc("topsrv_nginx_response_bytes_total", "Total response bytes.", nil, nil),
 		cacheRequests:    prometheus.NewDesc("topsrv_nginx_cache_requests_total", "Requests by upstream cache status.", []string{"status"}, nil),
-		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI.", []string{"status", "uri"}, nil),
-		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI.", []string{"status", "uri"}, nil),
-		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI.", []string{"uri"}, nil),
+		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"uri"}, nil),
 
 		reqBuckets:   make([]uint64, len(defaultHTTPBuckets)+1),
 		upBuckets:    make([]uint64, len(defaultHTTPBuckets)+1),
 		statusCounts: make(map[string]uint64),
 		taggedCounts: make(map[taggedStatusKey]uint64),
 		cacheCounts:  make(map[string]uint64),
-		uri5xx:       make(map[statusURI]uint64),
-		uri4xx:       make(map[statusURI]uint64),
-		bytesByURI:   make(map[string]uint64),
+		uri5xx:       newURICounters[statusURI](maxCardinalityURI),
+		uri4xx:       newURICounters[statusURI](maxCardinalityURI),
+		bytesByURI:   newURICounters[string](maxCardinalityURI),
 	}
 }
 
@@ -263,16 +265,16 @@ func (c *LogCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(count), status)
 	}
 
-	for key, count := range c.uri5xx {
-		ch <- prometheus.MustNewConstMetric(c.http5xxRequests, prometheus.CounterValue, float64(count), key.status, key.uri)
+	for key, e := range c.uri5xx.m {
+		ch <- prometheus.MustNewConstMetric(c.http5xxRequests, prometheus.CounterValue, float64(e.count), key.status, key.uri)
 	}
 
-	for key, count := range c.uri4xx {
-		ch <- prometheus.MustNewConstMetric(c.http4xxRequests, prometheus.CounterValue, float64(count), key.status, key.uri)
+	for key, e := range c.uri4xx.m {
+		ch <- prometheus.MustNewConstMetric(c.http4xxRequests, prometheus.CounterValue, float64(e.count), key.status, key.uri)
 	}
 
-	for uri, bytes := range c.bytesByURI {
-		ch <- prometheus.MustNewConstMetric(c.responseByteURI, prometheus.CounterValue, float64(bytes), uri)
+	for uri, e := range c.bytesByURI.m {
+		ch <- prometheus.MustNewConstMetric(c.responseByteURI, prometheus.CounterValue, float64(e.count), uri)
 	}
 }
 
@@ -586,27 +588,20 @@ func (c *LogCollector) recordLine(p *ParsedLine) { //nolint:gocognit,nestif
 		}
 
 		uri := p.URI
+		now := nowUnix()
 
 		if strings.HasPrefix(status, "5") && uri != "" {
-			key := statusURI{status, uri}
-			if _, ok := c.uri5xx[key]; ok || len(c.uri5xx) < maxCardinalityURI {
-				c.uri5xx[key]++
-			}
+			c.uri5xx.add(statusURI{status, uri}, statusURI{status, overflowMarker}, 1, now)
 		}
 
 		if strings.HasPrefix(status, "4") && uri != "" {
-			key := statusURI{status, uri}
-			if _, ok := c.uri4xx[key]; ok || len(c.uri4xx) < maxCardinalityURI {
-				c.uri4xx[key]++
-			}
+			c.uri4xx.add(statusURI{status, uri}, statusURI{status, overflowMarker}, 1, now)
 		}
 
 		if v, err := strconv.ParseInt(p.BodyBytesSent, 10, 64); err == nil {
 			c.bytesTotal.Add(v)
 			if uri != "" {
-				if _, ok := c.bytesByURI[uri]; ok || len(c.bytesByURI) < maxCardinalityURI {
-					c.bytesByURI[uri] += uint64(v)
-				}
+				c.bytesByURI.add(uri, overflowMarker, uint64(v), now)
 			}
 		}
 	}
