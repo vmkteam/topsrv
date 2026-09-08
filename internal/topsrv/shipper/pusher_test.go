@@ -1,4 +1,4 @@
-package botlog
+package shipper
 
 import (
 	"bytes"
@@ -15,8 +15,6 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
-
-	"github.com/vmkteam/topsrv/internal/topsrv"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -113,15 +111,17 @@ func decodeBatchLines(t *testing.T, raw []byte) [][]byte {
 // spool subdir so tests can glob inside it.
 func newTestPusher(t *testing.T, endpoint, parentDir string, batchSize int, batchInterval string) (*Pusher, string) {
 	t.Helper()
-	cfg := Config{
-		Enabled:       true,
+	interval, err := time.ParseDuration(batchInterval)
+	require.NoError(t, err)
+	cfg := Options{
+		MetricPrefix:  "topsrv_botlog",
+		MetricSubject: "Bot-log",
 		Endpoint:      endpoint,
 		Token:         "bl_test",
 		BatchSize:     batchSize,
-		BatchInterval: batchInterval,
-		SpoolDir:      parentDir,
+		BatchInterval: interval,
+		SpoolDir:      filepath.Join(parentDir, "botlog"),
 	}
-	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
 	return NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry()), cfg.SpoolDir
 }
 
@@ -155,12 +155,15 @@ func startPusher(t *testing.T, p *Pusher) (stop func()) {
 }
 
 func sampleEvent(uri string) Event {
-	ev, _ := NewEvent(time.Now(), "host01", Fields{
-		Status:    "200",
-		URI:       uri,
-		UserAgent: "GPTBot/1.0",
-	}, nil, 1024)
-	return ev
+	return Event{
+		TS:            time.Now(),
+		AgentHostname: "host01",
+		URI:           uri,
+		Status:        200,
+		UserAgent:     "GPTBot/1.0",
+		BotFamily:     "openai",
+		BotName:       "gptbot",
+	}
 }
 
 func TestPusher_EnqueueAndFlushOnTicker(t *testing.T) {
@@ -322,15 +325,16 @@ func TestPusher_DrainQueueRespectsBatchSizeOnShutdown(t *testing.T) {
 
 func TestPusher_TrimSpoolByBudget(t *testing.T) {
 	parent := t.TempDir()
-	cfg := Config{
-		Enabled:    true,
-		Endpoint:   "http://example.invalid/v1/bot-logs",
-		Token:      "bl_test",
-		BatchSize:  10,
-		SpoolDir:   parent,
-		MaxSpoolMB: 2,
+	cfg := Options{
+		MetricPrefix:  "topsrv_botlog",
+		MetricSubject: "Bot-log",
+		Endpoint:      "http://example.invalid/v1/bot-logs",
+		Token:         "bl_test",
+		BatchSize:     10,
+		BatchInterval: 30 * time.Second,
+		SpoolDir:      filepath.Join(parent, "botlog"),
+		MaxSpoolMB:    2,
 	}
-	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
 	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
 
 	// Three pre-seeded files of ~1 MB each in the final spool dir; budget 2 MB.

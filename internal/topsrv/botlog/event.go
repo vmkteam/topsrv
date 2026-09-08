@@ -6,31 +6,13 @@ import (
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
+	"github.com/vmkteam/topsrv/internal/topsrv/shipper"
 )
 
-// Event is one bot-log entry shipped to the topsrv.io ingest endpoint. JSON
-// tags mirror the documented /v1/bot-logs Input contract — keep them in sync.
-// Numeric fields ship 0 when absent (the receiver treats 0 as sentinel
-// "not present"); string fields use omitempty so empty values stay off the
-// wire and save bytes.
-type Event struct {
-	TS                     time.Time `json:"ts"`
-	Host                   string    `json:"host,omitempty"`
-	ServerName             string    `json:"serverName,omitempty"`
-	AgentHostname          string    `json:"agentHostname"`
-	RemoteAddr             string    `json:"remoteAddr,omitempty"`
-	Method                 string    `json:"method,omitempty"`
-	URI                    string    `json:"uri"`
-	Referer                string    `json:"referer,omitempty"`
-	Status                 uint16    `json:"status"`
-	BodyBytesSent          uint32    `json:"bodyBytesSent"`
-	RequestTimeUs          uint32    `json:"requestTimeUs"`
-	UpstreamResponseTimeUs uint32    `json:"upstreamResponseTimeUs"`
-	UpstreamCacheStatus    string    `json:"upstreamCacheStatus,omitempty"`
-	UserAgent              string    `json:"userAgent,omitempty"`
-	BotFamily              string    `json:"botFamily,omitempty"`
-	BotName                string    `json:"botName,omitempty"`
-}
+// Event is one bot-log record on the wire. It lives in shipper because both
+// streams send the same shape; botlog keeps the name as an alias so the
+// observer and its tests read unchanged.
+type Event = shipper.Event
 
 // Fields holds raw nginx fields the observer pulls from a ParsedLine. Strings are
 // the verbatim log values (status as decimal, request_time in seconds with a
@@ -65,20 +47,22 @@ func NewEvent(now time.Time, agentHostname string, f Fields, extraUAPatterns []s
 // callers (Observer) use this to avoid constructing Fields when MatchUA misses.
 func BuildEvent(now time.Time, agentHostname string, f Fields, family, name string, uaTruncate int) Event {
 	return Event{
-		TS:                     now,
-		Host:                   normalizeHost(f.Host),
-		ServerName:             f.ServerName,
-		AgentHostname:          agentHostname,
-		RemoteAddr:             dashToEmpty(f.RemoteAddr),
-		Method:                 f.Method,
-		URI:                    f.URI,
-		Referer:                dashToEmpty(f.Referer),
+		TS:            now,
+		Host:          normalizeHost(f.Host),
+		ServerName:    f.ServerName,
+		AgentHostname: agentHostname,
+		RemoteAddr:    DashToEmpty(f.RemoteAddr),
+		Method:        f.Method,
+		URI:           f.URI,
+		// Referer arrives already capped: like URI it is a client-controlled URL,
+		// and nginx accepts header values up to large_client_header_buffers.
+		Referer:                DashToEmpty(f.Referer),
 		Status:                 parseStatus(f.Status),
 		BodyBytesSent:          parseUint32(f.BodyBytesSent),
 		RequestTimeUs:          parseSecondsToMicros(f.RequestTime),
 		UpstreamResponseTimeUs: parseSecondsToMicros(firstUpstreamTime(f.UpstreamResponseTime)),
-		UpstreamCacheStatus:    dashToEmpty(f.UpstreamCacheStatus),
-		UserAgent:              truncate(f.UserAgent, uaTruncate),
+		UpstreamCacheStatus:    DashToEmpty(f.UpstreamCacheStatus),
+		UserAgent:              Truncate(f.UserAgent, uaTruncate),
 		BotFamily:              family,
 		BotName:                name,
 	}
@@ -130,18 +114,26 @@ func firstUpstreamTime(s string) string {
 	return s
 }
 
-func dashToEmpty(s string) string {
+// DashToEmpty drops nginx's placeholder for an absent value. Exported for the
+// same reason as Truncate: "the dash is not a value" is one rule, and both
+// streams have to apply it identically or the receiver grows a "-" bucket in a
+// low-cardinality column.
+func DashToEmpty(s string) string {
 	if s == "-" {
 		return ""
 	}
 	return s
 }
 
-// truncate caps s at n bytes, n <= 0 meaning "no cap". The cut lands on a rune
+// Truncate caps s at n bytes, n <= 0 meaning "no cap". The cut lands on a rune
 // boundary: UA, URI and Host are all client-controlled and routinely carry
 // multi-byte UTF-8, and encodeBatch aborts on the first marshal error, so one
 // mid-rune cut would drop every event batched alongside it.
-func truncate(s string, n int) string {
+//
+// Exported because the web stream truncates the same client-controlled strings
+// and must not re-derive this — a plain s[:n] there would reintroduce exactly
+// the batch-wide loss described above.
+func Truncate(s string, n int) string {
 	if n <= 0 { // no cap configured; TruncateAtRune would read it as "cut to nothing"
 		return s
 	}

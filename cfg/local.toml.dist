@@ -68,3 +68,49 @@ Channel  = "stable"      # stable / beta
 # [BotLogs.FieldAliases]
 # Referer = "ref"
 # UserAgent = ""
+
+# Web-logs ingest to topsrv.io (optional — ships the full HTTP stream from the
+# access logs you name, not just bot traffic).
+#
+# Where [BotLogs] sends only lines whose user agent matched the built-in list,
+# this stream sends everything from the files listed in LogPaths. The UA
+# classifier still runs, but as a signal on the event (uaMatched) rather than a
+# gate — a scraper on a plain browser UA never appears in the bot stream at all.
+#
+# LogPaths is an explicit allowlist, and it has no default: naming files is the
+# cheapest filter there is, and it is the only one that cannot accidentally pick
+# up a log added later whose log_format carries request bodies. Globs are
+# refused for the same reason. Every path must also appear in your
+# [Nginx]/[Angie] AccessLogs — this stream reads the collector's tail, it does
+# not open files of its own.
+#
+# Before tailing, each path's log_format is checked. A format carrying
+# $request_body, $http_cookie or $http_authorization is refused outright, as is
+# one with no client address, no $status or no URI variable. Missing timestamp,
+# method or $upstream_response_time only warn. Every refusal and warning is
+# logged at startup and ticks topsrv_collector_config_warnings_total{kind=...}.
+#
+# Volume is the thing to plan for: a front node produces one line per request,
+# so expect three to four orders of magnitude more events than the bot stream.
+# The filters below are what keep that in hand — RequireUpstream alone typically
+# removes most of a front node's traffic, since bundles, images and static files
+# never reach a backend.
+#
+# Token must differ from [BotLogs].Token: separate tokens are what make the two
+# streams separately revocable. Endpoint defaults to [Push].Endpoint with the
+# path replaced by /v1/web-logs; SpoolDir defaults to [Push].SpoolDir with a
+# "weblog/" subdir, so a burst on one stream cannot evict the other's batches.
+# [WebLogs]
+# Enabled         = true
+# Token           = ""        # required — must differ from [BotLogs].Token
+# Endpoint        = ""        # default: derived from [Push].Endpoint
+# LogPaths        = ["/var/log/nginx/site.access.log"]  # required; absolute, no globs
+# RequireUpstream = true      # keep only requests that reached a backend
+# Upstreams       = []        # allowlist of $proxy_host values; needs $proxy_host in log_format
+# ExcludePathPrefixes = ["/static/", "/_build/"]  # matched against the raw path
+# BatchSize       = 5000      # events per batch
+# BatchInterval   = "30s"     # flush interval
+# SpoolDir        = ""        # default: [Push].SpoolDir + "/weblog"
+# MaxSpoolMB      = 200       # WAL disk budget, separate from the bot-log one
+# UATruncate      = 1024      # truncate user-agent at this length
+# URITruncate     = 2048      # truncate request URI at this length

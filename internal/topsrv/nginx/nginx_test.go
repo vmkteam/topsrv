@@ -118,13 +118,16 @@ type recordingObserver struct {
 }
 
 type recordedLine struct {
-	status  string
-	uri     string
-	rawURI  string
-	ua      string
-	path    string
-	method  string
-	rawTime string
+	status     string
+	uri        string
+	rawURI     string
+	ua         string
+	path       string
+	method     string
+	rawTime    string
+	platform   string
+	appVersion string
+	visitorID  string
 }
 
 // timestamp mirrors ParsedLine.Timestamp on the recorded copy — the observer
@@ -133,12 +136,15 @@ func (r recordedLine) timestamp() (time.Time, bool) { return parseLogTime(r.rawT
 
 func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
 	rl := recordedLine{
-		status:  p.Status,
-		uri:     p.URI,
-		rawURI:  p.RawURI,
-		path:    path,
-		method:  p.Method,
-		rawTime: p.Time,
+		status:     p.Status,
+		uri:        p.URI,
+		rawURI:     p.RawURI,
+		path:       path,
+		method:     p.Method,
+		platform:   p.Platform,
+		appVersion: p.AppVersion,
+		visitorID:  p.VisitorID,
+		rawTime:    p.Time,
 	}
 	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
 		rl.ua = p.Extras[r.uaIdx]
@@ -1330,4 +1336,108 @@ func TestParsedLine_ResolvedFieldNamesText(t *testing.T) {
 	ts, ok := rec.lines[0].timestamp()
 	require.True(t, ok)
 	assert.True(t, time.Date(2026, 8, 18, 11, 20, 3, 0, time.FixedZone("", 3*60*60)).Equal(ts))
+}
+
+// Client fields ride the same three parse paths as Method and Time. The typed
+// JSON struct is the one that historically drifted from the other two, so all
+// three are asserted here rather than only the text path.
+func TestParsedLine_ClientFields(t *testing.T) {
+	// A logfmt-style production format, trimmed to what matters here.
+	const logfmtFormat = `time="$time_iso8601" clientIp="$remote_addr" httpMethod="$request_method" ` +
+		`uriPath="$uri" httpStatus=$status bodyBytesSent=$body_bytes_sent requestTime=$request_time ` +
+		`platform="$http_platform" version="$http_version" nginxUserId="$uid_got"`
+
+	cases := []struct {
+		name                                string
+		setup                               func(c *LogCollector)
+		feed                                func(c *LogCollector)
+		wantPlatform, wantVersion, wantUser string
+	}{
+		{
+			name:  "text: mobile app fills all three",
+			setup: func(c *LogCollector) { c.defaultParser = gonx.NewParser(logfmtFormat) },
+			feed: func(c *LogCollector) {
+				c.parseLine(`time="2026-09-08T17:57:15+03:00" clientIp="203.0.113.7" httpMethod="POST" ` +
+					`uriPath="/v3/rpc/stat/" httpStatus=200 bodyBytesSent=71 requestTime=0.004 ` +
+					`platform="android" version="4.2.0" nginxUserId="AgAAAGpxAAABc2Vzc2lvbg=="`)
+			},
+			wantPlatform: "android",
+			wantVersion:  "4.2.0",
+			wantUser:     "AgAAAGpxAAABc2Vzc2lvbg==",
+		},
+		{
+			// Browsers send neither header, and nginx writes "-" for an absent
+			// value. That placeholder must not reach the receiver: it would be
+			// a distinct value in a LowCardinality column and, worse, a visitor
+			// identity shared by every anonymous request on the host.
+			name:  "text: nginx dash placeholder is not a value",
+			setup: func(c *LogCollector) { c.defaultParser = gonx.NewParser(logfmtFormat) },
+			feed: func(c *LogCollector) {
+				c.parseLine(`time="2026-09-08T17:57:15+03:00" clientIp="198.51.100.15" httpMethod="GET" ` +
+					`uriPath="/movie/461666/" httpStatus=404 bodyBytesSent=12412 requestTime=0.108 ` +
+					`platform="-" version="-" nginxUserId="-"`)
+			},
+		},
+		{
+			name: "JSON typed path answers for the same names",
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/catalog","request_method":"GET",` +
+					`"http_platform":"ios","http_version":"3.9.1","uid_got":"Zm9vYmFy"}`)
+			},
+			wantPlatform: "ios",
+			wantVersion:  "3.9.1",
+			wantUser:     "Zm9vYmFy",
+		},
+		{
+			name:  "JSON map path agrees with the typed one",
+			setup: func(c *LogCollector) { c.extractFields = []string{"http_user_agent"} },
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/catalog","request_method":"GET","http_user_agent":"Bot/1",` +
+					`"http_platform":"ios","http_version":"3.9.1","uid_got":"Zm9vYmFy"}`)
+			},
+			wantPlatform: "ios",
+			wantVersion:  "3.9.1",
+			wantUser:     "Zm9vYmFy",
+		},
+		{
+			// $uid_set is what nginx logs on the request that issues the cookie;
+			// $uid_got only appears once the client sends it back.
+			name: "falls back to uid_set on the issuing request",
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/","request_method":"GET","uid_set":"QUJDRA=="}`)
+			},
+			wantUser: "QUJDRA==",
+		},
+		{
+			// A format without these variables must leave them empty rather
+			// than inventing values — the receiver distinguishes "not logged"
+			// from "logged as empty".
+			name: "format without client fields leaves them empty",
+			feed: func(c *LogCollector) { c.parseLine(defaultCombinedLine) },
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewLogCollector(embedlog.Logger{}, LogConfig{
+				LogPaths:  []string{"/dev/null"},
+				LogFormat: DefaultLogFormat,
+			})
+			rec := &recordingObserver{uaIdx: -1}
+			c.AddObserver(rec)
+			if tc.setup != nil {
+				tc.setup(c)
+			}
+			tc.feed(c)
+
+			require.NotEmpty(t, rec.lines, "observer saw no line")
+			got := rec.lines[len(rec.lines)-1]
+			assert.Equal(t, tc.wantPlatform, got.platform, "platform")
+			assert.Equal(t, tc.wantVersion, got.appVersion, "appVersion")
+			assert.Equal(t, tc.wantUser, got.visitorID, "visitorId")
+		})
+	}
 }

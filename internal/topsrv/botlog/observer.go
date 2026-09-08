@@ -40,19 +40,33 @@ const maxHostLen = 256
 // applied first so SplitHostPort doesn't scan a hostile 8 KB Host header
 // (nginx accepts up to large_client_header_buffers without escaping).
 func normalizeHost(s string) string {
-	s = truncate(s, maxHostLen)
-	if h, _, err := net.SplitHostPort(s); err == nil {
-		s = h
+	s = Truncate(s, maxHostLen)
+	// Guarded because the no-port path is the common one and SplitHostPort
+	// reports it by allocating an *AddrError. That was noise at bot-stream
+	// volume; the web stream calls this once per request.
+	if strings.IndexByte(s, ':') >= 0 {
+		if h, _, err := net.SplitHostPort(s); err == nil {
+			s = h
+		}
 	}
 	return strings.ToLower(s)
 }
 
+// EventSink is what the observer needs from delivery: somewhere to put an event
+// and a place to count UA matches. Narrow on purpose — the observer has no
+// business knowing about batching, spool or retries, and tests supply a
+// recorder instead of reaching into another package's private fields.
+type EventSink interface {
+	Enqueue(ev Event)
+	RecordMatch(family string)
+}
+
 // Observer implements nginx.LogObserver. On every parsed access log line it
 // classifies the UA, drops non-bots, and enqueues a fully-built Event onto the
-// Pusher. Observer is created once at startup, registered before LogCollector.Run,
+// sink. Observer is created once at startup, registered before LogCollector.Run,
 // and runs synchronously on the tail goroutine — keep work minimal.
 type Observer struct {
-	pusher        *Pusher
+	pusher        EventSink
 	hostname      string
 	uaTruncate    int
 	uriTruncate   int
@@ -69,7 +83,7 @@ type Observer struct {
 // aliases is the per-format resolution of which field name carries which
 // semantic value (UA, Host, etc.); empty entries collapse to idx -1 and the
 // Event ships those fields empty.
-func NewObserver(p *Pusher, cfg Config, hostname string, extractFields []string, aliases FieldAliases) *Observer {
+func NewObserver(p EventSink, cfg Config, hostname string, extractFields []string, aliases FieldAliases) *Observer {
 	return &Observer{
 		pusher:        p,
 		hostname:      hostname,
@@ -130,7 +144,7 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 
 	ev := BuildEvent(ts, o.hostname, Fields{
 		Status:               p.Status,
-		URI:                  truncate(uri, o.uriTruncate),
+		URI:                  Truncate(uri, o.uriTruncate),
 		BodyBytesSent:        p.BodyBytesSent,
 		RequestTime:          p.RequestTime,
 		UpstreamResponseTime: p.UpstreamResponseTime,
@@ -140,7 +154,7 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 		Host:                 o.field(p, o.idxHost),
 		ServerName:           o.field(p, o.idxServerName),
 		RemoteAddr:           o.field(p, o.idxRemoteAddr),
-		Referer:              o.field(p, o.idxReferer),
+		Referer:              Truncate(o.field(p, o.idxReferer), o.uriTruncate),
 	}, family, name, o.uaTruncate)
 	o.pusher.RecordMatch(family)
 	o.pusher.Enqueue(ev)

@@ -1,6 +1,6 @@
 //go:build !unix
 
-package botlog
+package shipper
 
 import "os"
 
