@@ -23,6 +23,38 @@ var criticalAttrIDs = map[uint8]bool{
 // skipBlockPrefixes lists /sys/block/ device prefixes to ignore (virtual, RAID, etc.).
 var skipBlockPrefixes = [...]string{"loop", "dm-", "ram", "zram", "sr", "fd", "nbd", "md"}
 
+// nvmeDataUnitBytes is the size of one NVMe "data unit": the spec counts them
+// in thousands of 512-byte units, so one unit is 512 000 bytes, not a sector.
+const nvmeDataUnitBytes = 512 * 1000
+
+// pageWriteAttrs copies a SMART page into the shape the host-write unit table
+// works on — see hostWriteAttr for why the library type does not cross into
+// the untagged file.
+func pageWriteAttrs(attrs map[uint8]sm.AtaSmartAttr) []hostWriteAttr {
+	out := make([]hostWriteAttr, 0, len(attrs))
+	for id, a := range attrs {
+		out = append(out, hostWriteAttr{id: id, name: a.Name, valueRaw: a.ValueRaw})
+	}
+	return out
+}
+
+// logicalSectorSize returns the logical block size of a block device — the unit
+// ATA counts LBA-based host writes in. Falls back to 512 when sysfs cannot be
+// read, which is what smartmontools, node_exporter and scrutiny assume for
+// every drive. Reading it only changes the answer on 4Kn drives, where that
+// blanket assumption is wrong by 8x.
+func logicalSectorSize(device string) uint64 {
+	data, err := os.ReadFile(filepath.Join("/sys/block", device, "queue/logical_block_size"))
+	if err != nil {
+		return defaultSectorSize
+	}
+	size, err := strconv.ParseUint(strings.TrimSpace(string(data)), 10, 64)
+	if err != nil || size == 0 {
+		return defaultSectorSize
+	}
+	return size
+}
+
 // discoverBlockDevices returns names of physical block devices from /sys/block/.
 func discoverBlockDevices() []string {
 	entries, err := os.ReadDir("/sys/block")
@@ -108,9 +140,10 @@ func (c *Collector) collectFromDevice(ctx context.Context, name string) ([]prome
 		if ga.PowerOnHours > 0 {
 			metrics = append(metrics, prometheus.MustNewConstMetric(c.powerOnHours, prometheus.GaugeValue, float64(ga.PowerOnHours), name))
 		}
-		if ga.Written > 0 {
-			metrics = append(metrics, prometheus.MustNewConstMetric(c.bytesWritten, prometheus.GaugeValue, float64(ga.Written), name))
-		}
+		// Host writes are deliberately not taken from here: GenericAttributes
+		// hands out a raw unit count ("data units (LBA)"), and by this point
+		// the attribute it came from — the only thing that says how large a
+		// unit is — is lost. collectSata/collectNVMe emit it instead.
 	}
 
 	// Type-specific metrics.
@@ -154,6 +187,10 @@ func (c *Collector) collectSata(device string, dev *sm.SataDevice) []prometheus.
 	if err != nil {
 		metrics = append(metrics, prometheus.MustNewConstMetric(c.healthy, prometheus.GaugeValue, 1, device))
 		return metrics
+	}
+
+	if written, ok := hostBytesWritten(pageWriteAttrs(page.Attrs), logicalSectorSize(device)); ok {
+		metrics = append(metrics, prometheus.MustNewConstMetric(c.bytesWritten, prometheus.CounterValue, float64(written), device))
 	}
 
 	for _, attr := range page.Attrs {
@@ -200,14 +237,22 @@ func (c *Collector) collectNVMe(device string, dev *sm.NVMeDevice) []prometheus.
 		healthy = 0
 	}
 
+	// An NVMe data unit is a thousand 512-byte units, not one sector: the
+	// counter was published raw and read 512 000x too small. Val[0] is the low
+	// half of a Uint128, as everywhere else here — float64 loses precision long
+	// before the multiply overflows, and real drives are orders below both.
+	if w := log.DataUnitsWritten.Val[0]; w > 0 {
+		metrics = append(metrics, prometheus.MustNewConstMetric(c.bytesWritten, prometheus.CounterValue, float64(w)*nvmeDataUnitBytes, device))
+	}
+
 	metrics = append(metrics,
 		prometheus.MustNewConstMetric(c.healthy, prometheus.GaugeValue, healthy, device),
 		prometheus.MustNewConstMetric(c.nvmeCritWarn, prometheus.GaugeValue, float64(log.CritWarning), device),
 		prometheus.MustNewConstMetric(c.nvmeAvailSpare, prometheus.GaugeValue, float64(log.AvailSpare), device),
 		prometheus.MustNewConstMetric(c.nvmeSpareThresh, prometheus.GaugeValue, float64(log.SpareThresh), device),
 		prometheus.MustNewConstMetric(c.nvmePercentUsed, prometheus.GaugeValue, float64(log.PercentUsed), device),
-		prometheus.MustNewConstMetric(c.nvmeMediaErrors, prometheus.GaugeValue, float64(log.MediaErrors.Val[0]), device),
-		prometheus.MustNewConstMetric(c.nvmeUnsafeShutdowns, prometheus.GaugeValue, float64(log.UnsafeShutdowns.Val[0]), device),
+		prometheus.MustNewConstMetric(c.nvmeMediaErrors, prometheus.CounterValue, float64(log.MediaErrors.Val[0]), device),
+		prometheus.MustNewConstMetric(c.nvmeUnsafeShutdowns, prometheus.CounterValue, float64(log.UnsafeShutdowns.Val[0]), device),
 		prometheus.MustNewConstMetric(c.nvmeWarnTempTime, prometheus.GaugeValue, float64(log.WarningTempTime), device),
 		prometheus.MustNewConstMetric(c.nvmeCritTempTime, prometheus.GaugeValue, float64(log.CritCompTime), device),
 	)

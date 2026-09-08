@@ -193,7 +193,9 @@ Always enabled. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` or root. Devices auto
 | `topsrv_smart_device_healthy` | gauge | device | Overall health: 1=healthy, 0=unhealthy |
 | `topsrv_smart_device_temperature_celsius` | gauge | device | Device temperature |
 | `topsrv_smart_device_power_on_hours` | gauge | device | Total power-on hours |
-| `topsrv_smart_device_bytes_written_total` | gauge | device | Total bytes written |
+| `topsrv_smart_device_bytes_written_total` | counter | device | Total host bytes written |
+
+`bytes_written_total` counts **host** writes, not NAND writes, and is scaled to bytes from whatever unit the drive reports: LBAs × logical sector size (read from `/sys/block/<dev>/queue/logical_block_size`, 512 when unreadable) on SATA, data units × 512 000 on NVMe. SATA vendors rename the attribute and change its unit with it (`Host_Writes_GiB`, `Host_Writes_32MiB`, …), so resolution is by attribute name, never by id — the default database puts `Load_Cycle_Count` on id 225, where Intel puts host writes. A drive exposing no attribute with a documented unit gets **no series** rather than one in unknown units; that is also the expected state for HDDs, which have no host-write counter at all. NAND-side counters (`Total_NAND_Written`, `NAND_GB_Written_TLC`) are never substituted — they measure flash writes after amplification. Before v0.1.5 the raw unit count was published as if it were bytes: SATA read 512x low, NVMe 512 000x low, and drives with a renamed attribute had no series at all. Expect one step up at the upgrade, and a new series on drives that had none; historical points stay understated.
 
 ### ATA/SATA critical attributes
 
@@ -211,8 +213,8 @@ Only critical attribute IDs are exported: 5 (Reallocated Sectors), 187 (Reported
 | `topsrv_smart_nvme_available_spare_percent` | gauge | device | Available spare capacity % |
 | `topsrv_smart_nvme_available_spare_threshold_percent` | gauge | device | Available spare threshold % |
 | `topsrv_smart_nvme_percentage_used` | gauge | device | Estimated % of life used (can exceed 100) |
-| `topsrv_smart_nvme_media_errors_total` | gauge | device | Media and data integrity errors |
-| `topsrv_smart_nvme_unsafe_shutdowns_total` | gauge | device | Unsafe shutdown count |
+| `topsrv_smart_nvme_media_errors_total` | counter | device | Media and data integrity errors |
+| `topsrv_smart_nvme_unsafe_shutdowns_total` | counter | device | Unsafe shutdown count |
 | `topsrv_smart_nvme_warning_temp_time_minutes` | gauge | device | Minutes above warning temp |
 | `topsrv_smart_nvme_critical_temp_time_minutes` | gauge | device | Minutes above critical temp |
 

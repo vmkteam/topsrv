@@ -65,7 +65,7 @@ func NewCollector(logger embedlog.Logger, interval string) *Collector {
 		healthy:      prometheus.NewDesc("topsrv_smart_device_healthy", "S.M.A.R.T. overall health: 1=healthy, 0=unhealthy.", []string{"device"}, nil),
 		temperature:  prometheus.NewDesc("topsrv_smart_device_temperature_celsius", "Device temperature in Celsius.", []string{"device"}, nil),
 		powerOnHours: prometheus.NewDesc("topsrv_smart_device_power_on_hours", "Total power-on hours.", []string{"device"}, nil),
-		bytesWritten: prometheus.NewDesc("topsrv_smart_device_bytes_written_total", "Total bytes written to device.", []string{"device"}, nil),
+		bytesWritten: prometheus.NewDesc("topsrv_smart_device_bytes_written_total", "Total host bytes written to device (host writes, not NAND writes). Absent on drives whose host-write attribute has no documented unit.", []string{"device"}, nil),
 
 		attrRawValue: prometheus.NewDesc("topsrv_smart_attr_raw_value", "ATA S.M.A.R.T. critical attribute raw value.", []string{"device", "id", "name"}, nil),
 
