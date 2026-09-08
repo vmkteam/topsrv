@@ -25,6 +25,15 @@ type Event struct {
 	BotFamily              string    `json:"botFamily,omitempty"`
 	BotName                string    `json:"botName,omitempty"`
 
+	// RequestID ties the event to the backend's own logs for the same request.
+	// Empty means "the format carries none" — the receiver then generates one,
+	// which is unique but joins to nothing.
+	RequestID string `json:"requestId,omitempty"`
+	// UpstreamStatus is what the backend answered, where Status is what the
+	// client got: nginx serving its own 502, a retry chain whose first attempt
+	// failed, a cached 200 over a dead backend.
+	UpstreamStatus uint16 `json:"upstreamStatus"`
+
 	// Web-log stream only; the bot stream leaves these zero.
 	//
 	// UAMatched with UAListVersion is what keeps stream membership out of the

@@ -17,6 +17,8 @@ const (
 	KindNoTimestamp       = "weblog_no_timestamp"
 	KindNoMethod          = "weblog_no_method"
 	KindNoUpstream        = "weblog_no_upstream"
+	KindNoRequestID       = "weblog_no_request_id"
+	KindNoUpstreamStatus  = "weblog_no_upstream_status"
 	KindUpstreamFilterOff = "weblog_upstream_filter_disabled"
 )
 
@@ -154,6 +156,23 @@ func checkPath(cfg *Config, path string, vars map[string]bool, aliases botlog.Fi
 		warnings = append(warnings, Warning{
 			Kind: KindNoUpstream, Path: path,
 			Detail: "format has no $upstream_response_time — RequireUpstream cannot be used on this host",
+		})
+	}
+	// Advisory, unlike the checks above: these disable no filter, the stream
+	// runs fine without them. They are here because the price is paid silently
+	// — the receiver generates a requestId that is unique and joins to nothing,
+	// and upstreamStatus stays 0 — so an operator otherwise learns about it
+	// from an empty column weeks later.
+	if !anyOf(vars, []string{"request_id", "http_x_request_id"}) {
+		warnings = append(warnings, Warning{
+			Kind: KindNoRequestID, Path: path,
+			Detail: "format has no $request_id — events cannot be joined to the backend's own logs for the same request; the receiver will generate an id that matches nothing",
+		})
+	}
+	if !vars["upstream_status"] {
+		warnings = append(warnings, Warning{
+			Kind: KindNoUpstreamStatus, Path: path,
+			Detail: "format has no $upstream_status — what the backend answered cannot be told apart from what nginx returned on its own (its 502 page, a cached 200 over a dead backend)",
 		})
 	}
 	if len(cfg.Upstreams) > 0 && !vars[proxyHostField] {

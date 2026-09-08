@@ -155,6 +155,8 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 		ServerName:           o.field(p, o.idxServerName),
 		RemoteAddr:           o.field(p, o.idxRemoteAddr),
 		Referer:              Truncate(o.field(p, o.idxReferer), o.uriTruncate),
+		RequestID:            p.RequestID,
+		UpstreamStatus:       p.UpstreamStatus,
 	}, family, name, o.uaTruncate)
 	o.pusher.RecordMatch(family)
 	o.pusher.Enqueue(ev)

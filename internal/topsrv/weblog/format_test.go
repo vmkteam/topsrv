@@ -13,7 +13,8 @@ import (
 const (
 	fullFormat = `time="$time_iso8601" host="$host" serverName="$server_name" clientIp="$remote_addr" ` +
 		`httpMethod="$request_method" uriPath="$uri" httpStatus=$status bodyBytesSent=$body_bytes_sent ` +
-		`requestTime=$request_time upstreamResponseTime="$upstream_response_time" userAgent="$http_user_agent"`
+		`requestTime=$request_time upstreamResponseTime="$upstream_response_time" userAgent="$http_user_agent" ` +
+		`xRequestId="$request_id" upstreamStatus="$upstream_status"`
 	bodyFormat   = fullFormat + ` requestBody="$request_body"`
 	cookieFormat = fullFormat + ` cookie="$http_cookie"`
 )
@@ -98,7 +99,9 @@ func TestCheckFormats(t *testing.T) {
 			assert.False(t, w.Fatal)
 			kinds = append(kinds, w.Kind)
 		}
-		assert.ElementsMatch(t, []string{KindNoTimestamp, KindNoMethod, KindNoUpstream}, kinds)
+		assert.ElementsMatch(t,
+			[]string{KindNoTimestamp, KindNoMethod, KindNoUpstream, KindNoRequestID, KindNoUpstreamStatus},
+			kinds)
 	})
 
 	// A filter reading a field the format lacks would drop every line, and a
@@ -190,5 +193,32 @@ func TestCheckFormatsHonoursResolvedAliases(t *testing.T) {
 	assert.Equal(t, []string{tailedPath}, tail)
 	for _, w := range warnings {
 		assert.NotEqual(t, KindNoClientIP, w.Kind)
+	}
+}
+
+// The docs list $request_id and $upstream_status as recommended; the check
+// layer has to say the same thing, or an operator learns about an empty column
+// weeks later. Advisory only — the path still ships.
+func TestCheckFormatsWarnsOnMissingTracingFields(t *testing.T) {
+	const noTracing = `time="$time_iso8601" clientIp="$remote_addr" httpMethod="$request_method" ` +
+		`uriPath="$uri" httpStatus=$status upstreamResponseTime="$upstream_response_time"`
+
+	tail, _, warnings := CheckFormats(&Config{LogPaths: []string{tailedPath}},
+		collector(noTracing), botlog.DefaultAliases())
+
+	assert.Equal(t, []string{tailedPath}, tail, "advisory warnings must not disqualify the path")
+	kinds := map[string]bool{}
+	for _, w := range warnings {
+		assert.False(t, w.Fatal)
+		kinds[w.Kind] = true
+	}
+	assert.True(t, kinds[KindNoRequestID])
+	assert.True(t, kinds[KindNoUpstreamStatus])
+
+	// The edge-assigned header counts: an id is an id.
+	_, _, warnings = CheckFormats(&Config{LogPaths: []string{tailedPath}},
+		collector(noTracing+` xRequestId="$http_x_request_id"`), botlog.DefaultAliases())
+	for _, w := range warnings {
+		assert.NotEqual(t, KindNoRequestID, w.Kind)
 	}
 }
