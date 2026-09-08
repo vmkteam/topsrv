@@ -11,6 +11,14 @@ type botPattern struct {
 	Name   string
 }
 
+// UAListVersion identifies the built-in UA list this build ships. It travels
+// with every web-log event because the boundary between the two streams is
+// exactly this list: after an update yesterday's web-log line becomes today's
+// bot-log line for the same user agent. Bump it whenever knownBots changes —
+// without it the receiver cannot tell "not a bot" from "the list did not know
+// it yet", and both look like an empty botFamily.
+const UAListVersion = "2026-09-08"
+
 // knownBots is a snapshot of UA patterns kept in sync with the topsrv.io
 // bot-verifier. Update this list whenever a new family is added upstream.
 // Order is contract — declare specific patterns before family-wide fallbacks.

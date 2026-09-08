@@ -10,8 +10,6 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv"
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 
-	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vmkteam/embedlog"
@@ -33,7 +31,18 @@ func TestRequiredFieldsHonoursAliases(t *testing.T) {
 	assert.ElementsMatch(t, []string{"ua", "h", "sn", "ip", "ref"}, RequiredFields(a))
 }
 
-func newObserverPair(t *testing.T) (*Observer, *Pusher) {
+// recordingSink stands in for the Pusher: the observer's contract is "matched
+// bots go to the sink, everything else does not", and that is checkable without
+// batching, spool or HTTP.
+type recordingSink struct {
+	events  []Event
+	matches []string
+}
+
+func (s *recordingSink) Enqueue(ev Event)          { s.events = append(s.events, ev) }
+func (s *recordingSink) RecordMatch(family string) { s.matches = append(s.matches, family) }
+
+func newObserverPair(t *testing.T) (*Observer, *recordingSink) {
 	t.Helper()
 	cfg := Config{
 		Enabled:   true,
@@ -42,11 +51,11 @@ func newObserverPair(t *testing.T) (*Observer, *Pusher) {
 		BatchSize: 100,
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
-	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
+	sink := &recordingSink{}
 	// Tests use the canonical default aliases — ExtractFields and Observer
 	// indices line up with botParsedLine's Extras layout.
-	o := NewObserver(p, cfg, "web01", RequiredFields(DefaultAliases()), DefaultAliases())
-	return o, p
+	o := NewObserver(sink, cfg, "web01", RequiredFields(DefaultAliases()), DefaultAliases())
+	return o, sink
 }
 
 func botParsedLine(ua, host, serverName, remoteAddr, referer string) *nginx.ParsedLine {
@@ -65,11 +74,12 @@ func TestObserver_EnqueuesBotEvent(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("Mozilla/5.0 GPTBot/1.0", "api.example.com", "vhost_cfg", "203.0.113.5", "-"), "")
 
-	assert.InDelta(t, 1, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
-	assert.InDelta(t, 1, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
+	assert.Len(t, p.events, 1)
+	assert.Equal(t, []string{"openai"}, p.matches)
 
-	select {
-	case ev := <-p.queue:
+	require.Len(t, p.events, 1)
+	{
+		ev := p.events[0]
 		assert.Equal(t, "openai", ev.BotFamily)
 		assert.Equal(t, "gptbot", ev.BotName)
 		assert.Equal(t, "api.example.com", ev.Host, "Host carries the request $host header")
@@ -77,8 +87,6 @@ func TestObserver_EnqueuesBotEvent(t *testing.T) {
 		assert.Equal(t, "203.0.113.5", ev.RemoteAddr)
 		assert.Empty(t, ev.Referer, "dash referer dropped")
 		assert.Equal(t, "web01", ev.AgentHostname)
-	case <-time.After(time.Second):
-		t.Fatal("event not enqueued")
 	}
 }
 
@@ -94,8 +102,8 @@ func TestObserver_UsesRawURIOverURI(t *testing.T) {
 		NExtras: 1,
 	}
 	o.OnLogLine(pl, "")
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "/news/12345/some-title?utm=x", ev.URI)
 }
 
@@ -112,8 +120,8 @@ func TestObserver_TruncatesURI(t *testing.T) {
 		NExtras: 1,
 	}
 	o.OnLogLine(pl, "")
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Len(t, ev.URI, DefaultURITruncate)
 	assert.Equal(t, long[:DefaultURITruncate], ev.URI)
 }
@@ -129,8 +137,8 @@ func TestObserver_FallsBackToURIWhenRawURIEmpty(t *testing.T) {
 		NExtras: 1,
 	}
 	o.OnLogLine(pl, "")
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "/news/:id", ev.URI)
 }
 
@@ -139,8 +147,8 @@ func TestObserver_NonBotIgnored(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("Mozilla/5.0 (Macintosh) Safari/605", "x.example.com", "", "1.2.3.4", "-"), "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
-	assert.InDelta(t, 0, testutil.ToFloat64(p.matchTotal.WithLabelValues("openai")), 0.01)
+	assert.Empty(t, p.events)
+	assert.Empty(t, p.matches)
 }
 
 func TestObserver_EmptyUAIgnored(t *testing.T) {
@@ -148,7 +156,7 @@ func TestObserver_EmptyUAIgnored(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("", "x.example.com", "", "1.2.3.4", "-"), "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
+	assert.Empty(t, p.events)
 }
 
 func TestObserver_LogFormatMissingUAField(t *testing.T) {
@@ -158,7 +166,7 @@ func TestObserver_LogFormatMissingUAField(t *testing.T) {
 	pl := &nginx.ParsedLine{Status: "200", URI: "/", NExtras: 0}
 	o.OnLogLine(pl, "")
 
-	assert.InDelta(t, 0, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateEnqueued, "")), 0.01)
+	assert.Empty(t, p.events)
 }
 
 func TestObserver_PartialFields(t *testing.T) {
@@ -174,8 +182,8 @@ func TestObserver_PartialFields(t *testing.T) {
 	}
 	o.OnLogLine(pl, "")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "google", ev.BotFamily)
 	assert.Empty(t, ev.ServerName)
 	assert.Empty(t, ev.RemoteAddr)
@@ -194,7 +202,7 @@ func TestObserver_PluggableThroughLogCollector(t *testing.T) {
 		BatchSize: 100,
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
-	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
+	p := &recordingSink{}
 
 	logPath := "/var/log/nginx/access.json"
 	// Operator labels here are empty (Prometheus-side); botlog needs the four
@@ -212,7 +220,7 @@ func TestObserver_PluggableThroughLogCollector(t *testing.T) {
 	logC.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1","request_uri":"/b",` +
 		`"http_user_agent":"curl/8.0","server_name":"example.com","remote_addr":"1.2.3.4","http_referer":"-"}`)
 
-	assert.Len(t, p.queue, 1, "only the GPTBot line should land on the queue")
+	assert.Len(t, p.events, 1, "only the GPTBot line should reach the sink")
 }
 
 // Operator labels first in ExtractFields → Observer still finds UA at its
@@ -222,7 +230,7 @@ func TestObserver_IndicesResolvedAtRuntime(t *testing.T) {
 		Enabled: true, Endpoint: "http://x.invalid/", Token: "bl_test", BatchSize: 10,
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
-	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
+	p := &recordingSink{}
 
 	// Operator labels first, botlog's required fields after — UA at index 2.
 	extract := []string{"server_name", "http_platform", fieldUserAgent, fieldRemoteAddr, fieldReferer}
@@ -236,8 +244,8 @@ func TestObserver_IndicesResolvedAtRuntime(t *testing.T) {
 	}
 	obs.OnLogLine(pl, "")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "openai", ev.BotFamily)
 	assert.Equal(t, "example.com", ev.ServerName)
 	assert.Equal(t, "1.2.3.4", ev.RemoteAddr)
@@ -250,7 +258,7 @@ func TestObserver_MissingFieldsSafe(t *testing.T) {
 		Enabled: true, Endpoint: "http://x.invalid/", Token: "bl_test", BatchSize: 10,
 	}
 	require.NoError(t, cfg.Validate(topsrv.PushConfig{}))
-	p := NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry())
+	p := &recordingSink{}
 
 	// Only UA — no server_name / remote_addr / referer fields tailed.
 	obs := NewObserver(p, cfg, "host1", []string{fieldUserAgent}, DefaultAliases())
@@ -261,8 +269,8 @@ func TestObserver_MissingFieldsSafe(t *testing.T) {
 		NExtras: 1,
 	}
 	assert.NotPanics(t, func() { obs.OnLogLine(pl, "") })
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "openai", ev.BotFamily)
 	assert.Empty(t, ev.Host)
 	assert.Empty(t, ev.ServerName)
@@ -300,8 +308,8 @@ func TestObserver_HostAndServerNameIndependent(t *testing.T) {
 	o, p := newObserverPair(t)
 	o.OnLogLine(botParsedLine("GPTBot/1.0", "Real.Example.COM:443", "vhost_cfg", "1.2.3.4", "https://prev.example.com/page"), "")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Equal(t, "real.example.com", ev.Host, "Host = normalizeHost($host)")
 	assert.Equal(t, "vhost_cfg", ev.ServerName, "ServerName = raw $server_name")
 	assert.Equal(t, "https://prev.example.com/page", ev.Referer, "non-dash referer passes through")
@@ -312,8 +320,8 @@ func TestObserver_HostMissingShipsEmpty(t *testing.T) {
 	o, p := newObserverPair(t)
 	o.OnLogLine(botParsedLine("GPTBot/1.0", "", "vhost_cfg", "1.2.3.4", "-"), "")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.Empty(t, ev.Host)
 	assert.Equal(t, "vhost_cfg", ev.ServerName)
 }
@@ -330,8 +338,8 @@ func TestObserver_UsesRequestTimeNotAgentClock(t *testing.T) {
 
 	o.OnLogLine(pl, "")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.True(t, time.UnixMilli(1787042366123).UTC().Equal(ev.TS), "got %v", ev.TS)
 	assert.Equal(t, "POST", ev.Method)
 }
@@ -346,8 +354,8 @@ func TestObserver_FallsBackToAgentClockAndEmptyMethod(t *testing.T) {
 
 	o.OnLogLine(botParsedLine("GPTBot/1.0", "example.com", "vhost", "203.0.113.5", "-"), "/var/log/nginx/access.log")
 
-	require.Len(t, p.queue, 1)
-	ev := <-p.queue
+	require.Len(t, p.events, 1)
+	ev := p.events[0]
 	assert.False(t, ev.TS.Before(before), "fell back to the agent clock")
 	assert.Empty(t, ev.Method, "verb must ship empty, never a guessed GET")
 }

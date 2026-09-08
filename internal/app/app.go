@@ -19,7 +19,9 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 	"github.com/vmkteam/topsrv/internal/topsrv/packages"
 	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
+	"github.com/vmkteam/topsrv/internal/topsrv/shipper"
 	"github.com/vmkteam/topsrv/internal/topsrv/smart"
+	"github.com/vmkteam/topsrv/internal/topsrv/weblog"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -37,6 +39,7 @@ type Config struct {
 	Angie    *AngieConfig        `toml:"Angie,omitempty"`
 	Smart    *smart.Config       `toml:"Smart,omitempty"`
 	BotLogs  *botlog.Config      `toml:"BotLogs,omitempty"`
+	WebLogs  *weblog.Config      `toml:"WebLogs,omitempty"`
 	Packages *packages.Config    `toml:"Packages,omitempty"`
 }
 
@@ -90,14 +93,15 @@ type App struct {
 	// observers (e.g. botlog) have been attached.
 	logCollector *nginx.LogCollector
 
-	// Built once in registerLogCollector; consumed by registerBotLogs to wire
-	// Observer's positional field-index resolution.
-	extractFields []string
-
 	// Per-format field aliases resolved from discovered log_format strings.
 	// registerLogCollector picks one canonical set (warning on mismatch) and
 	// registerBotLogs hands it to NewObserver.
 	botlogAliases botlog.FieldAliases
+
+	// The collector config as registered. ExtractFields off it is the layout
+	// both observers resolve their Extras indices against; registerWebLogs also
+	// reads the per-path log_format strings to decide what is safe to tail.
+	logCfg nginx.LogConfig
 
 	// Tracks pusher/log collector/smart/updater so Shutdown can wait for
 	// their drain paths before the process exits.
@@ -139,7 +143,7 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 		}, []string{"collector"}),
 		configWarnings: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_collector_config_warnings_total",
-			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field|botlog_no_time_field|botlog_no_method_field|botlog_alias_mismatch.",
+			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field|botlog_no_time_field|botlog_no_method_field|botlog_alias_mismatch|weblog_* (see docs/metrics.md).",
 		}, []string{"kind"}),
 	}
 	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics, a.configWarnings)
@@ -161,6 +165,7 @@ func (a *App) Run(ctx context.Context) error {
 	a.registerCollectors(ctx, services)
 
 	a.registerBotLogs(ctx)
+	a.registerWebLogs(ctx)
 
 	if a.logCollector != nil {
 		a.goBackground(func() { a.logCollector.Run(ctx) })
@@ -344,16 +349,24 @@ var highCardLabelDenylist = []string{
 	"request_id",
 	"args",
 	"query_string",
+	// The userid cookie is one value per visitor — the worst label available
+	// on this metric. It is listed because the web-log docs tell operators to
+	// add $uid_got to log_format, right next to $http_platform and
+	// $http_version, which do belong in ExtraLabels.
+	"uid_got",
+	"uid_set",
+	"http_cookie",
 }
 
 // registerLogCollector creates and registers a log collector. Tailing is not
 // started here — App.Run starts logCollector.Run after observers attach.
 //
-// BotLogs.RequiredFields() is merged into ExtractFields (parser reads) when
-// BotLogs is enabled; ExtraLabels (Prometheus labels) is left untouched so
-// observer needs can't inflate label cardinality. Operator-config warnings
-// are logged via Print and tick topsrv_collector_config_warnings_total so the
-// degraded state stays visible in Prometheus, not just startup stdout.
+// botlog.RequiredFields() is merged into ExtractFields (parser reads) when
+// either log stream is enabled — they read the same five nginx variables, and
+// the web stream adds $proxy_host. ExtraLabels (Prometheus labels) is left
+// untouched so observer needs can't inflate label cardinality. Operator-config
+// warnings are logged via Print and tick topsrv_collector_config_warnings_total
+// so the degraded state stays visible in Prometheus, not just startup stdout.
 func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if len(cfg.LogPaths) == 0 {
 		return
@@ -365,13 +378,21 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	}
 
 	cfg.ExtractFields = cfg.ExtraLabels
-	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
+	if a.logStreamsEnabled() {
 		a.botlogAliases = a.resolveBotlogAliases(ctx, cfg)
-		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields(a.botlogAliases))
+		// Each enabled stream declares what it needs read; the web one asks for
+		// everything the bot one does plus $proxy_host.
+		if webLogsEnabled(a.cfg.WebLogs) {
+			cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, weblog.RequiredFields(a.botlogAliases))
+		} else {
+			cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields(a.botlogAliases))
+		}
 		// Method and Time bypass ExtractFields — they land in typed ParsedLine
 		// fields, so the resolved names go to the parser directly.
 		cfg.MethodField = a.botlogAliases.Method
 		cfg.TimeField = a.botlogAliases.Time
+	}
+	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
 		if a.botlogAliases.UserAgent == "" {
 			a.warnConfig(ctx, "botlog_no_ua_field",
 				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives, or set [BotLogs.FieldAliases].UserAgent to the custom field name",
@@ -394,8 +415,11 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	}
 
 	if dropped := capExtractFields(&cfg); len(dropped) > 0 {
+		// Naming the dropped fields is not enough on its own: a stream loses a
+		// filter or an event field when its variable falls off the end, and
+		// "truncated" alone does not connect the two.
 		a.warnConfig(ctx, "truncated_extract",
-			"ExtractFields truncated to fit ParsedLine.Extras",
+			"ExtractFields truncated to fit ParsedLine.Extras — any log stream reading a dropped variable silently loses it (an upstream allowlist reading $proxy_host stops being applied); shorten ExtraLabels",
 			"kept", nginx.MaxExtras, "dropped", truncateList(dropped, 16))
 	}
 	if missing := missingFromExtract(cfg.ExtraLabels, cfg.ExtractFields); len(missing) > 0 {
@@ -404,7 +428,7 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 			"missing", truncateList(missing, 16))
 	}
 
-	a.extractFields = cfg.ExtractFields
+	a.logCfg = cfg
 	logC := nginx.NewLogCollector(a.Logger, cfg)
 	a.addCollector(logC)
 	a.logCollector = logC
@@ -625,10 +649,62 @@ func (a *App) registerBotLogs(ctx context.Context) {
 		return
 	}
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
-	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.extractFields, a.botlogAliases)
+	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.logCfg.ExtractFields, a.botlogAliases)
 	a.logCollector.AddObserver(obs)
 	a.goBackground(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)
+}
+
+// webLogsEnabled is the one place the "is this stream on" question is answered,
+// because it is asked twice from different files.
+func webLogsEnabled(cfg *weblog.Config) bool { return cfg != nil && cfg.Enabled }
+
+// logStreamsEnabled reports whether any access-log observer will attach — both
+// streams read the same nginx variables out of ParsedLine.Extras, so either one
+// being on is what makes resolving aliases worthwhile.
+func (a *App) logStreamsEnabled() bool {
+	return (a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled) || webLogsEnabled(a.cfg.WebLogs)
+}
+
+// registerWebLogs no-ops when [WebLogs] is disabled or no nginx access logs were
+// discovered. Unlike botlog it also refuses individual paths: a log whose
+// log_format carries request bodies, cookies or credentials is never tailed, and
+// when that leaves nothing the stream does not start at all.
+func (a *App) registerWebLogs(ctx context.Context) {
+	if !webLogsEnabled(a.cfg.WebLogs) {
+		return
+	}
+	cfg := a.cfg.WebLogs
+	botToken := ""
+	if a.cfg.BotLogs != nil {
+		botToken = a.cfg.BotLogs.Token
+	}
+	if err := cfg.Validate(a.cfg.Push, botToken); err != nil {
+		a.Error(ctx, "weblog: invalid config — disabled", "error", err)
+		return
+	}
+	if a.logCollector == nil {
+		a.Print(ctx, "weblog: no nginx access logs discovered — disabled")
+		return
+	}
+
+	tail, filters, warnings := weblog.CheckFormats(cfg, a.logCfg, a.botlogAliases)
+	for _, w := range warnings {
+		a.warnConfig(ctx, w.Kind, "weblog: "+w.Detail, "path", w.Path, "fatal", w.Fatal)
+	}
+	if len(tail) == 0 {
+		a.Print(ctx, "weblog: no configured log path is usable — disabled",
+			"configured", truncateList(cfg.LogPaths, 16))
+		return
+	}
+
+	m := weblog.NewMetrics(a.registry, len(tail))
+	wp := shipper.NewPusher(a.Logger, a.appName, a.version, cfg.ShipperOptions(), a.registry)
+	obs := weblog.NewObserver(wp, m, cfg, a.hostname, tail, a.logCfg.ExtractFields, a.botlogAliases, filters)
+	a.logCollector.AddObserver(obs)
+	a.goBackground(func() { wp.Run(ctx) })
+	a.Print(ctx, "weblog: observer attached", "endpoint", cfg.Endpoint, "spool", cfg.SpoolDir,
+		"paths", tail, "requireUpstream", filters.RequireUpstream, "upstreamFilter", filters.Upstreams)
 }
 
 func (a *App) registerSmart(ctx context.Context) {

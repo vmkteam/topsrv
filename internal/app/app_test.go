@@ -151,6 +151,14 @@ func TestHighCardLabels(t *testing.T) {
 		highCardLabels([]string{"server_name", "remote_addr"}))
 	assert.Equal(t, []string{"http_user_agent", "http_referer"},
 		highCardLabels([]string{"server_name", "http_user_agent", "http_referer"}))
+
+	// $http_platform and $http_version belong in ExtraLabels — a handful of
+	// values each. The userid cookie sits beside them in the web-log docs and
+	// is one value per visitor, so it must not pass as a label.
+	assert.Equal(t, []string{"uid_got"},
+		highCardLabels([]string{"server_name", "http_platform", "http_version", "uid_got"}))
+	assert.Equal(t, []string{"uid_set", "http_cookie"},
+		highCardLabels([]string{"uid_set", "http_cookie"}))
 }
 
 // Wiring contract: registerLogCollector builds the same union mergeUnique

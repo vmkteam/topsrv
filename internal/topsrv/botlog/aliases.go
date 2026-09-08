@@ -91,7 +91,7 @@ var (
 	uaCandidates      = []string{"http_user_agent"}
 	hostCandidates    = []string{"host", "http_host"}
 	serverCandidates  = []string{"server_name"}
-	remoteCandidates  = []string{"remote_addr", "realip_remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
+	RemoteCandidates  = []string{"remote_addr", "realip_remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
 	refererCandidates = []string{"http_referer", "http_referrer", "referer"}
 	// Borrowed from the parser rather than restated: what this detects and what
 	// LogCollector then reads must be the same names in the same order, or the
@@ -120,7 +120,7 @@ func DetectAliases(format string, isJSON bool) FieldAliases {
 		UserAgent:  detect(format, uaCandidates),
 		Host:       detect(format, hostCandidates),
 		ServerName: detect(format, serverCandidates),
-		RemoteAddr: detect(format, remoteCandidates),
+		RemoteAddr: detect(format, RemoteCandidates),
 		Referer:    detect(format, refererCandidates),
 		Method:     detect(format, methodCandidates),
 		Time:       detect(format, timeCandidates),

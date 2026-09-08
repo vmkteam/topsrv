@@ -60,6 +60,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **S.M.A.R.T.** | Disk health (ATA attributes, NVMe health log, temperature, wear, errors) | smartctl_exporter |
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
 | **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
+| **Web-logs** *(opt-in)* | Ships the full HTTP stream from the access logs you name, with the UA match carried as a signal rather than a gate — the scraper on a plain browser UA the bot stream cannot see. Local filters (reached-a-backend, upstream allowlist, path prefixes) keep the volume in hand; log_formats carrying request bodies, cookies or credentials are refused at startup | — |
 | **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching | apt-prom-exporter / pkg-exporter |
 
 ## Auto-discovery
@@ -170,6 +171,18 @@ Channel  = "stable"         # stable / beta
 # (e.g. operator-defined `set $custom $http_referer;`). Empty falls back.
 # [BotLogs.FieldAliases]
 # Referer = "ref"
+
+# Web-logs (optional — ships the full HTTP stream from the logs you name)
+# [WebLogs]
+# Enabled         = true
+# Token           = ""      # required — must differ from [BotLogs].Token
+# Endpoint        = ""      # default: [Push].Endpoint with /v1/web-logs path
+# LogPaths        = ["/var/log/nginx/site.access.log"]  # required; absolute, no globs
+# RequireUpstream = true    # keep only requests that reached a backend
+# Upstreams       = []      # allowlist of $proxy_host values
+# ExcludePathPrefixes = ["/static/", "/_build/"]
+# SpoolDir        = ""      # default: [Push].SpoolDir; a "weblog/" subdir is created inside
+# MaxSpoolMB      = 200     # WAL disk budget, separate from the bot-log one
 ```
 
 | Parameter | Default | Description |
@@ -211,6 +224,19 @@ Channel  = "stable"         # stable / beta
 | `BotLogs.URITruncate` | `2048` | Max URI length per event |
 | `BotLogs.ExtraUAPatterns` | `[]` | Local additions to known-bots UA patterns |
 | `BotLogs.FieldAliases.*` | auto | Per-format field-name overrides (UserAgent/Host/ServerName/RemoteAddr/Referer). Discovery auto-detects from `log_format`; only set when operator uses non-standard variables nginx config |
+| `WebLogs.Enabled` | `false` | Ship the full HTTP stream from `LogPaths` to topsrv.io |
+| `WebLogs.Token` | — | Web-logs ingest bearer token; must differ from `BotLogs.Token` so the two streams stay separately revocable |
+| `WebLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/web-logs` path |
+| `WebLogs.LogPaths` | — | **Required.** Absolute paths of the access logs to ship, each also present in `[Nginx]/[Angie] AccessLogs`. No default and no globs: naming files is the cheapest filter there is, and the only one that cannot pick up a log added later with an unsafe format |
+| `WebLogs.RequireUpstream` | `false` | Keep only requests that reached a backend. Typically removes most of a front node's traffic — assets served from disk never do |
+| `WebLogs.Upstreams` | `[]` | Allowlist of `$proxy_host` values; needs `$proxy_host` in the log_format, and is ignored (with a warning) when the format lacks it |
+| `WebLogs.ExcludePathPrefixes` | `[]` | Drop requests whose **raw** path starts with any of these. Matched before normalization, so a rule does not depend on the normalizer's current shape |
+| `WebLogs.BatchSize` | `5000` | Events per batch |
+| `WebLogs.BatchInterval` | `30s` | Flush interval |
+| `WebLogs.SpoolDir` | derived | Parent dir for WAL spool; a `weblog/` subdir is created inside, so a burst on one stream cannot evict the other's batches |
+| `WebLogs.MaxSpoolMB` | `200` | Disk budget for the web-log spool subdir |
+| `WebLogs.UATruncate` | `1024` | Max UA length per event |
+| `WebLogs.URITruncate` | `2048` | Max URI length per event |
 
 ### Environment variables
 
@@ -435,6 +461,79 @@ Metrics: `topsrv_botlog_events_total{state=enqueued|sent|spooled|dropped}`,
 `topsrv_botlog_match_total{family}`, `topsrv_botlog_send_errors_total{kind}`,
 `topsrv_botlog_batch_duration_seconds`, `topsrv_botlog_spool_files`,
 `topsrv_botlog_spool_bytes`.
+
+## Web-logs (optional)
+
+Bot-logs answers "which crawlers came by". Web-logs answers "what did the site
+actually serve" — and the two are different questions because the UA is a
+claim, not a fact. A scraper that sends a plain browser UA appears in neither
+the bot stream nor its metrics; on an API host the whole backend can be that
+blind spot, a few dozen bot events a day against millions of requests.
+
+So when `[WebLogs].Enabled = true`, every line from the access logs named in
+`LogPaths` becomes an event. The UA classifier still runs — the match travels
+on the event as `uaMatched` plus the list version that decided it — but it no
+longer decides whether the event exists.
+
+Both streams can run at once. They attach as two observers to the same tail and
+share one parse per line, so the second stream costs filtering and delivery,
+not a second read of the file. Everything that separates them is separate:
+token, ingest path, spool subdir, metric prefix. A burst on one cannot evict
+the other's pending batches, and revoking access to a site's entire traffic
+does not switch off the customer's alerting.
+
+**Volume is the thing to plan for.** One event per request means three to four
+orders of magnitude more than bot-logs. Four filters run per line,
+cheapest-first:
+
+1. **Wrong file** — a host usually tails more logs than this stream wants.
+2. **Never reached a backend** (`RequireUpstream`) — on a front node serving
+   bundles, images and static files from disk, this is the single most
+   effective filter available, and it takes the assets out of the volume.
+3. **Wrong backend** (`Upstreams`, an allowlist of `$proxy_host`).
+4. **Excluded prefix** (`ExcludePathPrefixes`), matched against the raw path
+   rather than the normalized URI, so a rule does not depend on the
+   normalizer's current shape.
+
+Each rejection is counted under
+`topsrv_weblog_filtered_total{reason=path|upstream|proxy_host|prefix}`. A zero
+count on a filter you configured means the rule never matches; the sum with
+delivered events is what the stream would cost unfiltered.
+
+**Formats are checked before anything is tailed.** A log_format carrying
+`$request_body`, `$http_cookie` or `$http_authorization` is refused outright —
+not filtered afterwards, because a config can declare such a format without
+attaching it anywhere, leaving it one line away from a vhost that is tailed. A
+format with no client address, no `$status` or no URI variable is refused as
+unusable. Missing timestamp, verb or `$upstream_response_time` only warn, and
+a filter whose field the format lacks is disabled rather than applied — a
+silent zero stream is indistinguishable from "this site has no traffic". Every
+refusal and warning is logged once at startup and ticks
+`topsrv_collector_config_warnings_total{kind="weblog_*"}`;
+`topsrv_weblog_tailed_paths` shows how many paths survived.
+
+**Required log_format variables**: the bot-log set (`$http_user_agent`,
+`$host` / `$server_name`, `$remote_addr`, `$http_referer`) plus `$status` and
+a URI variable.
+
+**Recommended**: `$upstream_response_time` (required by `RequireUpstream`),
+`$proxy_host` (required by `Upstreams`), and — when the site has them —
+`$http_platform`, `$http_version` and the userid module's `$uid_got`. The last
+one is the only stable identity above the address: one client rotating
+addresses under a single cookie and many cookies behind one address are
+opposite cases and tell apart by nothing else. All three are read
+automatically when present, under those names.
+
+Note the asymmetry with `ExtraLabels`: `$http_platform` and `$http_version` are
+fine as Prometheus labels (a handful of values each), but `$uid_got` is one
+value per visitor and belongs only in the log stream — the agent refuses it as
+a label and warns at startup.
+
+Metrics: `topsrv_weblog_events_total{state=enqueued|sent|spooled|dropped}`,
+`topsrv_weblog_filtered_total{reason}`, `topsrv_weblog_match_total{family}`,
+`topsrv_weblog_tailed_paths`, `topsrv_weblog_send_errors_total{kind}`,
+`topsrv_weblog_batch_duration_seconds`, `topsrv_weblog_spool_files`,
+`topsrv_weblog_spool_bytes`.
 
 ## Metrics reference
 

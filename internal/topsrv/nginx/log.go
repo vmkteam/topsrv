@@ -89,9 +89,10 @@ type LogCollector struct {
 	extractFields []string                // nginx vars read into ParsedLine.Extras (superset of labelFields)
 	methodField   string                  // resolved name of the request-verb field ("" → canonical names only)
 	timeField     string                  // resolved name of the request-time field ("" → canonical names only)
-	labelFields   []string                // nginx vars used as Prometheus labels (must be low-cardinality)
-	labelIdx      []int                   // labelFields[k] is at Extras[labelIdx[k]]; -1 if missing
-	logPaths      []string                // captured from LogConfig.LogPaths for Run
+
+	labelFields []string // nginx vars used as Prometheus labels (must be low-cardinality)
+	labelIdx    []int    // labelFields[k] is at Extras[labelIdx[k]]; -1 if missing
+	logPaths    []string // captured from LogConfig.LogPaths for Run
 
 	reqDuration      *prometheus.Desc
 	upstreamDuration *prometheus.Desc
@@ -395,6 +396,22 @@ type ParsedLine struct {
 	// only observers that need it pay for the parse (see Timestamp).
 	Time string
 
+	// Client fields carried by request headers and the userid module, "" when
+	// the format omits them. Typed rather than Extras slots for the same reason
+	// as Method: MaxExtras is a hard budget shared with operator ExtraLabels,
+	// and on a host logging $http_platform plus the botlog set only one slot is
+	// left — a third field would be dropped by capExtractFields with nothing
+	// but a warning to show for it.
+	//
+	// Platform and AppVersion identify the calling app ($http_platform,
+	// $http_version); VisitorID is the userid cookie ($uid_got), which is the
+	// only stable identity above the address — one client rotating addresses
+	// under a single cookie and many cookies behind one address are opposite
+	// cases and tell apart by nothing else.
+	Platform   string
+	AppVersion string
+	VisitorID  string
+
 	Extras  [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
 	NExtras int
 }
@@ -505,6 +522,9 @@ func (c *LogCollector) fillLine(get func(string) string) ParsedLine {
 	p.URI, p.RawURI = resolveURI(get)
 	p.Method = c.resolveMethod(get)
 	p.Time = c.resolveTime(get)
+	p.Platform = resolveClientField(get, PlatformCandidates)
+	p.AppVersion = resolveClientField(get, AppVersionCandidates)
+	p.VisitorID = resolveClientField(get, VisitorIDCandidates)
 
 	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
@@ -608,6 +628,10 @@ type jsonLogEntry struct {
 	RequestMethod       string `json:"request_method"`
 	TimeISO8601         string `json:"time_iso8601"`
 	TimeLocal           string `json:"time_local"`
+	HTTPPlatform        string `json:"http_platform"`
+	HTTPVersion         string `json:"http_version"`
+	UIDGot              string `json:"uid_got"`
+	UIDSet              string `json:"uid_set"`
 }
 
 // field answers by nginx variable name so the typed decode path can be filled
@@ -650,6 +674,14 @@ func (e *jsonLogEntry) field(name string) string {
 		return e.TimeISO8601
 	case "time_local":
 		return e.TimeLocal
+	case "http_platform":
+		return e.HTTPPlatform
+	case "http_version":
+		return e.HTTPVersion
+	case "uid_got":
+		return e.UIDGot
+	case "uid_set":
+		return e.UIDSet
 	}
 	return ""
 }
@@ -671,6 +703,19 @@ var (
 	// Ordered by precision: $msec carries milliseconds, $time_iso8601 and
 	// $time_local only whole seconds.
 	TimeCandidates = []string{"msec", "time_iso8601", "time_local"}
+
+	// URICandidates is the order resolveURI walks. Exported for the same reason
+	// as the two above: a check that decides whether a format is usable must
+	// name the same variables the parse path reads, or its verdict stops
+	// describing what the agent will actually do.
+	URICandidates = []string{"request_uri", "request", "uri"}
+
+	// Client field candidates. Names are nginx variables, not the keys an
+	// operator chose in the log line: gonx names fields after the variable, so
+	// `platform="$http_platform"` is read as http_platform.
+	PlatformCandidates   = []string{"http_platform"}
+	AppVersionCandidates = []string{"http_version"}
+	VisitorIDCandidates  = []string{"uid_got", "uid_set"}
 )
 
 // methodOf coerces one logged value into a request verb. The value is either a
@@ -731,6 +776,23 @@ func (c *LogCollector) resolveMethod(get func(string) string) string {
 	return ""
 }
 
+// resolveClientField walks the candidate variable names and returns the first
+// usable value. nginx writes "-" for an absent value, and that placeholder must
+// not reach the receiver: it would become a distinct value in a LowCardinality
+// column and a bogus visitor identity shared by every anonymous request.
+// Walked per line rather than narrowed at startup on purpose: a JSON access log
+// whose log_format discovery could not read still yields these keys, and
+// deciding from the format string would drop them silently on exactly those
+// hosts. Four map probes against a ~3.4 µs parse is not the trade to make.
+func resolveClientField(get func(string) string, candidates []string) string {
+	for _, name := range candidates {
+		if v := get(name); v != "" && v != "-" {
+			return v
+		}
+	}
+	return ""
+}
+
 func (c *LogCollector) resolveTime(get func(string) string) string {
 	if c.timeField != "" {
 		if v := get(c.timeField); v != "" && v != "-" {
@@ -755,7 +817,9 @@ func rawURIFromRequest(request string) string {
 	return parts[1]
 }
 
-func stripQuery(p string) string {
+// StripQuery cuts a raw URI at the query separator. Exported for observers that
+// filter on the path alone.
+func StripQuery(p string) string {
 	if i := strings.IndexByte(p, '?'); i >= 0 {
 		return p[:i]
 	}
@@ -768,13 +832,13 @@ func stripQuery(p string) string {
 // Returns the normalized URI (for metrics cardinality) and the un-normalized
 // RawURI (full path + query) for botlog. get returns "" for absent fields.
 func resolveURI(get func(string) string) (uri, rawURI string) {
-	if v := get("request_uri"); v != "" && v != "-" {
-		return normalizePath(stripQuery(v)), v
+	if v := get(URICandidates[0]); v != "" && v != "-" {
+		return normalizePath(StripQuery(v)), v
 	}
-	if v := get("request"); v != "" && v != "-" {
+	if v := get(URICandidates[1]); v != "" && v != "-" {
 		return normalizeURI(v), rawURIFromRequest(v)
 	}
-	if v := get("uri"); v != "" && v != "-" {
+	if v := get(URICandidates[2]); v != "" && v != "-" {
 		args := get("args")
 		if args == "" || args == "-" {
 			args = get("query_string")
@@ -782,7 +846,7 @@ func resolveURI(get func(string) string) (uri, rawURI string) {
 		// stripQuery on the metric URI is defensive — nginx $uri is path-only
 		// per spec, but operators occasionally log $request_uri under the
 		// "uri" field name and query strings must never reach metric labels.
-		metricURI := normalizePath(stripQuery(v))
+		metricURI := normalizePath(StripQuery(v))
 		if args != "" && args != "-" {
 			return metricURI, joinPathArgs(v, args)
 		}
@@ -800,7 +864,7 @@ func resolveURI(get func(string) string) (uri, rawURI string) {
 // defensive — guards against operators who log $request_uri under the
 // "uri" field name by mistake.
 func joinPathArgs(path, args string) string {
-	path = stripQuery(path)
+	path = StripQuery(path)
 	args = strings.TrimPrefix(args, "?")
 	if args == "" || args == "-" {
 		return path
