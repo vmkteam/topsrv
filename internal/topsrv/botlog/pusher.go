@@ -67,8 +67,11 @@ const (
 	errStatus  = "status"
 )
 
-// retryBackoff is overridable in tests; production smooths restart windows.
-var retryBackoff = 5 * time.Second
+// defaultRetryBackoff smooths receiver restart windows. Tests shorten it per
+// Pusher rather than package-wide: a Pusher outlives the test that built it
+// until its Run goroutine is joined, so a shared variable is read by one
+// test's flush while the next test writes it.
+const defaultRetryBackoff = 5 * time.Second
 
 // maxTransientPerRun caps how many spool replays may fail transiently in one
 // retrySpool pass — without it, a poison oldest file blocks every newer batch
@@ -129,6 +132,9 @@ type Pusher struct {
 	client *http.Client
 	queue  chan Event
 
+	// Fixed at construction; only tests give it another value.
+	retryBackoff time.Duration
+
 	eventsTotal *prometheus.CounterVec
 	matchTotal  *prometheus.CounterVec // family
 	sendErrors  *prometheus.CounterVec // kind=connect|timeout|status
@@ -151,6 +157,8 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg Config, reg 
 		cfg:    cfg,
 		client: appkit.NewHTTPClient(appName, version, sendTimeout),
 		queue:  make(chan Event, cfg.BatchSize*2),
+
+		retryBackoff: defaultRetryBackoff,
 
 		eventsTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_botlog_events_total",
@@ -360,7 +368,7 @@ func (p *Pusher) sendWithRetry(ctx context.Context, payload []byte, batchID stri
 		return err // retry would only repeat the same 4xx
 	}
 	// One retry with a fixed backoff — the server could be momentarily reloading.
-	t := time.NewTimer(retryBackoff)
+	t := time.NewTimer(p.retryBackoff)
 	defer t.Stop()
 	select {
 	case <-ctx.Done():

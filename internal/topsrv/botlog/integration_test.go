@@ -103,9 +103,22 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 	logC.AddObserver(obs)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go logC.Run(ctx)
-	go p.Run(ctx)
+	logDone, pushDone := make(chan struct{}), make(chan struct{})
+	go func() { defer close(logDone); logC.Run(ctx) }()
+	go func() { defer close(pushDone); p.Run(ctx) }()
+	// Join both before returning — cancel only signals. A Run left going keeps
+	// tailing and flushing into the next test, and stops before srv.Close so
+	// the last flush still has a server to talk to.
+	defer func() {
+		cancel()
+		for _, done := range []chan struct{}{logDone, pushDone} {
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("Run did not return after cancel")
+			}
+		}
+	}()
 
 	// Mix of one bot line, one human, one Anthropic Claude.
 	lines := []string{

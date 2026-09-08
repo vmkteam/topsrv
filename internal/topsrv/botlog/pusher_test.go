@@ -125,6 +125,35 @@ func newTestPusher(t *testing.T, endpoint, parentDir string, batchSize int, batc
 	return NewPusher(embedlog.Logger{}, "topsrv-test", "test", cfg, prometheus.NewRegistry()), cfg.SpoolDir
 }
 
+// startPusher runs p.Run in the background and returns stop, which cancels the
+// run and waits for the goroutine to return. stop is idempotent and also runs
+// at test end, so no Run survives the test that started it: a surviving Run
+// keeps flushing while the next test sets up, and the two then meet on
+// whatever the pusher shares.
+func startPusher(t *testing.T, p *Pusher) (stop func()) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		p.Run(ctx)
+	}()
+
+	var once sync.Once
+	stop = func() {
+		once.Do(func() {
+			cancel()
+			select {
+			case <-done:
+			case <-time.After(3 * time.Second):
+				t.Error("Run did not return after cancel")
+			}
+		})
+	}
+	t.Cleanup(stop)
+	return stop
+}
+
 func sampleEvent(uri string) Event {
 	ev, _ := NewEvent(time.Now(), "host01", Fields{
 		Status:    "200",
@@ -140,9 +169,7 @@ func TestPusher_EnqueueAndFlushOnTicker(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 100, "20ms")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	startPusher(t, p)
 
 	for i := range 5 {
 		p.Enqueue(sampleEvent("/p" + string(rune('0'+i))))
@@ -169,9 +196,7 @@ func TestPusher_FlushOnBatchSize(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 3, "10s") // long interval — only size triggers
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	startPusher(t, p)
 
 	for i := range 3 {
 		p.Enqueue(sampleEvent("/p" + string(rune('0'+i))))
@@ -199,19 +224,14 @@ func TestPusher_DropOnQueueFull(t *testing.T) {
 }
 
 func TestPusher_SpoolOnFailure(t *testing.T) {
-	prev := retryBackoff
-	retryBackoff = 10 * time.Millisecond
-	defer func() { retryBackoff = prev }()
-
 	r := newReceiver()
 	atomic.StoreInt32(&r.status, http.StatusServiceUnavailable)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
 	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 2, "20ms")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.retryBackoff = 10 * time.Millisecond
+	startPusher(t, p)
 
 	p.Enqueue(sampleEvent("/a"))
 	p.Enqueue(sampleEvent("/b"))
@@ -243,9 +263,7 @@ func TestPusher_ReplaySpoolOnStartup(t *testing.T) {
 	stalePath := filepath.Join(spool, "100-deadbeef.ndjson.gz")
 	require.NoError(t, os.WriteFile(stalePath, payload, 0o600))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	startPusher(t, p)
 
 	require.Eventually(t, func() bool { return r.calls() >= 1 }, 2*time.Second, 10*time.Millisecond)
 
@@ -260,22 +278,14 @@ func TestPusher_DrainsOnShutdown(t *testing.T) {
 	defer srv.Close()
 
 	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 100, "10s") // long interval
-	ctx, cancel := context.WithCancel(context.Background())
-
-	done := make(chan struct{})
-	go func() { p.Run(ctx); close(done) }()
+	stop := startPusher(t, p)
 
 	for i := range 4 {
 		p.Enqueue(sampleEvent("/d" + string(rune('0'+i))))
 	}
 	time.Sleep(50 * time.Millisecond) // let events sit in queue
 
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after cancel")
-	}
+	stop()
 
 	assert.Equal(t, 1, r.calls(), "shutdown should flush exactly one batch")
 	assert.Len(t, r.lastDecoded(t), 4)
@@ -292,21 +302,14 @@ func TestPusher_DrainQueueRespectsBatchSizeOnShutdown(t *testing.T) {
 	// BatchSize=2 → queue cap 4. Enqueue 5 events (1 dropped), then shutdown.
 	// Drain must send chunks of ≤2, not one combined batch of 4.
 	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 2, "10s")
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { p.Run(ctx); close(done) }()
+	stop := startPusher(t, p)
 
 	for range 5 {
 		p.Enqueue(sampleEvent("/x"))
 	}
 	time.Sleep(50 * time.Millisecond)
 
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("Run did not return after cancel")
-	}
+	stop()
 
 	r.mu.Lock()
 	bodies := append([][]byte(nil), r.bodies...)
@@ -345,19 +348,14 @@ func TestPusher_TrimSpoolByBudget(t *testing.T) {
 }
 
 func TestPusher_PermanentFailureDropsBatch(t *testing.T) {
-	prev := retryBackoff
-	retryBackoff = 10 * time.Millisecond
-	defer func() { retryBackoff = prev }()
-
 	r := newReceiver()
 	atomic.StoreInt32(&r.status, http.StatusBadRequest)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
 	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 1, "20ms")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.retryBackoff = 10 * time.Millisecond
+	startPusher(t, p)
 
 	p.Enqueue(sampleEvent("/bad"))
 
@@ -389,9 +387,7 @@ func TestPusher_RetrySpoolDiscardsPermanentlyRejected(t *testing.T) {
 	stalePath := filepath.Join(spool, "100-deadbeef.ndjson.gz")
 	require.NoError(t, os.WriteFile(stalePath, payload, 0o600))
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	startPusher(t, p)
 
 	require.Eventually(t, func() bool {
 		_, statErr := os.Stat(stalePath)
@@ -400,19 +396,14 @@ func TestPusher_RetrySpoolDiscardsPermanentlyRejected(t *testing.T) {
 }
 
 func TestPusher_RetrySuccess(t *testing.T) {
-	prev := retryBackoff
-	retryBackoff = 10 * time.Millisecond
-	defer func() { retryBackoff = prev }()
-
 	r := newReceiver()
 	r.failOnce.Store(true)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
 	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 1, "10s")
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.retryBackoff = 10 * time.Millisecond
+	startPusher(t, p)
 
 	p.Enqueue(sampleEvent("/a"))
 
@@ -485,9 +476,7 @@ func TestPusher_RetrySpoolOrderOldestFirst(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(spool, name), payload, 0o600))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	startPusher(t, p)
 
 	require.Eventually(t, func() bool { return r.calls() >= 3 }, 2*time.Second, 10*time.Millisecond)
 
@@ -513,30 +502,20 @@ func TestPusher_RetrySpoolOrderOldestFirst(t *testing.T) {
 // Drained batch must hit spool when receiver is down at shutdown — covers
 // the rolling-restart-with-503 case.
 func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
-	prev := retryBackoff
-	retryBackoff = 10 * time.Millisecond
-	defer func() { retryBackoff = prev }()
-
 	r := newReceiver()
 	atomic.StoreInt32(&r.status, http.StatusServiceUnavailable)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
 	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 100, "10s")
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan struct{})
-	go func() { p.Run(ctx); close(done) }()
+	p.retryBackoff = 10 * time.Millisecond
+	stop := startPusher(t, p)
 
 	for i := range 4 {
 		p.Enqueue(sampleEvent("/d" + string(rune('0'+i))))
 	}
 	time.Sleep(50 * time.Millisecond) // let events sit in the queue
-	cancel()
-	select {
-	case <-done:
-	case <-time.After(3 * time.Second):
-		t.Fatal("Run did not return after cancel")
-	}
+	stop()
 
 	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
 	assert.NotEmpty(t, files, "drained batch must hit spool when endpoint is down")
@@ -546,10 +525,6 @@ func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
 // A transient failure on the oldest batch must not stop the loop from
 // forwarding newer batches in the same pass.
 func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
-	prev := retryBackoff
-	retryBackoff = 10 * time.Millisecond
-	defer func() { retryBackoff = prev }()
-
 	var calls atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
 		body, _ := io.ReadAll(req.Body)
@@ -577,9 +552,8 @@ func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
 		require.NoError(t, os.WriteFile(filepath.Join(spool, tc.name), payload, 0o600))
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	go p.Run(ctx)
+	p.retryBackoff = 10 * time.Millisecond
+	startPusher(t, p)
 
 	require.Eventually(t, func() bool { return calls.Load() >= 2 }, 2*time.Second, 10*time.Millisecond,
 		"newer batches must not be blocked by a transient-failing older batch")
