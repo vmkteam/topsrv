@@ -5,6 +5,8 @@ import (
 	"slices"
 	"strings"
 	"sync"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 )
 
 // FieldAliases resolves the per-format names of the five nginx variables
@@ -91,13 +93,14 @@ var (
 	serverCandidates  = []string{"server_name"}
 	remoteCandidates  = []string{"remote_addr", "realip_remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
 	refererCandidates = []string{"http_referer", "http_referrer", "referer"}
-	// $request ("GET /x HTTP/1.1") carries the verb as its first token, so a
-	// format logging it needs no $request_method. textVarRe is word-boundaried,
-	// so "request" matches neither $request_time nor $request_uri.
-	methodCandidates = []string{"request_method", "request"}
-	// Ordered by precision: $msec carries milliseconds, the other two only
-	// whole seconds. First match wins, so a format logging both yields $msec.
-	timeCandidates = []string{"msec", "time_iso8601", "time_local"}
+	// Borrowed from the parser rather than restated: what this detects and what
+	// LogCollector then reads must be the same names in the same order, or the
+	// startup warning stops describing what the parse path does. $request ("GET
+	// /x HTTP/1.1") carries the verb as its first token, so a format logging it
+	// needs no $request_method; textVarRe is word-boundaried, so "request"
+	// matches neither $request_time nor $request_uri.
+	methodCandidates = nginx.MethodCandidates
+	timeCandidates   = nginx.TimeCandidates
 )
 
 // DetectAliases inspects an nginx log_format string and returns the resolved

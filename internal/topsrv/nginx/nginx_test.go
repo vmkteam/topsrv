@@ -1060,28 +1060,33 @@ func TestParseLogTime(t *testing.T) {
 	}
 }
 
-func TestMethodFrom(t *testing.T) {
+// methodOf takes one logged value because operators log either shape under
+// either field name — a bare verb ($request_method) or a whole request line
+// ($request). Which fields are consulted, and in what order, is resolveMethod's
+// job and is covered by TestParsedLine_ResolvedFieldNames.
+func TestMethodOf(t *testing.T) {
 	cases := []struct {
-		name        string
-		method, req string
-		want        string
+		name string
+		in   string
+		want string
 	}{
-		{"explicit method wins", "PATCH", "GET /x HTTP/1.1", "PATCH"},
-		{"falls back to $request", "", "PROPFIND /dav HTTP/1.1", "PROPFIND"},
-		{"dash method falls back", "-", "GET /x HTTP/1.1", "GET"},
-		{"neither present", "", "", ""},
-		{"lowercase rejected", "get", "", ""},
-		{"binary rejected", "\x16\x03\x01", "", ""},
-		{"digits rejected", "GET2", "", ""},
-		{"overlong rejected", strings.Repeat("A", maxMethodLen+1), "", ""},
-		{"malformed $request without space", "", "GET", ""},
-		{"dashed IANA method accepted", "VERSION-CONTROL", "", "VERSION-CONTROL"},
-		{"leading hyphen rejected", "-GET", "", ""},
-		{"trailing hyphen rejected", "GET-", "", ""},
+		{"bare verb", "PATCH", "PATCH"},
+		{"verb off a request line", "PROPFIND /dav HTTP/1.1", "PROPFIND"},
+		{"nginx placeholder", "-", ""},
+		{"empty", "", ""},
+		{"lowercase rejected", "get", ""},
+		{"binary rejected", "\x16\x03\x01", ""},
+		{"digits rejected", "GET2", ""},
+		{"overlong rejected", strings.Repeat("A", maxMethodLen+1), ""},
+		{"malformed request line without space", "GET", "GET"},
+		{"dashed IANA method accepted", "VERSION-CONTROL", "VERSION-CONTROL"},
+		{"leading hyphen rejected", "-GET", ""},
+		{"trailing hyphen rejected", "GET-", ""},
+		{"binary request line rejected", "\x16\x03\x01 /x HTTP/1.1", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, methodFrom(tc.method, tc.req))
+			assert.Equal(t, tc.want, methodOf(tc.in))
 		})
 	}
 }
@@ -1144,8 +1149,88 @@ func TestLogValue_UnmarshalJSON(t *testing.T) {
 		`"upstream_cache_status":null,"request":"GET /x HTTP/1.1"}`), &e))
 	assert.Equal(t, logValue("200"), e.Status)
 	assert.Equal(t, logValue("0.15"), e.RequestTime)
-	assert.Equal(t, logValue(""), e.UpstreamCacheStatus, "null must decode to empty, not \"null\"")
-	assert.Equal(t, logValue("GET /x HTTP/1.1"), e.Request)
+	// The plain-string fields are the ones nginx cannot emit unquoted; they
+	// keep json/v2's string cache, and null still decodes to empty.
+	assert.Empty(t, e.UpstreamCacheStatus, "null must decode to empty, not \"null\"")
+	assert.Equal(t, "GET /x HTTP/1.1", e.Request)
+}
+
+// Which JSON decode path a line takes is an internal detail — the typed struct
+// when no extra fields are needed, a map otherwise — so both must produce the
+// same ParsedLine. They did not: the typed path carried its own URI logic that
+// counted nginx's "-" placeholder as a real path and ignored formats splitting
+// $uri and $args into separate fields.
+func TestParseJSONLine_DecodePathsAgree(t *testing.T) {
+	cases := []struct {
+		name       string
+		line       string
+		wantURI    string
+		wantRawURI string
+		wantMethod string
+	}{
+		{
+			name:       "request_uri placeholder falls back to $request",
+			line:       `{"status":"404","request_uri":"-","request":"GET /a/b?x=1 HTTP/1.1"}`,
+			wantURI:    "/a/b",
+			wantRawURI: "/a/b?x=1",
+			wantMethod: "GET",
+		},
+		{
+			name:       "split $uri and $args are rejoined",
+			line:       `{"status":"200","uri":"/search","args":"q=1&page=2","request_method":"GET"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search?q=1&page=2",
+			wantMethod: "GET",
+		},
+		{
+			name:       "$uri with $query_string",
+			line:       `{"status":"200","uri":"/search","query_string":"q=1","request_method":"POST"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search?q=1",
+			wantMethod: "POST",
+		},
+		{
+			name:       "empty $args keeps the bare path",
+			line:       `{"status":"200","uri":"/search","args":"-"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search",
+		},
+		{
+			name:       "request_uri wins over $uri",
+			line:       `{"status":"200","request_uri":"/a?x=1","uri":"/b","args":"y=2"}`,
+			wantURI:    "/a",
+			wantRawURI: "/a?x=1",
+		},
+	}
+
+	paths := []struct {
+		name    string
+		extract []string
+	}{
+		{"typed", nil},
+		{"map", []string{"http_user_agent"}}, // any extra field selects the map path
+	}
+
+	for _, tc := range cases {
+		for _, p := range paths {
+			t.Run(tc.name+"/"+p.name, func(t *testing.T) {
+				c := NewLogCollector(embedlog.Logger{}, LogConfig{
+					LogPaths:      []string{"/dev/null"},
+					LogFormat:     DefaultLogFormat,
+					ExtractFields: p.extract,
+				})
+				rec := &recordingObserver{uaIdx: -1}
+				c.AddObserver(rec)
+				c.ParseJSONLine(tc.line)
+
+				require.NotEmpty(t, rec.lines, "observer saw no line")
+				got := rec.lines[0]
+				assert.Equal(t, tc.wantURI, got.uri)
+				assert.Equal(t, tc.wantRawURI, got.rawURI)
+				assert.Equal(t, tc.wantMethod, got.method)
+			})
+		}
+	}
 }
 
 // Operators rename fields freely in JSON formats (`"ts":"$msec"`). Looking up

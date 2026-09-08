@@ -142,7 +142,7 @@ func dashToEmpty(s string) string {
 // multi-byte UTF-8, and encodeBatch aborts on the first marshal error, so one
 // mid-rune cut would drop every event batched alongside it.
 func truncate(s string, n int) string {
-	if n <= 0 || len(s) <= n {
+	if n <= 0 { // no cap configured; TruncateAtRune would read it as "cut to nothing"
 		return s
 	}
 	return topsrv.TruncateAtRune(s, n)

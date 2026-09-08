@@ -400,10 +400,17 @@ type ParsedLine struct {
 }
 
 // Timestamp parses Time into a time.Time. ok is false when the log_format
-// carried no timestamp or the value is unparseable — callers substitute their
-// own clock and should count how often that happens, because a substituted
-// clock silently destroys inter-request timing: think time, request gaps and
-// sequence detection are all computed from this field downstream.
+// carried no timestamp or the value is unparseable, and callers then substitute
+// their own clock — which silently destroys inter-request timing, because think
+// time, request gaps and sequence detection are all computed from this field
+// downstream.
+//
+// The common cause, a format carrying no timestamp at all, is reported once at
+// startup as topsrv_collector_config_warnings_total{kind="botlog_no_time_field"}
+// — it is a static property of the log_format, known before the first request.
+// A per-line failure (garbage value, or one outside the sanity window) carries
+// no separate signal on purpose: this runs on the tail goroutine for every
+// line, and the fix for both is the same edit to the log_format.
 func (p *ParsedLine) Timestamp() (time.Time, bool) { return parseLogTime(p.Time) }
 
 // timeLocalLayout is nginx's $time_local ("18/Aug/2026:11:20:03 +0300").
@@ -478,8 +485,17 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 	// which costs more than the parse itself. Fields() returns the same map
 	// with no copy, so each lookup below is a plain index.
 	fields := entry.Fields()
-	get := func(name string) string { return fields[name] }
 
+	p := c.fillLine(func(name string) string { return fields[name] })
+	c.finishLine(&p, path)
+}
+
+// fillLine assembles a ParsedLine from a field accessor. All three parse paths
+// (text, JSON-into-map, JSON-into-struct) share it: they differ only in how a
+// field is looked up by name, and keeping the assembly in one place is what
+// stops them from drifting — the typed JSON path once carried its own URI
+// resolution and silently disagreed with the other two for a year.
+func (c *LogCollector) fillLine(get func(string) string) ParsedLine {
 	var p ParsedLine
 	p.Status = get("status")
 	p.BodyBytesSent = get("body_bytes_sent")
@@ -494,11 +510,10 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 		if i >= len(p.Extras) {
 			break
 		}
-		p.Extras[i] = fields[f]
+		p.Extras[i] = get(f)
 		p.NExtras = i + 1
 	}
-
-	c.finishLine(&p, path)
+	return p
 }
 
 func (c *LogCollector) ParseJSONLine(line string) {
@@ -506,34 +521,18 @@ func (c *LogCollector) ParseJSONLine(line string) {
 }
 
 func (c *LogCollector) parseJSONLine(line, path string) {
-	// When extra labels are needed, unmarshal into a generic map once
-	// to get both typed fields and arbitrary extra label values.
+	// When extra fields are needed, unmarshal into a generic map once — it is
+	// the only shape that can answer for a field name the struct below has no
+	// tag for. It costs ~18% more wall time and ~60% more garbage per line
+	// (BenchmarkParseJSONLine), which is why the struct path stays for hosts
+	// that need no extra fields.
 	if len(c.extractFields) > 0 {
 		var m map[string]logValue
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			return
 		}
 
-		get := func(name string) string { return string(m[name]) }
-
-		var p ParsedLine
-		p.Status = get("status")
-		p.BodyBytesSent = get("body_bytes_sent")
-		p.RequestTime = get("request_time")
-		p.UpstreamResponseTime = get("upstream_response_time")
-		p.UpstreamCacheStatus = get("upstream_cache_status")
-		p.URI, p.RawURI = resolveURI(get)
-		p.Method = c.resolveMethod(get)
-		p.Time = c.resolveTime(get)
-
-		for i, f := range c.extractFields {
-			if i >= len(p.Extras) {
-				break
-			}
-			p.Extras[i] = get(f)
-			p.NExtras = i + 1
-		}
-
+		p := c.fillLine(func(name string) string { return string(m[name]) })
 		c.finishLine(&p, path)
 		return
 	}
@@ -543,19 +542,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		return
 	}
 
-	requestURI, request := string(entry.RequestURI), string(entry.Request)
-	p := ParsedLine{
-		Status:               string(entry.Status),
-		BodyBytesSent:        string(entry.BodyBytesSent),
-		RequestTime:          string(entry.RequestTime),
-		UpstreamResponseTime: string(entry.UpstreamResponseTime),
-		UpstreamCacheStatus:  string(entry.UpstreamCacheStatus),
-		URI:                  normalizeRequestURI(requestURI, request),
-		RawURI:               rawURIFromJSON(requestURI, request),
-		Method:               methodFrom(string(entry.RequestMethod), request),
-		Time:                 timeFrom(string(entry.Msec), string(entry.TimeISO8601), string(entry.TimeLocal)),
-	}
-
+	p := c.fillLine(entry.field)
 	c.finishLine(&p, path)
 }
 
@@ -598,30 +585,71 @@ func (v *logValue) UnmarshalJSON(b []byte) error {
 }
 
 // jsonLogEntry represents a single JSON-formatted nginx access log line.
+//
+// Only the fields nginx can plausibly emit unquoted are logValue; the rest are
+// plain strings on purpose. json/v2 interns repeated string values across lines
+// through a decoder-level cache, and a type with its own UnmarshalJSON opts out
+// of it — spending logValue where it buys nothing cost 8 extra allocations per
+// line, on values that repeat constantly in an access log (method, host, cache
+// status).
 type jsonLogEntry struct {
 	Status               logValue `json:"status"`
 	BodyBytesSent        logValue `json:"body_bytes_sent"`
 	RequestTime          logValue `json:"request_time"`
 	UpstreamResponseTime logValue `json:"upstream_response_time"`
-	UpstreamCacheStatus  logValue `json:"upstream_cache_status"`
-	RequestURI           logValue `json:"request_uri"`
-	Request              logValue `json:"request"`
-	RequestMethod        logValue `json:"request_method"`
 	Msec                 logValue `json:"msec"`
-	TimeISO8601          logValue `json:"time_iso8601"`
-	TimeLocal            logValue `json:"time_local"`
+
+	UpstreamCacheStatus string `json:"upstream_cache_status"`
+	RequestURI          string `json:"request_uri"`
+	Request             string `json:"request"`
+	URI                 string `json:"uri"`
+	Args                string `json:"args"`
+	QueryString         string `json:"query_string"`
+	RequestMethod       string `json:"request_method"`
+	TimeISO8601         string `json:"time_iso8601"`
+	TimeLocal           string `json:"time_local"`
 }
 
-// normalizeRequestURI normalizes a URI from JSON log fields.
-func normalizeRequestURI(requestURI, request string) string {
-	if requestURI != "" {
-		if i := strings.IndexByte(requestURI, '?'); i >= 0 {
-			requestURI = requestURI[:i]
-		}
-		return normalizePath(requestURI)
-	}
-	if request != "" {
-		return normalizeURI(request)
+// field answers by nginx variable name so the typed decode path can be filled
+// by the same fillLine as the map one. The two carried separate URI logic
+// before, and the typed copy silently lagged: it counted nginx's "-"
+// placeholder as a real path (uri="/-") and knew nothing about formats that log
+// $uri and $args as separate fields. It must answer for every field the struct
+// decodes, or a resolver written against get would work on one path only.
+//
+// Names outside the struct — an operator's renamed key — return "". Those are
+// only reachable through the map path, which every format needing extra fields
+// already takes.
+func (e *jsonLogEntry) field(name string) string {
+	switch name {
+	case "status":
+		return string(e.Status)
+	case "body_bytes_sent":
+		return string(e.BodyBytesSent)
+	case "request_time":
+		return string(e.RequestTime)
+	case "upstream_response_time":
+		return string(e.UpstreamResponseTime)
+	case "msec":
+		return string(e.Msec)
+	case "upstream_cache_status":
+		return e.UpstreamCacheStatus
+	case "request_uri":
+		return e.RequestURI
+	case "request":
+		return e.Request
+	case "uri":
+		return e.URI
+	case "args":
+		return e.Args
+	case "query_string":
+		return e.QueryString
+	case "request_method":
+		return e.RequestMethod
+	case "time_iso8601":
+		return e.TimeISO8601
+	case "time_local":
+		return e.TimeLocal
 	}
 	return ""
 }
@@ -631,17 +659,33 @@ func normalizeRequestURI(requestURI, request string) string {
 // hostile $request grow the receiver's LowCardinality dictionary.
 const maxMethodLen = 16
 
-// methodFrom resolves the request verb from an explicit $request_method,
-// falling back to the first token of $request ("GET /x HTTP/1.1"). Empty when
-// neither is available — callers must NOT substitute a default verb: a guessed
-// GET is indistinguishable from a real one, which hides POST floods against
-// login/checkout in exactly the traffic this data is collected to inspect.
-func methodFrom(requestMethod, request string) string {
-	if v := validMethod(requestMethod); v != "" {
+// MethodCandidates and TimeCandidates are the nginx variables that can carry
+// the request verb and the request timestamp, in resolution order. They are
+// exported because botlog detects which of them an operator's log_format
+// contains: detection and resolution must walk the same names in the same
+// order, or the agent warns about a missing field it then reads happily —
+// or, worse, reports a timestamp of a precision it did not resolve.
+var (
+	MethodCandidates = []string{"request_method", "request"}
+
+	// Ordered by precision: $msec carries milliseconds, $time_iso8601 and
+	// $time_local only whole seconds.
+	TimeCandidates = []string{"msec", "time_iso8601", "time_local"}
+)
+
+// methodOf coerces one logged value into a request verb. The value is either a
+// bare verb ($request_method) or a whole request line ($request, "GET /x
+// HTTP/1.1") — operators log either under either field name, so one function
+// accepts both shapes. Empty when neither applies: callers must NOT substitute
+// a default verb, because a guessed GET is indistinguishable from a real one,
+// which hides POST floods against login/checkout in exactly the traffic this
+// data is collected to inspect.
+func methodOf(s string) string {
+	if v := validMethod(s); v != "" {
 		return v
 	}
-	if i := strings.IndexByte(request, ' '); i > 0 {
-		return validMethod(request[:i])
+	if i := strings.IndexByte(s, ' '); i > 0 {
+		return validMethod(s[:i])
 	}
 	return ""
 }
@@ -668,31 +712,23 @@ func validMethod(s string) string {
 	return s
 }
 
-// timeFrom picks the request timestamp in descending precision: $msec carries
-// milliseconds, $time_iso8601 and $time_local only whole seconds.
-func timeFrom(msec, iso8601, local string) string {
-	for _, v := range [...]string{msec, iso8601, local} {
-		if v != "" && v != "-" {
+// resolveMethod and resolveTime try the operator's resolved field name first
+// (LogConfig.MethodField / TimeField, detected from the log_format), then the
+// canonical candidates in order, stopping at the first hit — a format logging
+// $msec pays one lookup, not three. Both parse paths address fields by name, so
+// the two resolvers are shared between them.
+func (c *LogCollector) resolveMethod(get func(string) string) string {
+	if c.methodField != "" {
+		if v := methodOf(get(c.methodField)); v != "" {
+			return v
+		}
+	}
+	for _, name := range MethodCandidates {
+		if v := methodOf(get(name)); v != "" {
 			return v
 		}
 	}
 	return ""
-}
-
-// resolveMethod and resolveTime try the operator's resolved field name first
-// (LogConfig.MethodField / TimeField, detected from the log_format), then the
-// canonical nginx names. Both parse paths address fields by name, so the two
-// are shared between them.
-func (c *LogCollector) resolveMethod(get func(string) string) string {
-	if c.methodField != "" {
-		// The resolved field is either $request_method (a bare verb) or
-		// $request ("GET /x HTTP/1.1"); methodFrom accepts both shapes, so
-		// pass the one value as both arguments.
-		if v := methodFrom(get(c.methodField), get(c.methodField)); v != "" {
-			return v
-		}
-	}
-	return methodFrom(get("request_method"), get("request"))
 }
 
 func (c *LogCollector) resolveTime(get func(string) string) string {
@@ -701,7 +737,12 @@ func (c *LogCollector) resolveTime(get func(string) string) string {
 			return v
 		}
 	}
-	return timeFrom(get("msec"), get("time_iso8601"), get("time_local"))
+	for _, name := range TimeCandidates {
+		if v := get(name); v != "" && v != "-" {
+			return v
+		}
+	}
+	return ""
 }
 
 // rawURIFromRequest extracts the un-normalized request URI (path + query) from
@@ -712,15 +753,6 @@ func rawURIFromRequest(request string) string {
 		return ""
 	}
 	return parts[1]
-}
-
-// rawURIFromJSON picks request_uri (already carries query string from nginx)
-// and falls back to parsing $request. Querystring is preserved.
-func rawURIFromJSON(requestURI, request string) string {
-	if requestURI != "" {
-		return requestURI
-	}
-	return rawURIFromRequest(request)
 }
 
 func stripQuery(p string) string {

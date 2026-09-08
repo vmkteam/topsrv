@@ -527,12 +527,14 @@ func aliasSources(override, detected botlog.FieldAliases) string {
 			return "default"
 		}
 	}
-	return fmt.Sprintf("ua=%s host=%s server=%s remote=%s referer=%s",
+	return fmt.Sprintf("ua=%s host=%s server=%s remote=%s referer=%s method=%s time=%s",
 		src(override.UserAgent, detected.UserAgent),
 		src(override.Host, detected.Host),
 		src(override.ServerName, detected.ServerName),
 		src(override.RemoteAddr, detected.RemoteAddr),
 		src(override.Referer, detected.Referer),
+		src(override.Method, detected.Method),
+		src(override.Time, detected.Time),
 	)
 }
 

@@ -3,6 +3,8 @@ package nginx
 import (
 	"strings"
 	"testing"
+
+	"github.com/vmkteam/embedlog"
 )
 
 // Representative URI shapes from real traffic: clean paths, UUID/numeric IDs,
@@ -36,6 +38,41 @@ func BenchmarkNormalizePath(b *testing.B) {
 			b.ReportAllocs()
 			for range b.N {
 				_ = normalizePath(tc.path)
+			}
+		})
+	}
+}
+
+// A JSON line in the shape operators actually write: every field the parser
+// reads, quoted, with a query string on the URI.
+const benchJSONLine = `{"status":"200","body_bytes_sent":"1234","request_time":"0.153",` +
+	`"upstream_response_time":"0.150","upstream_cache_status":"HIT",` +
+	`"request_uri":"/catalog/item/12345?utm=x","request_method":"GET",` +
+	`"msec":"1787042366.123","time_iso8601":"2026-08-18T11:20:03+03:00",` +
+	`"host":"example.com","http_user_agent":"Mozilla/5.0 (compatible; GPTBot/1.0)"}`
+
+// parseJSONLine has two decode paths and picks between them by config, so the
+// cost difference is what justifies keeping both: "typed" runs when no extra
+// fields are configured, "map" as soon as ExtraLabels or BotLogs need one.
+// Keep this benchmark honest — the comment in parseJSONLine cites it.
+func BenchmarkParseJSONLine(b *testing.B) {
+	cases := []struct {
+		name   string
+		fields []string
+	}{
+		{"typed", nil},
+		{"map", []string{"host", "http_user_agent"}},
+	}
+	for _, tc := range cases {
+		b.Run(tc.name, func(b *testing.B) {
+			c := NewLogCollector(embedlog.Logger{}, LogConfig{
+				LogPaths:      []string{"/dev/null"},
+				LogFormat:     DefaultLogFormat,
+				ExtractFields: tc.fields,
+			})
+			b.ReportAllocs()
+			for range b.N {
+				c.ParseJSONLine(benchJSONLine)
 			}
 		})
 	}

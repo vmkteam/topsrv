@@ -97,7 +97,7 @@ func indexOrSkip(extractFields []string, name string) int {
 // OnLogLine satisfies nginx.LogObserver. Matches the UA first to skip Fields
 // construction on the ~90% non-bot traffic — the hot path is one Extras read
 // and one substring scan when no bot is seen.
-func (o *Observer) OnLogLine(p *nginx.ParsedLine, path string) {
+func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 	ua := o.field(p, o.idxUA)
 	if ua == "" {
 		return
