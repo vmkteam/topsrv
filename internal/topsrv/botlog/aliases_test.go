@@ -155,13 +155,82 @@ func TestDetectAliases_EmptyFormatGivesEmpty(t *testing.T) {
 
 func TestFieldAliases_String(t *testing.T) {
 	// Startup log relies on this exact shape — dashboards or oncall grep for
-	// the "ua=… host=… server=… remote=… referer=…" tokens.
-	full := FieldAliases{UserAgent: "ua", Host: "h", ServerName: "sn", RemoteAddr: "ip", Referer: "ref"}
-	assert.Equal(t, "ua=ua host=h server=sn remote=ip referer=ref", full.String())
+	// the "ua=… host=… server=… remote=… referer=… method=… time=…" tokens.
+	full := FieldAliases{
+		UserAgent: "ua", Host: "h", ServerName: "sn", RemoteAddr: "ip", Referer: "ref",
+		Method: "m", Time: "ts",
+	}
+	assert.Equal(t, "ua=ua host=h server=sn remote=ip referer=ref method=m time=ts", full.String())
 
-	assert.Equal(t, "ua=- host=- server=- remote=- referer=-",
+	assert.Equal(t, "ua=- host=- server=- remote=- referer=- method=- time=-",
 		FieldAliases{}.String(), "empty fields render as -")
 
 	partial := FieldAliases{UserAgent: "http_user_agent", Referer: "http_referer"}
-	assert.Equal(t, "ua=http_user_agent host=- server=- remote=- referer=http_referer", partial.String())
+	assert.Equal(t, "ua=http_user_agent host=- server=- remote=- referer=http_referer method=- time=-", partial.String())
+}
+
+// Method and Time are resolved the same way as the other five, because the
+// question is the same: operators rename these freely in JSON formats, and
+// looking up only the canonical name made a renamed $msec read as "this host
+// logs no timestamp at all".
+func TestDetectAliases_MethodAndTime(t *testing.T) {
+	cases := []struct {
+		name       string
+		format     string
+		isJSON     bool
+		wantMethod string
+		wantTime   string
+	}{
+		{
+			name:       "combined: verb off $request, time off $time_local",
+			format:     `$remote_addr - - [$time_local] "$request" $status $body_bytes_sent`,
+			wantMethod: "request",
+			wantTime:   "time_local",
+		},
+		{
+			name:       "explicit $request_method and $msec win",
+			format:     `$msec $time_local "$request_method" "$request" $status`,
+			wantMethod: "request_method",
+			wantTime:   "msec",
+		},
+		{
+			name:       "JSON with renamed keys",
+			format:     `{"ts":"$msec","m":"$request_method","u":"$request_uri"}`,
+			isJSON:     true,
+			wantMethod: "m",
+			wantTime:   "ts",
+		},
+		{
+			name:       "JSON carrying only $request",
+			format:     `{"when":"$time_iso8601","req":"$request"}`,
+			isJSON:     true,
+			wantMethod: "req",
+			wantTime:   "when",
+		},
+		{
+			// $request_time and $request_uri must not be mistaken for $request:
+			// textVarRe is word-boundaried.
+			name:       "no verb, no timestamp",
+			format:     `"$request_uri" $status $request_time`,
+			wantMethod: "",
+			wantTime:   "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := DetectAliases(tc.format, tc.isJSON)
+			assert.Equal(t, tc.wantMethod, got.Method, "method")
+			assert.Equal(t, tc.wantTime, got.Time, "time")
+		})
+	}
+}
+
+// Names() feeds ExtractFields, which is capped at nginx.MaxExtras. Method and
+// Time live in typed ParsedLine fields, so they must not consume a slot.
+func TestFieldAliases_NamesExcludesMethodAndTime(t *testing.T) {
+	a := DefaultAliases()
+	a.Method, a.Time = "request_method", "msec"
+	assert.NotContains(t, a.Names(), "request_method")
+	assert.NotContains(t, a.Names(), "msec")
+	assert.Len(t, a.Names(), 5)
 }

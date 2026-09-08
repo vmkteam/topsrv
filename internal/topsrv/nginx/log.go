@@ -1,14 +1,17 @@
 package nginx
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/v2"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
@@ -84,6 +87,8 @@ type LogCollector struct {
 	parsers       map[string]*gonx.Parser // path → parser (for multi-format)
 	jsonPaths     map[string]bool         // path → true if log is JSON format
 	extractFields []string                // nginx vars read into ParsedLine.Extras (superset of labelFields)
+	methodField   string                  // resolved name of the request-verb field ("" → canonical names only)
+	timeField     string                  // resolved name of the request-time field ("" → canonical names only)
 	labelFields   []string                // nginx vars used as Prometheus labels (must be low-cardinality)
 	labelIdx      []int                   // labelFields[k] is at Extras[labelIdx[k]]; -1 if missing
 	logPaths      []string                // captured from LogConfig.LogPaths for Run
@@ -156,6 +161,15 @@ type LogConfig struct {
 	// without paying Prometheus cardinality cost. Empty → defaults to
 	// ExtraLabels (single-purpose behaviour).
 	ExtractFields []string
+
+	// MethodField and TimeField name the field carrying the request verb and
+	// the request timestamp: the nginx variable for text formats, the JSON key
+	// for JSON ones. Operators rename these freely (`"ts":"$msec"`), and the
+	// canonical names are only a fallback — looking them up unconditionally is
+	// what made a renamed $msec read as "no timestamp at all". Empty → the
+	// canonical candidates below are the only ones tried.
+	MethodField string
+	TimeField   string
 }
 
 func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
@@ -197,6 +211,8 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		parsers:       parsers,
 		jsonPaths:     cfg.JSONPaths,
 		extractFields: extractFields,
+		methodField:   cfg.MethodField,
+		timeField:     cfg.TimeField,
 		labelFields:   cfg.ExtraLabels,
 		labelIdx:      labelIdx,
 		logPaths:      cfg.LogPaths,
@@ -368,8 +384,85 @@ type ParsedLine struct {
 	RequestTime          string
 	UpstreamResponseTime string
 	UpstreamCacheStatus  string
-	Extras               [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
-	NExtras              int
+
+	// Method is the request verb, "" when the log_format carries neither
+	// $request_method nor $request. Typed field rather than an Extras slot:
+	// MaxExtras is a hard budget shared with operator ExtraLabels, and the
+	// verb is needed by every observer, not just the ones extras serve.
+	Method string
+	// Time is the raw request timestamp as logged ($msec / $time_iso8601 /
+	// $time_local), "" when the format carries none. Kept unparsed here —
+	// only observers that need it pay for the parse (see Timestamp).
+	Time string
+
+	Extras  [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
+	NExtras int
+}
+
+// Timestamp parses Time into a time.Time. ok is false when the log_format
+// carried no timestamp or the value is unparseable — callers substitute their
+// own clock and should count how often that happens, because a substituted
+// clock silently destroys inter-request timing: think time, request gaps and
+// sequence detection are all computed from this field downstream.
+func (p *ParsedLine) Timestamp() (time.Time, bool) { return parseLogTime(p.Time) }
+
+// timeLocalLayout is nginx's $time_local ("18/Aug/2026:11:20:03 +0300").
+const timeLocalLayout = "02/Jan/2006:15:04:05 -0700"
+
+// minLogTime / maxLogSkew bound an accepted timestamp. A "0.000" from a broken
+// format would otherwise land events in 1970 and pass any freshness window,
+// and the other end is just as reachable: gonx matches fields positionally, so
+// a log_format that drifted out of sync with the parser puts an arbitrary — in
+// the limit client-controlled — token in the timestamp field. Unbounded, that
+// writes a year-292277026 event and opens a partition that far out downstream.
+var minLogTime = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+const maxLogSkew = 24 * time.Hour
+
+// maxEpochSec is a pre-conversion guard: int64() of a float too large to
+// represent is undefined in Go, so the epoch is range-checked before the
+// multiply, not only after. Far past any date minLogTime/maxLogSkew allow.
+const maxEpochSec = 1e12
+
+// parseLogTime decodes one of the three timestamp shapes nginx produces and
+// rejects anything outside the sanity window above.
+func parseLogTime(s string) (time.Time, bool) {
+	t, ok := decodeLogTime(s)
+	if !ok || t.Before(minLogTime) || t.After(time.Now().Add(maxLogSkew)) {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// decodeLogTime picks the shape by a marker byte instead of trying each parser
+// in turn: every failed strconv/time parse allocates an error value that the
+// fallthrough would immediately discard, which on a $time_local-only format
+// made the "cheapest first" ordering the most expensive one.
+func decodeLogTime(s string) (time.Time, bool) {
+	if s == "" || s == "-" {
+		return time.Time{}, false
+	}
+	// $time_local ("18/Aug/2026:11:20:03 +0300") is the only shape carrying a
+	// '/', and $time_iso8601 the only one with a '-' past the first byte — a
+	// leading '-' is a negative epoch, which ParseFloat below rejects.
+	if strings.IndexByte(s, '/') > 0 {
+		t, err := time.Parse(timeLocalLayout, s)
+		return t, err == nil
+	}
+	if strings.IndexByte(s, '-') > 0 {
+		t, err := time.Parse(time.RFC3339, s)
+		return t, err == nil
+	}
+	if sec, err := strconv.ParseFloat(s, 64); err == nil {
+		// ParseFloat also accepts "NaN", "Inf", "infinity" and hex floats
+		// ("0x1p10"), none of which are timestamps. NaN is the sharp one: it
+		// fails every comparison, so a bare `sec <= 0` lets it through.
+		if math.IsNaN(sec) || sec <= 0 || sec > maxEpochSec {
+			return time.Time{}, false
+		}
+		return time.UnixMilli(int64(sec * 1e3)).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
@@ -378,23 +471,30 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 		return
 	}
 
-	var p ParsedLine
-	p.Status, _ = entry.Field("status")
-	p.BodyBytesSent, _ = entry.Field("body_bytes_sent")
-	p.RequestTime, _ = entry.Field("request_time")
-	p.UpstreamResponseTime, _ = entry.Field("upstream_response_time")
-	p.UpstreamCacheStatus, _ = entry.Field("upstream_cache_status")
+	// Read the field map once instead of calling entry.Field per name: on a
+	// miss gonx builds an error with fmt.Errorf("%+v", *entry), formatting the
+	// entire record into a string that the `_` here throws away. A format
+	// without $request_method/$msec/$time_iso8601 misses three times per line,
+	// which costs more than the parse itself. Fields() returns the same map
+	// with no copy, so each lookup below is a plain index.
+	fields := entry.Fields()
+	get := func(name string) string { return fields[name] }
 
-	p.URI, p.RawURI = resolveURI(func(name string) string {
-		v, _ := entry.Field(name)
-		return v
-	})
+	var p ParsedLine
+	p.Status = get("status")
+	p.BodyBytesSent = get("body_bytes_sent")
+	p.RequestTime = get("request_time")
+	p.UpstreamResponseTime = get("upstream_response_time")
+	p.UpstreamCacheStatus = get("upstream_cache_status")
+	p.URI, p.RawURI = resolveURI(get)
+	p.Method = c.resolveMethod(get)
+	p.Time = c.resolveTime(get)
 
 	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
 			break
 		}
-		p.Extras[i], _ = entry.Field(f)
+		p.Extras[i] = fields[f]
 		p.NExtras = i + 1
 	}
 
@@ -409,24 +509,28 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 	// When extra labels are needed, unmarshal into a generic map once
 	// to get both typed fields and arbitrary extra label values.
 	if len(c.extractFields) > 0 {
-		var m map[string]string
+		var m map[string]logValue
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			return
 		}
 
+		get := func(name string) string { return string(m[name]) }
+
 		var p ParsedLine
-		p.Status = m["status"]
-		p.BodyBytesSent = m["body_bytes_sent"]
-		p.RequestTime = m["request_time"]
-		p.UpstreamResponseTime = m["upstream_response_time"]
-		p.UpstreamCacheStatus = m["upstream_cache_status"]
-		p.URI, p.RawURI = resolveURI(func(name string) string { return m[name] })
+		p.Status = get("status")
+		p.BodyBytesSent = get("body_bytes_sent")
+		p.RequestTime = get("request_time")
+		p.UpstreamResponseTime = get("upstream_response_time")
+		p.UpstreamCacheStatus = get("upstream_cache_status")
+		p.URI, p.RawURI = resolveURI(get)
+		p.Method = c.resolveMethod(get)
+		p.Time = c.resolveTime(get)
 
 		for i, f := range c.extractFields {
 			if i >= len(p.Extras) {
 				break
 			}
-			p.Extras[i] = m[f]
+			p.Extras[i] = get(f)
 			p.NExtras = i + 1
 		}
 
@@ -439,14 +543,17 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		return
 	}
 
+	requestURI, request := string(entry.RequestURI), string(entry.Request)
 	p := ParsedLine{
-		Status:               entry.Status,
-		BodyBytesSent:        entry.BodyBytesSent,
-		RequestTime:          entry.RequestTime,
-		UpstreamResponseTime: entry.UpstreamResponseTime,
-		UpstreamCacheStatus:  entry.UpstreamCacheStatus,
-		URI:                  normalizeRequestURI(entry.RequestURI, entry.Request),
-		RawURI:               rawURIFromJSON(entry.RequestURI, entry.Request),
+		Status:               string(entry.Status),
+		BodyBytesSent:        string(entry.BodyBytesSent),
+		RequestTime:          string(entry.RequestTime),
+		UpstreamResponseTime: string(entry.UpstreamResponseTime),
+		UpstreamCacheStatus:  string(entry.UpstreamCacheStatus),
+		URI:                  normalizeRequestURI(requestURI, request),
+		RawURI:               rawURIFromJSON(requestURI, request),
+		Method:               methodFrom(string(entry.RequestMethod), request),
+		Time:                 timeFrom(string(entry.Msec), string(entry.TimeISO8601), string(entry.TimeLocal)),
 	}
 
 	c.finishLine(&p, path)
@@ -462,15 +569,47 @@ func (c *LogCollector) finishLine(p *ParsedLine, path string) {
 	}
 }
 
+// logValue is a log field that accepts both JSON shapes operators write. An
+// nginx JSON log_format is a hand-written template, and numeric-looking
+// variables are routinely emitted unquoted ('"msec":$msec', '"status":$status').
+// A plain string field rejects those, and since a decode error drops the whole
+// line, a single unquoted field costs the host every nginx metric and every
+// bot-log event — silently, with nothing but the missing series to go on.
+type logValue string
+
+func (v *logValue) UnmarshalJSON(b []byte) error {
+	if len(b) >= 2 && b[0] == '"' {
+		// Fast path: an nginx log value with no escape sequence is the norm
+		// (escape=json emits \xNN only for control bytes), and unquoting it is
+		// a reslice. Handing every field to the decoder instead roughly
+		// doubles decode cost on the tail goroutine's hot path.
+		if body := b[1 : len(b)-1]; bytes.IndexByte(body, '\\') < 0 {
+			*v = logValue(body)
+			return nil
+		}
+		return json.Unmarshal(b, (*string)(v))
+	}
+	if string(b) == "null" {
+		*v = ""
+		return nil
+	}
+	*v = logValue(b) // number or bool literal — kept verbatim, as if quoted
+	return nil
+}
+
 // jsonLogEntry represents a single JSON-formatted nginx access log line.
 type jsonLogEntry struct {
-	Status               string `json:"status"`
-	BodyBytesSent        string `json:"body_bytes_sent"`
-	RequestTime          string `json:"request_time"`
-	UpstreamResponseTime string `json:"upstream_response_time"`
-	UpstreamCacheStatus  string `json:"upstream_cache_status"`
-	RequestURI           string `json:"request_uri"`
-	Request              string `json:"request"`
+	Status               logValue `json:"status"`
+	BodyBytesSent        logValue `json:"body_bytes_sent"`
+	RequestTime          logValue `json:"request_time"`
+	UpstreamResponseTime logValue `json:"upstream_response_time"`
+	UpstreamCacheStatus  logValue `json:"upstream_cache_status"`
+	RequestURI           logValue `json:"request_uri"`
+	Request              logValue `json:"request"`
+	RequestMethod        logValue `json:"request_method"`
+	Msec                 logValue `json:"msec"`
+	TimeISO8601          logValue `json:"time_iso8601"`
+	TimeLocal            logValue `json:"time_local"`
 }
 
 // normalizeRequestURI normalizes a URI from JSON log fields.
@@ -485,6 +624,84 @@ func normalizeRequestURI(requestURI, request string) string {
 		return normalizeURI(request)
 	}
 	return ""
+}
+
+// maxMethodLen caps an accepted verb. Longest IANA-registered method is
+// "VERSION-CONTROL" (15); 16 leaves one char of headroom without letting a
+// hostile $request grow the receiver's LowCardinality dictionary.
+const maxMethodLen = 16
+
+// methodFrom resolves the request verb from an explicit $request_method,
+// falling back to the first token of $request ("GET /x HTTP/1.1"). Empty when
+// neither is available — callers must NOT substitute a default verb: a guessed
+// GET is indistinguishable from a real one, which hides POST floods against
+// login/checkout in exactly the traffic this data is collected to inspect.
+func methodFrom(requestMethod, request string) string {
+	if v := validMethod(requestMethod); v != "" {
+		return v
+	}
+	if i := strings.IndexByte(request, ' '); i > 0 {
+		return validMethod(request[:i])
+	}
+	return ""
+}
+
+// validMethod accepts uppercase ASCII tokens of a sane length, allowing the
+// interior hyphen the two dashed IANA methods carry (VERSION-CONTROL,
+// BASELINE-CONTROL). $request is verbatim client input: without this, a
+// scanner sending binary or randomized verbs writes unbounded distinct values
+// into a downstream LowCardinality column (same class of bug as the
+// normalizeURI binary bypass). A leading or trailing hyphen is rejected, which
+// also covers nginx's "-" placeholder for an absent value.
+func validMethod(s string) string {
+	if s == "" || len(s) > maxMethodLen {
+		return ""
+	}
+	for i := range len(s) {
+		switch c := s[i]; {
+		case c >= 'A' && c <= 'Z':
+		case c == '-' && i > 0 && i < len(s)-1:
+		default:
+			return ""
+		}
+	}
+	return s
+}
+
+// timeFrom picks the request timestamp in descending precision: $msec carries
+// milliseconds, $time_iso8601 and $time_local only whole seconds.
+func timeFrom(msec, iso8601, local string) string {
+	for _, v := range [...]string{msec, iso8601, local} {
+		if v != "" && v != "-" {
+			return v
+		}
+	}
+	return ""
+}
+
+// resolveMethod and resolveTime try the operator's resolved field name first
+// (LogConfig.MethodField / TimeField, detected from the log_format), then the
+// canonical nginx names. Both parse paths address fields by name, so the two
+// are shared between them.
+func (c *LogCollector) resolveMethod(get func(string) string) string {
+	if c.methodField != "" {
+		// The resolved field is either $request_method (a bare verb) or
+		// $request ("GET /x HTTP/1.1"); methodFrom accepts both shapes, so
+		// pass the one value as both arguments.
+		if v := methodFrom(get(c.methodField), get(c.methodField)); v != "" {
+			return v
+		}
+	}
+	return methodFrom(get("request_method"), get("request"))
+}
+
+func (c *LogCollector) resolveTime(get func(string) string) string {
+	if c.timeField != "" {
+		if v := get(c.timeField); v != "" && v != "-" {
+			return v
+		}
+	}
+	return timeFrom(get("msec"), get("time_iso8601"), get("time_local"))
 }
 
 // rawURIFromRequest extracts the un-normalized request URI (path + query) from
@@ -719,28 +936,12 @@ func normalizePath(path string) string {
 	// Hard byte cap: even after all the above, a single segment can carry
 	// 256+ bytes (long transliterated slugs, concatenated normalized markers).
 	// Prometheus rejects label values >256 bytes, so trim with restMarker
-	// as a final guard. truncateAtRune walks back to a rune boundary so a
+	// as a final guard. TruncateAtRune walks back to a rune boundary so a
 	// multi-byte UTF-8 tail (Cyrillic, CJK) is never cut mid-rune.
 	if len(out) > maxNormalizedURIBytes {
-		return truncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
+		return topsrv.TruncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
 	}
 	return out
-}
-
-// truncateAtRune returns s[:n] adjusted backwards to a UTF-8 rune boundary.
-// Guarantees the result is valid UTF-8 when s is. Used to avoid emitting
-// label values with truncated multi-byte sequences.
-func truncateAtRune(s string, n int) string {
-	if n >= len(s) {
-		return s
-	}
-	if n < 0 {
-		return ""
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }
 
 // truncatePath collapses path segments beyond maxDepth into restMarker.

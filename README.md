@@ -402,7 +402,23 @@ timing histograms are simply skipped per-line for those. Installs without
 `[BotLogs]` keep the original behavior.
 
 **Required log_format variables**: `$http_user_agent`, `$host` /
-`$server_name`, `$remote_addr`, `$http_referer`. Field names are
+`$server_name`, `$remote_addr`, `$http_referer`.
+
+**Strongly recommended**: `$msec` (or `$time_iso8601` / `$time_local`) and
+`$request_method`. Without a timestamp the agent stamps events with its own
+clock at parse time — which diverges from the request time by the tail lag and,
+after a restart or a spool drain, by the whole backlog. Every timing-derived
+question (gap between requests, think time, request sequences) then has no
+usable answer. Without a verb, events ship with `method` empty and POST floods
+against login/checkout become indistinguishable from ordinary reads. Both are
+read from the standard combined format too: the verb off `$request`, the time
+off `$time_local` — but at whole-second precision, which is too coarse for
+inter-request timing. Both are auto-detected like the fields below, so JSON
+formats that rename them (`"ts":"$msec"`) work as-is. If a tailed format
+carries neither, the agent warns once at startup and ticks
+`topsrv_collector_config_warnings_total{kind="botlog_no_time_field"}` /
+`{kind="botlog_no_method_field"}`; the fix is in the log_format, not the agent.
+Field names are
 auto-detected from each tailed `log_format` — common alternates work
 out of the box (`http_host`, `realip_remote_addr`, `http_x_real_ip`,
 `http_x_forwarded_for`, `http_referrer` typo, custom JSON keys). The

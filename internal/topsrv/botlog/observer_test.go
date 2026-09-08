@@ -317,3 +317,37 @@ func TestObserver_HostMissingShipsEmpty(t *testing.T) {
 	assert.Empty(t, ev.Host)
 	assert.Equal(t, "vhost_cfg", ev.ServerName)
 }
+
+// The event must carry the request time from the log line, not the moment the
+// agent happened to read it. The two diverge by the tail lag and, after a
+// restart or a spool drain, by the whole backlog — every gap/think-time/
+// sequence feature computed downstream is wrong if the agent clock leaks in.
+func TestObserver_UsesRequestTimeNotAgentClock(t *testing.T) {
+	o, p := newObserverPair(t)
+	pl := botParsedLine("GPTBot/1.0", "example.com", "vhost", "203.0.113.5", "-")
+	pl.Method = "POST"
+	pl.Time = "1787042366.123"
+
+	o.OnLogLine(pl, "")
+
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.True(t, time.UnixMilli(1787042366123).UTC().Equal(ev.TS), "got %v", ev.TS)
+	assert.Equal(t, "POST", ev.Method)
+}
+
+// A log_format carrying neither timestamp nor verb still ships events: the
+// agent clock stands in for the request time and the verb ships empty. The
+// operator is warned about such a format once at startup, not from the parse
+// path — see TestRegisterLogCollector_WarnsOnMissingTimeAndMethod.
+func TestObserver_FallsBackToAgentClockAndEmptyMethod(t *testing.T) {
+	o, p := newObserverPair(t)
+	before := time.Now()
+
+	o.OnLogLine(botParsedLine("GPTBot/1.0", "example.com", "vhost", "203.0.113.5", "-"), "/var/log/nginx/access.log")
+
+	require.Len(t, p.queue, 1)
+	ev := <-p.queue
+	assert.False(t, ev.TS.Before(before), "fell back to the agent clock")
+	assert.Empty(t, ev.Method, "verb must ship empty, never a guessed GET")
+}

@@ -19,6 +19,15 @@ type FieldAliases struct {
 	ServerName string
 	RemoteAddr string
 	Referer    string
+
+	// Method and Time do not travel through ParsedLine.Extras like the five
+	// above — they land in typed ParsedLine fields, so they are excluded from
+	// Names() and passed to the parser via LogConfig instead. They are still
+	// resolved here because the question is identical: which name does this
+	// operator's format use? Unlike the others they have no DefaultAliases
+	// entry, so "" means "the format carries none" and the caller can warn.
+	Method string
+	Time   string
 }
 
 // DefaultAliases returns the canonical nginx variable names — used as the
@@ -55,12 +64,20 @@ func (a FieldAliases) WithFallback(fallback FieldAliases) FieldAliases {
 	if out.Referer == "" {
 		out.Referer = fallback.Referer
 	}
+	if out.Method == "" {
+		out.Method = fallback.Method
+	}
+	if out.Time == "" {
+		out.Time = fallback.Time
+	}
 	return out
 }
 
 // Names returns the resolved field names in a stable order, dropping empty
 // entries — suitable for merging into LogConfig.ExtractFields so the parser
-// knows which nginx variables to copy into ParsedLine.Extras.
+// knows which nginx variables to copy into ParsedLine.Extras. Method and Time
+// are deliberately absent: they occupy typed ParsedLine fields, and spending
+// two of the eight Extras slots on them would crowd out operator ExtraLabels.
 func (a FieldAliases) Names() []string {
 	out := []string{a.UserAgent, a.Host, a.ServerName, a.RemoteAddr, a.Referer}
 	return slices.DeleteFunc(out, func(s string) bool { return s == "" })
@@ -74,6 +91,13 @@ var (
 	serverCandidates  = []string{"server_name"}
 	remoteCandidates  = []string{"remote_addr", "realip_remote_addr", "http_x_real_ip", "http_x_forwarded_for"}
 	refererCandidates = []string{"http_referer", "http_referrer", "referer"}
+	// $request ("GET /x HTTP/1.1") carries the verb as its first token, so a
+	// format logging it needs no $request_method. textVarRe is word-boundaried,
+	// so "request" matches neither $request_time nor $request_uri.
+	methodCandidates = []string{"request_method", "request"}
+	// Ordered by precision: $msec carries milliseconds, the other two only
+	// whole seconds. First match wins, so a format logging both yields $msec.
+	timeCandidates = []string{"msec", "time_iso8601", "time_local"}
 )
 
 // DetectAliases inspects an nginx log_format string and returns the resolved
@@ -85,21 +109,18 @@ var (
 // is the nginx variable name without the '$' prefix. For JSON formats, the
 // result is the JSON key wrapping the variable in the format string.
 func DetectAliases(format string, isJSON bool) FieldAliases {
+	detect := detectTextVar
 	if isJSON {
-		return FieldAliases{
-			UserAgent:  detectJSONKey(format, uaCandidates),
-			Host:       detectJSONKey(format, hostCandidates),
-			ServerName: detectJSONKey(format, serverCandidates),
-			RemoteAddr: detectJSONKey(format, remoteCandidates),
-			Referer:    detectJSONKey(format, refererCandidates),
-		}
+		detect = detectJSONKey
 	}
 	return FieldAliases{
-		UserAgent:  detectTextVar(format, uaCandidates),
-		Host:       detectTextVar(format, hostCandidates),
-		ServerName: detectTextVar(format, serverCandidates),
-		RemoteAddr: detectTextVar(format, remoteCandidates),
-		Referer:    detectTextVar(format, refererCandidates),
+		UserAgent:  detect(format, uaCandidates),
+		Host:       detect(format, hostCandidates),
+		ServerName: detect(format, serverCandidates),
+		RemoteAddr: detect(format, remoteCandidates),
+		Referer:    detect(format, refererCandidates),
+		Method:     detect(format, methodCandidates),
+		Time:       detect(format, timeCandidates),
 	}
 }
 
@@ -171,6 +192,10 @@ func (a FieldAliases) String() string {
 	sb.WriteString(orDash(a.RemoteAddr))
 	sb.WriteString(" referer=")
 	sb.WriteString(orDash(a.Referer))
+	sb.WriteString(" method=")
+	sb.WriteString(orDash(a.Method))
+	sb.WriteString(" time=")
+	sb.WriteString(orDash(a.Time))
 	return sb.String()
 }
 

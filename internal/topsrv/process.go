@@ -5,7 +5,6 @@ import (
 	"context"
 	"slices"
 	"strings"
-	"unicode/utf8"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shirou/gopsutil/v4/process"
@@ -148,15 +147,7 @@ func sanitizeProcessName(name string) string {
 	if i := strings.Index(name, " -"); i > 0 {
 		name = name[:i]
 	}
-	name = strings.TrimSpace(name)
-	if len(name) > maxProcessNameLen {
-		cut := maxProcessNameLen
-		for cut > 0 && !utf8.RuneStart(name[cut]) {
-			cut--
-		}
-		name = name[:cut]
-	}
-	return name
+	return TruncateAtRune(strings.TrimSpace(name), maxProcessNameLen)
 }
 
 // isKernelThread returns true for Linux kernel thread names that are not useful for monitoring.

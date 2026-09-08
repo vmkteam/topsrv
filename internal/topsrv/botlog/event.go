@@ -4,6 +4,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/vmkteam/topsrv/internal/topsrv"
 )
 
 // Event is one bot-log entry shipped to the topsrv.io ingest endpoint. JSON
@@ -135,9 +137,13 @@ func dashToEmpty(s string) string {
 	return s
 }
 
+// truncate caps s at n bytes, n <= 0 meaning "no cap". The cut lands on a rune
+// boundary: UA, URI and Host are all client-controlled and routinely carry
+// multi-byte UTF-8, and encodeBatch aborts on the first marshal error, so one
+// mid-rune cut would drop every event batched alongside it.
 func truncate(s string, n int) string {
 	if n <= 0 || len(s) <= n {
 		return s
 	}
-	return s[:n]
+	return topsrv.TruncateAtRune(s, n)
 }
