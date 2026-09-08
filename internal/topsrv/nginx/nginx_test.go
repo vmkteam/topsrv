@@ -118,16 +118,18 @@ type recordingObserver struct {
 }
 
 type recordedLine struct {
-	status     string
-	uri        string
-	rawURI     string
-	ua         string
-	path       string
-	method     string
-	rawTime    string
-	platform   string
-	appVersion string
-	visitorID  string
+	status         string
+	uri            string
+	rawURI         string
+	ua             string
+	path           string
+	method         string
+	rawTime        string
+	platform       string
+	appVersion     string
+	visitorID      string
+	requestID      string
+	upstreamStatus string
 }
 
 // timestamp mirrors ParsedLine.Timestamp on the recorded copy — the observer
@@ -136,15 +138,17 @@ func (r recordedLine) timestamp() (time.Time, bool) { return parseLogTime(r.rawT
 
 func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
 	rl := recordedLine{
-		status:     p.Status,
-		uri:        p.URI,
-		rawURI:     p.RawURI,
-		path:       path,
-		method:     p.Method,
-		platform:   p.Platform,
-		appVersion: p.AppVersion,
-		visitorID:  p.VisitorID,
-		rawTime:    p.Time,
+		status:         p.Status,
+		uri:            p.URI,
+		rawURI:         p.RawURI,
+		path:           path,
+		method:         p.Method,
+		platform:       p.Platform,
+		appVersion:     p.AppVersion,
+		visitorID:      p.VisitorID,
+		requestID:      p.RequestID,
+		upstreamStatus: p.UpstreamStatus,
+		rawTime:        p.Time,
 	}
 	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
 		rl.ua = p.Extras[r.uaIdx]
@@ -1338,20 +1342,27 @@ func TestParsedLine_ResolvedFieldNamesText(t *testing.T) {
 	assert.True(t, time.Date(2026, 8, 18, 11, 20, 3, 0, time.FixedZone("", 3*60*60)).Equal(ts))
 }
 
-// Client fields ride the same three parse paths as Method and Time. The typed
-// JSON struct is the one that historically drifted from the other two, so all
-// three are asserted here rather than only the text path.
-func TestParsedLine_ClientFields(t *testing.T) {
+// The typed fields — client identity plus request tracing — ride the same three
+// parse paths as Method and Time. The typed JSON struct is the one that
+// historically drifted from the other two, so all three are asserted here
+// rather than only the text path.
+func TestParsedLine_TypedFields(t *testing.T) {
 	// A logfmt-style production format, trimmed to what matters here.
 	const logfmtFormat = `time="$time_iso8601" clientIp="$remote_addr" httpMethod="$request_method" ` +
 		`uriPath="$uri" httpStatus=$status bodyBytesSent=$body_bytes_sent requestTime=$request_time ` +
 		`platform="$http_platform" version="$http_version" nginxUserId="$uid_got"`
+
+	// The same format with the tracing pair appended — a separate constant
+	// because gonx matches positionally, so widening the shared one would
+	// invalidate every line the other cases feed.
+	const logfmtTracingFormat = logfmtFormat + ` xRequestId="$request_id" upstreamStatus="$upstream_status"`
 
 	cases := []struct {
 		name                                string
 		setup                               func(c *LogCollector)
 		feed                                func(c *LogCollector)
 		wantPlatform, wantVersion, wantUser string
+		wantRequestID, wantUpstreamStatus   string
 	}{
 		{
 			name:  "text: mobile app fills all three",
@@ -1418,6 +1429,40 @@ func TestParsedLine_ClientFields(t *testing.T) {
 			name: "format without client fields leaves them empty",
 			feed: func(c *LogCollector) { c.parseLine(defaultCombinedLine) },
 		},
+		{
+			// Tracing pair on the text path: $request_id is what joins the
+			// event to the backend's own logs, $upstream_status is what the
+			// backend answered as opposed to what the client got.
+			name:  "text path reads request id and upstream status",
+			setup: func(c *LogCollector) { c.defaultParser = gonx.NewParser(logfmtTracingFormat) },
+			feed: func(c *LogCollector) {
+				c.parseLine(`time="2026-09-08T20:00:00+03:00" clientIp="203.0.113.7" httpMethod="GET" ` +
+					`uriPath="/v3/rpc/" httpStatus=200 bodyBytesSent=512 requestTime=0.031 ` +
+					`platform="iOS" version="237116" nginxUserId="msid=2299D55F" ` +
+					`xRequestId="1a7ccaf3ab908eccad1912d7badcc7ac" upstreamStatus="502"`)
+			},
+			wantPlatform: "iOS", wantVersion: "237116", wantUser: "msid=2299D55F",
+			wantRequestID: "1a7ccaf3ab908eccad1912d7badcc7ac", wantUpstreamStatus: "502",
+		},
+		{
+			name:  "JSON map path reads the tracing pair too",
+			setup: func(c *LogCollector) { c.extractFields = []string{"http_user_agent"} },
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","request_uri":"/x","request_method":"GET",` +
+					`"http_user_agent":"Bot/1","request_id":"1a7ccaf3ab908eccad1912d7badcc7ac","upstream_status":"200"}`)
+			},
+			wantRequestID: "1a7ccaf3ab908eccad1912d7badcc7ac", wantUpstreamStatus: "200",
+		},
+		{
+			// An edge that assigned the id passes it down as a header; nginx's
+			// own $request_id is absent then.
+			name: "falls back to the request id the edge set",
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","request_uri":"/x","request_method":"GET",` +
+					`"http_x_request_id":"edge-generated-id"}`)
+			},
+			wantRequestID: "edge-generated-id",
+		},
 	}
 
 	for _, tc := range cases {
@@ -1438,6 +1483,8 @@ func TestParsedLine_ClientFields(t *testing.T) {
 			assert.Equal(t, tc.wantPlatform, got.platform, "platform")
 			assert.Equal(t, tc.wantVersion, got.appVersion, "appVersion")
 			assert.Equal(t, tc.wantUser, got.visitorID, "visitorId")
+			assert.Equal(t, tc.wantRequestID, got.requestID, "requestId")
+			assert.Equal(t, tc.wantUpstreamStatus, got.upstreamStatus, "upstreamStatus")
 		})
 	}
 }

@@ -30,6 +30,13 @@ type Fields struct {
 	RemoteAddr           string
 	Referer              string
 	Method               string
+	// RequestID as logged: nginx $request_id (32 hex) or a header the edge set.
+	// Values coming from the parser are already dash-stripped (resolveClientField
+	// owns that rule for typed fields); DashToEmpty below is for hand-built
+	// Fields, which is what this exported type invites.
+	RequestID string
+	// UpstreamStatus as logged; may be a chain ("502, 200") on retries.
+	UpstreamStatus string
 }
 
 // NewEvent matches the UA against the bot list and, on match, builds an Event.
@@ -65,10 +72,54 @@ func BuildEvent(now time.Time, agentHostname string, f Fields, family, name stri
 		UserAgent:              Truncate(f.UserAgent, uaTruncate),
 		BotFamily:              family,
 		BotName:                name,
+		RequestID:              sanitizeRequestID(f.RequestID),
+		UpstreamStatus:         parseStatus(lastUpstreamStatus(f.UpstreamStatus)),
 	}
 }
 
+// lastUpstreamStatus takes the final entry of an $upstream_status chain. On a
+// retry nginx logs every attempt ("502, 200"); the last one is the answer that
+// actually reached the client, and it is the only one comparable with Status.
+// The earlier attempts are a different question — visible in the chain, but a
+// single uint16 column cannot hold them.
+//
+// Deliberately the mirror image of firstUpstreamTime below, which takes the
+// first entry: a status is a verdict, so the one that stuck is the one that
+// counts, while a time is a duration the client actually waited. Read as a
+// pair, not as two independent choices. (No branch needed: LastIndexByte
+// returns -1 on a miss and s[0:] is s.)
+func lastUpstreamStatus(s string) string {
+	return strings.TrimSpace(s[strings.LastIndexByte(s, ',')+1:])
+}
+
+// maxRequestIDLen bounds what can plausibly be a request identifier: nginx's
+// $request_id is 32 hex, a UUID is 36, a W3C traceparent is 55.
+const maxRequestIDLen = 64
+
+// sanitizeRequestID drops a value that cannot be an identifier rather than
+// truncating it. $request_id is nginx's own, but $http_x_request_id is a client
+// header — accepted only because an edge proxy usually overwrites it — and
+// nginx will carry up to large_client_header_buffers (8 KB by default) of
+// whatever the client sent. Truncating would ship 64 bytes of a hostile string
+// that joins to nothing; dropping ships nothing and lets the receiver generate
+// an id, which is the same outcome minus the payload. At one event per request
+// the difference is the whole batch.
+func sanitizeRequestID(s string) string {
+	if len(s) > maxRequestIDLen {
+		return ""
+	}
+	return DashToEmpty(s)
+}
+
 func parseStatus(s string) uint16 {
+	// Guarded like parseUint32 below: ParseUint("") takes the error path and
+	// heap-allocates a *strconv.NumError. Status is always present, but
+	// UpstreamStatus is absent on every request that never reached a backend —
+	// cache hits, static files, redirects — and that is one wasted allocation
+	// per event on the busiest path there is.
+	if s == "" || s == "-" {
+		return 0
+	}
 	n, err := strconv.ParseUint(s, 10, 16)
 	if err != nil {
 		return 0

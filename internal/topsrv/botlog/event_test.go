@@ -154,3 +154,48 @@ func TestFirstUpstreamTime(t *testing.T) {
 	assert.Equal(t, "0.5", firstUpstreamTime("0.5"))
 	assert.Empty(t, firstUpstreamTime(""))
 }
+
+// $upstream_status carries every attempt on a retry. The last one is what the
+// client actually got and the only entry comparable with Status; a naive parse
+// of the whole string yields 0 and looks like "the backend never answered".
+func TestBuildEventUpstreamStatusChain(t *testing.T) {
+	cases := map[string]uint16{
+		"200":       200,
+		"502, 200":  200, // first attempt failed, retry succeeded
+		"-":         0,   // nginx never reached a backend
+		"":          0,
+		"200 : 404": 0, // not a chain nginx writes — refuse rather than guess
+	}
+	for in, want := range cases {
+		ev := BuildEvent(time.Now(), "web01", Fields{Status: "200", UpstreamStatus: in}, "", "", 1024)
+		assert.Equalf(t, want, ev.UpstreamStatus, "upstreamStatus %q", in)
+	}
+}
+
+// The request id is what ties an event to the backend's own logs. nginx writes
+// a dash when the format declares the variable but nothing set it, and that
+// placeholder must not travel — the receiver would store it as a literal.
+func TestBuildEventRequestID(t *testing.T) {
+	const hex32 = "1a7ccaf3ab908eccad1912d7badcc7ac"
+
+	ev := BuildEvent(time.Now(), "web01", Fields{Status: "200", RequestID: hex32}, "", "", 1024)
+	assert.Equal(t, hex32, ev.RequestID, "passed through verbatim; the receiver parses it")
+
+	ev = BuildEvent(time.Now(), "web01", Fields{Status: "200", RequestID: "-"}, "", "", 1024)
+	assert.Empty(t, ev.RequestID, "empty means 'the format carries none', and the receiver generates one")
+}
+
+// $http_x_request_id is a client header, and nginx carries up to
+// large_client_header_buffers (8 KB) of it. The receiver would reject the value
+// and generate its own id anyway, so shipping it is pure payload — at one event
+// per request, enough to inflate every batch on demand.
+func TestBuildEventRejectsOversizedRequestID(t *testing.T) {
+	hostile := strings.Repeat("A", 8192)
+	ev := BuildEvent(time.Now(), "web01", Fields{Status: "200", RequestID: hostile}, "", "", 1024)
+	assert.Empty(t, ev.RequestID, "an 8 KB header is not an identifier")
+
+	// A W3C traceparent is 55 chars — the cap must not clip legitimate formats.
+	const traceparent = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	ev = BuildEvent(time.Now(), "web01", Fields{Status: "200", RequestID: traceparent}, "", "", 1024)
+	assert.Equal(t, traceparent, ev.RequestID)
+}

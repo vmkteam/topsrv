@@ -168,6 +168,8 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, path string) {
 		ServerName:           o.field(p, o.idxServerName),
 		RemoteAddr:           o.field(p, o.idxRemoteAddr),
 		Referer:              botlog.Truncate(o.field(p, o.idxReferer), o.uriTruncate),
+		RequestID:            p.RequestID,
+		UpstreamStatus:       p.UpstreamStatus,
 	}, family, name, o.uaTruncate)
 
 	// What the bot stream has no field for.

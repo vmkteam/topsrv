@@ -516,13 +516,30 @@ refusal and warning is logged once at startup and ticks
 `$host` / `$server_name`, `$remote_addr`, `$http_referer`) plus `$status` and
 a URI variable.
 
-**Recommended**: `$upstream_response_time` (required by `RequireUpstream`),
-`$proxy_host` (required by `Upstreams`), and — when the site has them —
-`$http_platform`, `$http_version` and the userid module's `$uid_got`. The last
-one is the only stable identity above the address: one client rotating
+**Recommended**: `$request_id` and `$upstream_status`,
+`$upstream_response_time` (required by `RequireUpstream`), `$proxy_host`
+(required by `Upstreams`), and — when the site has them — `$http_platform`,
+`$http_version` and the userid module's `$uid_got`.
+
+`$uid_got` is the only stable identity above the address: one client rotating
 addresses under a single cookie and many cookies behind one address are
-opposite cases and tell apart by nothing else. All three are read
-automatically when present, under those names.
+opposite cases and tell apart by nothing else. It, `$http_platform` and
+`$http_version` are read automatically when present, under those names.
+
+`$request_id` is the only field that ties an event to the backend's own logs
+for the same request; without it a slow or failed request is visible here but
+cannot be followed to where it was served. Absent from the format, the receiver
+generates an id that is unique but joins to nothing — an edge that assigned the
+id itself is read too, via `$http_x_request_id`. `$upstream_status` is what the
+backend answered, where `status` is what the client got: they differ exactly
+where it matters — nginx serving its own 502, a retry chain whose first attempt
+failed, a cached 200 over a backend that is down. On a retry nginx logs every
+attempt (`"502, 200"`) and the last entry ships, being the answer that reached
+the client.
+
+Both are checked at startup like the rest: a format missing either raises
+`topsrv_collector_config_warnings_total{kind="weblog_no_request_id"}` or
+`{kind="weblog_no_upstream_status"}` and keeps shipping.
 
 Note the asymmetry with `ExtraLabels`: `$http_platform` and `$http_version` are
 fine as Prometheus labels (a handful of values each), but `$uid_got` is one

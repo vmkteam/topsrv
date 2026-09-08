@@ -412,6 +412,21 @@ type ParsedLine struct {
 	AppVersion string
 	VisitorID  string
 
+	// RequestID is nginx's $request_id (32 hex) or an X-Request-Id header the
+	// upstream generated — the only field that ties an event to the backend's
+	// own logs for the same request. Without it a slow or failed request can be
+	// seen here but not followed to where it was actually served.
+	//
+	// UpstreamStatus is $upstream_status: what the backend answered, as opposed
+	// to Status, which is what the client got. They differ exactly where it
+	// matters — nginx serving a 502 from its own error page, a retry chain
+	// whose first attempt failed, a cached 200 over a backend that is down.
+	//
+	// Typed for the same reason as the three above: MaxExtras is a hard budget
+	// shared with operator ExtraLabels, and a busy front node has none left.
+	RequestID      string
+	UpstreamStatus string
+
 	Extras  [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
 	NExtras int
 }
@@ -518,6 +533,7 @@ func (c *LogCollector) fillLine(get func(string) string) ParsedLine {
 	p.BodyBytesSent = get("body_bytes_sent")
 	p.RequestTime = get("request_time")
 	p.UpstreamResponseTime = get("upstream_response_time")
+	p.UpstreamStatus = get("upstream_status")
 	p.UpstreamCacheStatus = get("upstream_cache_status")
 	p.URI, p.RawURI = resolveURI(get)
 	p.Method = c.resolveMethod(get)
@@ -525,6 +541,7 @@ func (c *LogCollector) fillLine(get func(string) string) ParsedLine {
 	p.Platform = resolveClientField(get, PlatformCandidates)
 	p.AppVersion = resolveClientField(get, AppVersionCandidates)
 	p.VisitorID = resolveClientField(get, VisitorIDCandidates)
+	p.RequestID = resolveClientField(get, requestIDCandidates)
 
 	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
@@ -632,6 +649,9 @@ type jsonLogEntry struct {
 	HTTPVersion         string `json:"http_version"`
 	UIDGot              string `json:"uid_got"`
 	UIDSet              string `json:"uid_set"`
+	RequestID           string `json:"request_id"`
+	HTTPXRequestID      string `json:"http_x_request_id"`
+	UpstreamStatus      string `json:"upstream_status"`
 }
 
 // field answers by nginx variable name so the typed decode path can be filled
@@ -678,6 +698,12 @@ func (e *jsonLogEntry) field(name string) string {
 		return e.HTTPPlatform
 	case "http_version":
 		return e.HTTPVersion
+	case "request_id":
+		return e.RequestID
+	case "http_x_request_id":
+		return e.HTTPXRequestID
+	case "upstream_status":
+		return e.UpstreamStatus
 	case "uid_got":
 		return e.UIDGot
 	case "uid_set":
@@ -716,6 +742,12 @@ var (
 	PlatformCandidates   = []string{"http_platform"}
 	AppVersionCandidates = []string{"http_version"}
 	VisitorIDCandidates  = []string{"uid_got", "uid_set"}
+	// $request_id is nginx's own; the http_ variant is what a load balancer in
+	// front of it passes down. Unexported unlike the lists above: those are
+	// walked by the format checks in weblog and by the alias detector, so the
+	// two must agree on the same names in the same order. Nothing outside this
+	// package reads this one.
+	requestIDCandidates = []string{"request_id", "http_x_request_id"}
 )
 
 // methodOf coerces one logged value into a request verb. The value is either a
@@ -783,7 +815,13 @@ func (c *LogCollector) resolveMethod(get func(string) string) string {
 // Walked per line rather than narrowed at startup on purpose: a JSON access log
 // whose log_format discovery could not read still yields these keys, and
 // deciding from the format string would drop them silently on exactly those
-// hosts. Four map probes against a ~3.4 µs parse is not the trade to make.
+// hosts. Seven map probes against a ~3.4 µs parse is not the trade to make.
+//
+// Known gap: this resolves canonical nginx variable names only. Method and Time
+// take the stronger path — app.go resolves an operator's renamed field through
+// FieldAliases and passes it in LogConfig — so a JSON format writing
+// `"rid":"$request_id"` yields Method but not RequestID. Closing it means
+// extending FieldAliases to the five typed fields; see docs/metrics.md.
 func resolveClientField(get func(string) string, candidates []string) string {
 	for _, name := range candidates {
 		if v := get(name); v != "" && v != "-" {
