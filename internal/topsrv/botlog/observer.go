@@ -115,7 +115,20 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 	if uri == "" {
 		uri = p.URI
 	}
-	ev := BuildEvent(time.Now(), o.hostname, Fields{
+
+	// Request time, not processing time. The two diverge by the tail's read
+	// lag and by the whole backlog after a restart or a spool drain, and every
+	// timing feature downstream (gap between requests, think time, sequence
+	// detection) is computed from this value. Falling back to the local clock
+	// keeps events flowing on formats that log no timestamp; the operator is
+	// warned about that format once at startup (botlog_no_time_field), not
+	// from here — this runs per line, on the tail goroutine.
+	ts, ok := p.Timestamp()
+	if !ok {
+		ts = time.Now()
+	}
+
+	ev := BuildEvent(ts, o.hostname, Fields{
 		Status:               p.Status,
 		URI:                  truncate(uri, o.uriTruncate),
 		BodyBytesSent:        p.BodyBytesSent,
@@ -123,6 +136,7 @@ func (o *Observer) OnLogLine(p *nginx.ParsedLine, _ string) {
 		UpstreamResponseTime: p.UpstreamResponseTime,
 		UpstreamCacheStatus:  p.UpstreamCacheStatus,
 		UserAgent:            ua,
+		Method:               p.Method,
 		Host:                 o.field(p, o.idxHost),
 		ServerName:           o.field(p, o.idxServerName),
 		RemoteAddr:           o.field(p, o.idxRemoteAddr),

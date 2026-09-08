@@ -2,6 +2,7 @@ package nginx
 
 import (
 	"context"
+	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -104,7 +105,7 @@ func TestLogCollectorParseLine(t *testing.T) {
 	assert.EqualValues(t, 4, c.reqCount)
 	assert.EqualValues(t, 2, c.upCount)
 	assert.EqualValues(t, 1, c.statusCounts["503"])
-	assert.EqualValues(t, 1, c.uri5xx[statusURI{"503", "/slow"}])
+	assert.EqualValues(t, 1, c.uri5xx.m[statusURI{"503", "/slow"}].count)
 	assert.EqualValues(t, 1323, c.bytesTotal.Load())
 }
 
@@ -117,15 +118,28 @@ type recordingObserver struct {
 }
 
 type recordedLine struct {
-	status string
-	uri    string
-	rawURI string
-	ua     string
-	path   string
+	status  string
+	uri     string
+	rawURI  string
+	ua      string
+	path    string
+	method  string
+	rawTime string
 }
 
+// timestamp mirrors ParsedLine.Timestamp on the recorded copy — the observer
+// contract forbids retaining the ParsedLine pointer past OnLogLine.
+func (r recordedLine) timestamp() (time.Time, bool) { return parseLogTime(r.rawTime) }
+
 func (r *recordingObserver) OnLogLine(p *ParsedLine, path string) {
-	rl := recordedLine{status: p.Status, uri: p.URI, rawURI: p.RawURI, path: path}
+	rl := recordedLine{
+		status:  p.Status,
+		uri:     p.URI,
+		rawURI:  p.RawURI,
+		path:    path,
+		method:  p.Method,
+		rawTime: p.Time,
+	}
 	if r.uaIdx >= 0 && r.uaIdx < p.NExtras {
 		rl.ua = p.Extras[r.uaIdx]
 	}
@@ -425,8 +439,8 @@ func TestLogCollectorJSONParseLine(t *testing.T) {
 	assert.EqualValues(t, 2, c.statusCounts["200"])
 	assert.EqualValues(t, 1, c.statusCounts["503"])
 	assert.EqualValues(t, 1, c.statusCounts["404"])
-	assert.Len(t, c.uri5xx, 1, "one 503 URI")
-	assert.Len(t, c.uri4xx, 1, "one 404 URI")
+	assert.Len(t, c.uri5xx.m, 1, "one 503 URI")
+	assert.Len(t, c.uri4xx.m, 1, "one 404 URI")
 	assert.Equal(t, int64(10939722+1043200+221239839+162), c.bytesTotal.Load())
 }
 
@@ -515,28 +529,33 @@ func TestLogCollectorTail(t *testing.T) {
 func TestLogCollectorCardinalityCap(t *testing.T) {
 	c := NewLogCollector(embedlog.Logger{}, LogConfig{LogPaths: []string{"/dev/null"}, LogFormat: DefaultLogFormat})
 
-	// Fill uri5xx, uri4xx, bytesByURI to maxCardinalityURI with unique URIs.
+	// Fill uri5xx, uri4xx, bytesByURI to maxCardinalityURI with unique, still
+	// active URIs (lastSeen = now — idle ones would simply be evicted).
+	now := nowUnix()
 	for i := range maxCardinalityURI {
 		uri := "/section" + strconv.Itoa(i) + "/page"
-		c.uri5xx[statusURI{"500", uri}] = 1
-		c.uri4xx[statusURI{"404", uri}] = 1
-		c.bytesByURI[uri] = 1
+		c.uri5xx.m[statusURI{"500", uri}] = uriCounter{count: 1, lastSeen: now}
+		c.uri4xx.m[statusURI{"404", uri}] = uriCounter{count: 1, lastSeen: now}
+		c.bytesByURI.m[uri] = uriCounter{count: 1, lastSeen: now}
 	}
-	assert.Len(t, c.uri5xx, maxCardinalityURI)
-	assert.Len(t, c.uri4xx, maxCardinalityURI)
-	assert.Len(t, c.bytesByURI, maxCardinalityURI)
+	assert.Len(t, c.uri5xx.m, maxCardinalityURI)
+	assert.Len(t, c.uri4xx.m, maxCardinalityURI)
+	assert.Len(t, c.bytesByURI.m, maxCardinalityURI)
 
 	// Parse a line with a URI that normalizes to an EXISTING entry — counters must still grow.
 	existingURI := "/section0/page"
 	c.parseLine(`1.2.3.4 - - [11/Apr/2026:17:15:23 +0300] "GET ` + existingURI + ` HTTP/1.1" 500 999 "-" "test" 0.1 0.1`)
-	assert.EqualValues(t, 2, c.uri5xx[statusURI{"500", existingURI}], "existing 5xx URI counter must increment")
-	assert.EqualValues(t, 1000, c.bytesByURI[existingURI], "existing bytes URI counter must increment")
+	assert.EqualValues(t, 2, c.uri5xx.m[statusURI{"500", existingURI}].count, "existing 5xx URI counter must increment")
+	assert.EqualValues(t, 1000, c.bytesByURI.m[existingURI].count, "existing bytes URI counter must increment")
 
-	// Parse a line with a NEW URI — must be rejected (cap reached).
+	// Parse a line with a NEW URI while every slot is active — it lands in the
+	// per-status overflow bucket instead of vanishing, and the cap holds.
 	c.parseLine(`1.2.3.4 - - [11/Apr/2026:17:15:24 +0300] "GET /brand-new HTTP/1.1" 503 500 "-" "test" 0.2 0.2`)
-	_, exists := c.uri5xx[statusURI{"503", "/brand-new"}]
-	assert.False(t, exists, "new URI must not be added when cap is reached")
-	assert.Len(t, c.uri5xx, maxCardinalityURI)
+	_, exists := c.uri5xx.m[statusURI{"503", "/brand-new"}]
+	assert.False(t, exists, "new URI must not get its own slot when cap is reached")
+	assert.EqualValues(t, 1, c.uri5xx.m[statusURI{"503", overflowMarker}].count, "overflow bucket counts the request")
+	assert.EqualValues(t, 500, c.bytesByURI.m[overflowMarker].count)
+	assert.Len(t, c.uri5xx.m, maxCardinalityURI+1, "only the bucket sits above the cap")
 }
 
 func TestNormalizeURI(t *testing.T) {
@@ -674,34 +693,6 @@ func TestNormalizePath_ByteCap(t *testing.T) {
 	}
 	if !utf8.ValidString(out) {
 		t.Fatalf("mid-rune cut produced invalid UTF-8: %q", out)
-	}
-}
-
-func TestTruncateAtRune(t *testing.T) {
-	tests := []struct {
-		in   string
-		n    int
-		want string
-	}{
-		{"hello", 3, "hel"},
-		{"hello", 10, "hello"}, // n >= len → unchanged
-		{"hello", 0, ""},
-		{"hello", -1, ""},
-		{"яяя", 1, ""},  // 1 byte mid-rune → rewind to 0
-		{"яяя", 2, "я"}, // 2 bytes = one rune
-		{"яяя", 3, "я"}, // 3 bytes mid-rune of second → rewind
-		{"яяя", 4, "яя"},
-		{"a" + "я" + "b", 2, "a"}, // cut into the middle of `я`
-		{"a" + "я" + "b", 3, "aя"},
-	}
-	for _, tt := range tests {
-		got := truncateAtRune(tt.in, tt.n)
-		if got != tt.want {
-			t.Errorf("truncateAtRune(%q, %d) = %q, want %q", tt.in, tt.n, got, tt.want)
-		}
-		if !utf8.ValidString(got) {
-			t.Errorf("truncateAtRune(%q, %d) produced invalid UTF-8: %q", tt.in, tt.n, got)
-		}
 	}
 }
 
@@ -920,4 +911,423 @@ func TestExtractFields_SupersetOrderingLabelIdx(t *testing.T) {
 	require.Len(t, c.labelIdx, 2)
 	assert.Equal(t, 0, c.labelIdx[0], "server_name lives at Extras[0]")
 	assert.Equal(t, 1, c.labelIdx[1], "http_platform lives at Extras[1]")
+}
+
+// Method and Time are read into typed ParsedLine fields (not Extras slots),
+// so they must resolve on every parse path: text via gonx, JSON via the
+// typed struct, and JSON via the map path taken when extractFields is set.
+func TestParsedLine_MethodAndTime(t *testing.T) {
+	cases := []struct {
+		name       string
+		setup      func(c *LogCollector)
+		feed       func(c *LogCollector)
+		wantMethod string
+		// Zero value means "the format carries no usable timestamp" — no real
+		// one can be zero, since parseLogTime floors accepted values at
+		// minLogTime (year 2000).
+		wantTime time.Time
+	}{
+		{
+			// Default combined format carries neither $request_method nor
+			// $msec — the verb comes off $request, the time off $time_local.
+			name:       "text/combined: verb from $request, time from $time_local",
+			feed:       func(c *LogCollector) { c.parseLine(defaultCombinedLine) },
+			wantMethod: "POST",
+			wantTime:   time.Date(2026, 4, 11, 17, 15, 24, 0, time.FixedZone("", 3*60*60)),
+		},
+		{
+			name: "text: explicit $request_method wins, $msec keeps milliseconds",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`$msec "$request_method" "$request_uri" $status $body_bytes_sent`)
+			},
+			feed: func(c *LogCollector) {
+				c.parseLine(`1787042366.123 "DELETE" "/api/v1/session" 204 0`)
+			},
+			wantMethod: "DELETE",
+			wantTime:   time.UnixMilli(1787042366123).UTC(),
+		},
+		{
+			name: "JSON typed path",
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/catalog","request_method":"HEAD","time_iso8601":"2026-08-18T11:20:03+03:00"}`)
+			},
+			wantMethod: "HEAD",
+			wantTime:   time.Date(2026, 8, 18, 11, 20, 3, 0, time.FixedZone("", 3*60*60)),
+		},
+		{
+			name: "JSON map path (extractFields set)",
+			setup: func(c *LogCollector) {
+				c.extractFields = []string{"http_user_agent"} // selects the map path
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"100","request_time":"0.1",` +
+					`"request_uri":"/catalog","request_method":"PUT","msec":"1787042366.500",` +
+					`"http_user_agent":"Bot/1"}`)
+			},
+			wantMethod: "PUT",
+			wantTime:   time.UnixMilli(1787042366500).UTC(),
+		},
+		{
+			// A format carrying no timestamp must report that, not guess:
+			// the observer substitutes its own clock and counts the fallback.
+			name: "no timestamp in format",
+			setup: func(c *LogCollector) {
+				c.defaultParser = gonx.NewParser(`"$request" $status $body_bytes_sent`)
+			},
+			feed:       func(c *LogCollector) { c.parseLine(`"GET /x HTTP/1.1" 200 10`) },
+			wantMethod: "GET",
+		},
+		{
+			// $request is verbatim client input. A hostile verb must not
+			// reach the receiver's LowCardinality method column.
+			name: "hostile verb in $request is dropped",
+			feed: func(c *LogCollector) {
+				c.parseLine(`10.0.0.1 - - [11/Apr/2026:17:15:24 +0300] "\x16\x03\x01 /x HTTP/1.1" 400 0 "-" "-" 0.1 -`)
+			},
+			wantMethod: "",
+			wantTime:   time.Date(2026, 4, 11, 17, 15, 24, 0, time.FixedZone("", 3*60*60)),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewLogCollector(embedlog.Logger{}, LogConfig{
+				LogPaths:  []string{"/dev/null"},
+				LogFormat: DefaultLogFormat,
+			})
+			rec := &recordingObserver{uaIdx: -1}
+			c.AddObserver(rec)
+			if tc.setup != nil {
+				tc.setup(c)
+			}
+			tc.feed(c)
+
+			require.NotEmpty(t, rec.lines, "observer saw no line")
+			got := rec.lines[len(rec.lines)-1]
+			assert.Equal(t, tc.wantMethod, got.method)
+
+			ts, ok := got.timestamp()
+			if tc.wantTime.IsZero() {
+				assert.False(t, ok, "expected no usable timestamp, got %v", ts)
+				return
+			}
+			require.True(t, ok, "timestamp did not parse: %q", got.rawTime)
+			assert.True(t, tc.wantTime.Equal(ts), "want %v, got %v", tc.wantTime, ts)
+		})
+	}
+}
+
+const defaultCombinedLine = `10.10.10.14 - - [11/Apr/2026:17:15:24 +0300] "POST /api/v1/login HTTP/1.1" 401 89 "-" "curl/7.68" 0.750 -`
+
+func TestParseLogTime(t *testing.T) {
+	cases := []struct {
+		in     string
+		wantOK bool
+	}{
+		{"1787042366.123", true},
+		{"1787042366", true},
+		{"2026-08-18T11:20:03+03:00", true},
+		{"18/Aug/2026:11:20:03 +0300", true},
+		{"", false},
+		{"-", false},
+		{"0", false},           // broken format writing a zero epoch
+		{"0.000", false},       // ditto, with a fraction
+		{"-1787042366", false}, // negative epoch
+		{"not-a-time", false},
+		{"11/Apr/2026:17:15:24", false}, // $time_local without the zone
+		// strconv.ParseFloat accepts all of these; none is a timestamp. NaN is
+		// the sharp one — it fails every comparison, so a bare `sec <= 0`
+		// guard lets it through and it converts to the 1970 epoch.
+		{"NaN", false},
+		{"Inf", false},
+		{"+Inf", false},
+		{"-Inf", false},
+		{"infinity", false},
+		{"0x1p10", false}, // hex float → 1024s after the epoch
+		{"1e300", false},
+		{"99999999999", false},                // year 5138 — past the skew window
+		{"1999-12-31T23:59:59Z", false},       // below minLogTime
+		{"2000-01-01T00:00:00Z", true},        // exactly minLogTime
+		{"9999-12-31T23:59:59Z", false},       // RFC3339 is range-checked too
+		{"31/Dec/9999:23:59:59 +0000", false}, // ...and so is $time_local
+	}
+	for _, tc := range cases {
+		t.Run(tc.in, func(t *testing.T) {
+			_, ok := parseLogTime(tc.in)
+			assert.Equal(t, tc.wantOK, ok)
+		})
+	}
+}
+
+// methodOf takes one logged value because operators log either shape under
+// either field name — a bare verb ($request_method) or a whole request line
+// ($request). Which fields are consulted, and in what order, is resolveMethod's
+// job and is covered by TestParsedLine_ResolvedFieldNames.
+func TestMethodOf(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"bare verb", "PATCH", "PATCH"},
+		{"verb off a request line", "PROPFIND /dav HTTP/1.1", "PROPFIND"},
+		{"nginx placeholder", "-", ""},
+		{"empty", "", ""},
+		{"lowercase rejected", "get", ""},
+		{"binary rejected", "\x16\x03\x01", ""},
+		{"digits rejected", "GET2", ""},
+		{"overlong rejected", strings.Repeat("A", maxMethodLen+1), ""},
+		{"malformed request line without space", "GET", "GET"},
+		{"dashed IANA method accepted", "VERSION-CONTROL", "VERSION-CONTROL"},
+		{"leading hyphen rejected", "-GET", ""},
+		{"trailing hyphen rejected", "GET-", ""},
+		{"binary request line rejected", "\x16\x03\x01 /x HTTP/1.1", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, methodOf(tc.in))
+		})
+	}
+}
+
+// An nginx JSON log_format is a hand-written template, and numeric-looking
+// variables are commonly emitted unquoted. Decoding is all-or-nothing per
+// line, so a single unquoted field must not cost the host every metric and
+// every bot-log event — which is what a plain `string` struct field does.
+func TestParseJSONLine_UnquotedNumericFields(t *testing.T) {
+	const line = `{"status":200,"body_bytes_sent":100,"request_time":0.15,` +
+		`"request_uri":"/catalog","request_method":"GET","msec":1787042366.123,` +
+		`"http_user_agent":"Bot/1"}`
+
+	for _, tc := range []struct {
+		name  string
+		setup func(c *LogCollector)
+	}{
+		{name: "typed path"},
+		{
+			name: "map path (extractFields set)",
+			setup: func(c *LogCollector) {
+				c.extractFields = []string{"http_user_agent"}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := NewLogCollector(embedlog.Logger{}, LogConfig{
+				LogPaths:  []string{"/dev/null"},
+				LogFormat: DefaultLogFormat,
+			})
+			rec := &recordingObserver{uaIdx: -1}
+			c.AddObserver(rec)
+			if tc.setup != nil {
+				tc.setup(c)
+			}
+
+			c.ParseJSONLine(line)
+
+			require.Len(t, rec.lines, 1, "unquoted numeric field dropped the whole line")
+			got := rec.lines[0]
+			assert.Equal(t, "200", got.status)
+			assert.Equal(t, "/catalog", got.uri)
+			assert.Equal(t, "GET", got.method)
+
+			ts, ok := got.timestamp()
+			require.True(t, ok, "unquoted $msec did not survive as a timestamp")
+			assert.True(t, time.UnixMilli(1787042366123).UTC().Equal(ts), "got %v", ts)
+
+			// The line must still reach the metric accumulators, not just the
+			// observer — an unquoted status is the field most likely to appear.
+			assert.Equal(t, uint64(1), c.statusCounts["200"])
+			assert.Equal(t, int64(100), c.bytesTotal.Load())
+		})
+	}
+}
+
+func TestLogValue_UnmarshalJSON(t *testing.T) {
+	var e jsonLogEntry
+	require.NoError(t, json.Unmarshal([]byte(`{"status":200,"request_time":0.15,`+
+		`"upstream_cache_status":null,"request":"GET /x HTTP/1.1"}`), &e))
+	assert.Equal(t, logValue("200"), e.Status)
+	assert.Equal(t, logValue("0.15"), e.RequestTime)
+	// The plain-string fields are the ones nginx cannot emit unquoted; they
+	// keep json/v2's string cache, and null still decodes to empty.
+	assert.Empty(t, e.UpstreamCacheStatus, "null must decode to empty, not \"null\"")
+	assert.Equal(t, "GET /x HTTP/1.1", e.Request)
+}
+
+// Which JSON decode path a line takes is an internal detail — the typed struct
+// when no extra fields are needed, a map otherwise — so both must produce the
+// same ParsedLine. They did not: the typed path carried its own URI logic that
+// counted nginx's "-" placeholder as a real path and ignored formats splitting
+// $uri and $args into separate fields.
+func TestParseJSONLine_DecodePathsAgree(t *testing.T) {
+	cases := []struct {
+		name       string
+		line       string
+		wantURI    string
+		wantRawURI string
+		wantMethod string
+	}{
+		{
+			name:       "request_uri placeholder falls back to $request",
+			line:       `{"status":"404","request_uri":"-","request":"GET /a/b?x=1 HTTP/1.1"}`,
+			wantURI:    "/a/b",
+			wantRawURI: "/a/b?x=1",
+			wantMethod: "GET",
+		},
+		{
+			name:       "split $uri and $args are rejoined",
+			line:       `{"status":"200","uri":"/search","args":"q=1&page=2","request_method":"GET"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search?q=1&page=2",
+			wantMethod: "GET",
+		},
+		{
+			name:       "$uri with $query_string",
+			line:       `{"status":"200","uri":"/search","query_string":"q=1","request_method":"POST"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search?q=1",
+			wantMethod: "POST",
+		},
+		{
+			name:       "empty $args keeps the bare path",
+			line:       `{"status":"200","uri":"/search","args":"-"}`,
+			wantURI:    "/search",
+			wantRawURI: "/search",
+		},
+		{
+			name:       "request_uri wins over $uri",
+			line:       `{"status":"200","request_uri":"/a?x=1","uri":"/b","args":"y=2"}`,
+			wantURI:    "/a",
+			wantRawURI: "/a?x=1",
+		},
+	}
+
+	paths := []struct {
+		name    string
+		extract []string
+	}{
+		{"typed", nil},
+		{"map", []string{"http_user_agent"}}, // any extra field selects the map path
+	}
+
+	for _, tc := range cases {
+		for _, p := range paths {
+			t.Run(tc.name+"/"+p.name, func(t *testing.T) {
+				c := NewLogCollector(embedlog.Logger{}, LogConfig{
+					LogPaths:      []string{"/dev/null"},
+					LogFormat:     DefaultLogFormat,
+					ExtractFields: p.extract,
+				})
+				rec := &recordingObserver{uaIdx: -1}
+				c.AddObserver(rec)
+				c.ParseJSONLine(tc.line)
+
+				require.NotEmpty(t, rec.lines, "observer saw no line")
+				got := rec.lines[0]
+				assert.Equal(t, tc.wantURI, got.uri)
+				assert.Equal(t, tc.wantRawURI, got.rawURI)
+				assert.Equal(t, tc.wantMethod, got.method)
+			})
+		}
+	}
+}
+
+// Operators rename fields freely in JSON formats (`"ts":"$msec"`). Looking up
+// only the canonical name made a renamed timestamp read as "this host logs no
+// timestamp", which then silently substituted the agent clock.
+func TestParsedLine_ResolvedFieldNames(t *testing.T) {
+	cases := []struct {
+		name       string
+		cfg        LogConfig
+		feed       func(c *LogCollector)
+		wantMethod string
+		wantTime   time.Time
+	}{
+		{
+			name: "JSON keys renamed, aliases point at them",
+			cfg: LogConfig{
+				ExtractFields: []string{"ua"},
+				MethodField:   "m",
+				TimeField:     "ts",
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"10","u":"/x",` +
+					`"m":"PATCH","ts":"1787042366.250","ua":"Bot/1"}`)
+			},
+			wantMethod: "PATCH",
+			wantTime:   time.UnixMilli(1787042366250).UTC(),
+		},
+		{
+			// The resolved method field may name $request rather than
+			// $request_method — the verb is then its first token.
+			name: "renamed key holds the whole $request",
+			cfg: LogConfig{
+				ExtractFields: []string{"ua"},
+				MethodField:   "req",
+				TimeField:     "when",
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"10",` +
+					`"req":"DELETE /session HTTP/1.1","when":"2026-08-18T11:20:03+03:00","ua":"Bot/1"}`)
+			},
+			wantMethod: "DELETE",
+			wantTime:   time.Date(2026, 8, 18, 11, 20, 3, 0, time.FixedZone("", 3*60*60)),
+		},
+		{
+			// Aliases set, but the line carries the canonical names instead
+			// (mixed fleet, one collector). The canonical fallback still runs.
+			name: "alias misses, canonical names still work",
+			cfg: LogConfig{
+				ExtractFields: []string{"ua"},
+				MethodField:   "m",
+				TimeField:     "ts",
+			},
+			feed: func(c *LogCollector) {
+				c.ParseJSONLine(`{"status":"200","body_bytes_sent":"10","request_uri":"/x",` +
+					`"request_method":"HEAD","msec":"1787042366.750","ua":"Bot/1"}`)
+			},
+			wantMethod: "HEAD",
+			wantTime:   time.UnixMilli(1787042366750).UTC(),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.LogPaths = []string{"/dev/null"}
+			tc.cfg.LogFormat = DefaultLogFormat
+			c := NewLogCollector(embedlog.Logger{}, tc.cfg)
+			rec := &recordingObserver{uaIdx: -1}
+			c.AddObserver(rec)
+
+			tc.feed(c)
+
+			require.Len(t, rec.lines, 1)
+			assert.Equal(t, tc.wantMethod, rec.lines[0].method)
+			ts, ok := rec.lines[0].timestamp()
+			require.True(t, ok, "timestamp did not parse: %q", rec.lines[0].rawTime)
+			assert.True(t, tc.wantTime.Equal(ts), "want %v, got %v", tc.wantTime, ts)
+		})
+	}
+}
+
+// The text path resolves names the same way: gonx names fields after the nginx
+// variable, so a custom variable name must be honoured there too.
+func TestParsedLine_ResolvedFieldNamesText(t *testing.T) {
+	c := NewLogCollector(embedlog.Logger{}, LogConfig{
+		LogPaths:    []string{"/dev/null"},
+		LogFormat:   `$time_iso8601 "$request" $status $body_bytes_sent`,
+		MethodField: "request",
+		TimeField:   "time_iso8601",
+	})
+	rec := &recordingObserver{uaIdx: -1}
+	c.AddObserver(rec)
+
+	c.parseLine(`2026-08-18T11:20:03+03:00 "PUT /items/7 HTTP/1.1" 200 12`)
+
+	require.Len(t, rec.lines, 1)
+	assert.Equal(t, "PUT", rec.lines[0].method)
+	ts, ok := rec.lines[0].timestamp()
+	require.True(t, ok)
+	assert.True(t, time.Date(2026, 8, 18, 11, 20, 3, 0, time.FixedZone("", 3*60*60)).Equal(ts))
 }

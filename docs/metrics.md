@@ -174,10 +174,10 @@ regardless of ranking, so latency percentiles have no such gap.
 | `topsrv_nginx_upstream_duration_seconds` | histogram | — | Upstream response time |
 | `topsrv_nginx_http_requests_total` | counter | status, +ExtraLabels | Requests by status code. ExtraLabels comes from `[Nginx]/[Angie] ExtraLabels` (operator-controlled, must be low cardinality — `server_name`, `http_platform`, `http_version`). Variables that botlog needs internally are NOT added here; see warning below. |
 | `topsrv_nginx_cache_requests_total` | counter | status | Cache status (HIT/MISS/EXPIRED) |
-| `topsrv_nginx_5xx_requests_total` | counter | status, uri | 5xx errors with normalized URI |
-| `topsrv_nginx_4xx_requests_total` | counter | status, uri | 4xx errors with normalized URI |
+| `topsrv_nginx_5xx_requests_total` | counter | status, uri | 5xx errors with normalized URI. Per-host cap of 1000 URIs: keys idle for an hour are evicted when the map is full, and new paths beyond that count as `uri="/:other"` |
+| `topsrv_nginx_4xx_requests_total` | counter | status, uri | 4xx errors with normalized URI. Same 1000-URI cap and `/:other` overflow as 5xx — on public hosts the bucket mostly holds one-off scanner paths |
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
-| `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI |
+| `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI. Same 1000-URI cap and `/:other` overflow |
 
 > **High-cardinality labels warning.** `ExtraLabels` values appear on every series of `topsrv_nginx_http_requests_total`; total cardinality is `status × ExtraLabels[0] × ExtraLabels[1] × …`. Adding unbounded variables (`remote_addr`, `http_user_agent`, `http_referer`, `http_x_forwarded_for`, `request_id`, `args`, `query_string`) will explode Prometheus storage. The agent logs a WARN at startup if it sees any of these in `ExtraLabels`. Enabling `[BotLogs]` does NOT add any of these to labels — botlog reads them into `ParsedLine.Extras` for event enrichment only.
 
@@ -193,7 +193,9 @@ Always enabled. Requires `CAP_SYS_RAWIO` + `CAP_SYS_ADMIN` or root. Devices auto
 | `topsrv_smart_device_healthy` | gauge | device | Overall health: 1=healthy, 0=unhealthy |
 | `topsrv_smart_device_temperature_celsius` | gauge | device | Device temperature |
 | `topsrv_smart_device_power_on_hours` | gauge | device | Total power-on hours |
-| `topsrv_smart_device_bytes_written_total` | gauge | device | Total bytes written |
+| `topsrv_smart_device_bytes_written_total` | counter | device | Total host bytes written |
+
+`bytes_written_total` counts **host** writes, not NAND writes, and is scaled to bytes from whatever unit the drive reports: LBAs × logical sector size (read from `/sys/block/<dev>/queue/logical_block_size`, 512 when unreadable) on SATA, data units × 512 000 on NVMe. SATA vendors rename the attribute and change its unit with it (`Host_Writes_GiB`, `Host_Writes_32MiB`, …), so resolution is by attribute name, never by id — the default database puts `Load_Cycle_Count` on id 225, where Intel puts host writes. A drive exposing no attribute with a documented unit gets **no series** rather than one in unknown units; that is also the expected state for HDDs, which have no host-write counter at all. NAND-side counters (`Total_NAND_Written`, `NAND_GB_Written_TLC`) are never substituted — they measure flash writes after amplification. Before v0.1.5 the raw unit count was published as if it were bytes: SATA read 512x low, NVMe 512 000x low, and drives with a renamed attribute had no series at all. Expect one step up at the upgrade, and a new series on drives that had none; historical points stay understated.
 
 ### ATA/SATA critical attributes
 
@@ -211,8 +213,8 @@ Only critical attribute IDs are exported: 5 (Reallocated Sectors), 187 (Reported
 | `topsrv_smart_nvme_available_spare_percent` | gauge | device | Available spare capacity % |
 | `topsrv_smart_nvme_available_spare_threshold_percent` | gauge | device | Available spare threshold % |
 | `topsrv_smart_nvme_percentage_used` | gauge | device | Estimated % of life used (can exceed 100) |
-| `topsrv_smart_nvme_media_errors_total` | gauge | device | Media and data integrity errors |
-| `topsrv_smart_nvme_unsafe_shutdowns_total` | gauge | device | Unsafe shutdown count |
+| `topsrv_smart_nvme_media_errors_total` | counter | device | Media and data integrity errors |
+| `topsrv_smart_nvme_unsafe_shutdowns_total` | counter | device | Unsafe shutdown count |
 | `topsrv_smart_nvme_warning_temp_time_minutes` | gauge | device | Minutes above warning temp |
 | `topsrv_smart_nvme_critical_temp_time_minutes` | gauge | device | Minutes above critical temp |
 
@@ -307,6 +309,8 @@ Event payload notes:
 - `host` — the request `$host` header, normalized (lowercased, optional `:port` stripped, bracketed IPv6 preserved). Client-controlled. Use this when grouping by the actual domain the client requested.
 - `serverName` — nginx `$server_name` of the matched virtual host (config-controlled). Use this when grouping by the operator-configured vhost.
 - Both ship side by side; downstream dashboards/joins should pick the one that fits the question.
+- `ts` — the request time as logged, read from `$msec` (millisecond precision), `$time_iso8601`, or `$time_local` in that order. The field name is auto-detected per format, so JSON logs that rename it (`"ts":"$msec"`) are read correctly. Values outside `[2000-01-01, now+24h]` are treated as unusable. When the format carries no timestamp at all, the agent's own clock is substituted and `topsrv_collector_config_warnings_total{kind="botlog_no_time_field"}` ticks once at startup — timing-derived analysis is unreliable for that stream. Note that events replayed from the spool after a restart carry their original `ts`, so a freshness check on the receiving side must not assume `ts` tracks arrival time.
+- `method` — from `$request_method`, else the verb off `$request` (also auto-detected per format). Only uppercase ASCII tokens ≤16 chars are accepted (an interior hyphen is allowed for `VERSION-CONTROL` / `BASELINE-CONTROL`): `$request` is verbatim client input, and an unbounded verb would grow a LowCardinality dictionary on the receiving side. Absent or rejected → ships empty; the receiver stores it as `_unknown` rather than guessing `GET`. A format carrying no verb ticks `{kind="botlog_no_method_field"}` at startup.
 
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
@@ -351,4 +355,4 @@ Per-collector instrumentation. Any collector registered via `addCollector` is wr
 |--------|------|--------|-------------|
 | `topsrv_collector_scrape_duration_seconds` | gauge | collector | Last scrape duration. Alert: `> 5s` = monitoring is adding overhead to the target |
 | `topsrv_collector_scrape_panics_total` | counter | collector | Panics recovered during Collect. Any non-zero rate = bug, page immediately |
-| `topsrv_collector_config_warnings_total` | counter | kind | Operator-config warnings raised at startup. `kind` ∈ {`high_card_label` (denylisted variable in ExtraLabels), `missing_extract` (ExtraLabels references variable absent from ExtractFields → empty label values), `truncated_extract` (ExtractFields > MaxExtras=8 → tail dropped), `botlog_no_ua_field` (BotLogs enabled but no log_format carries http_user_agent — override via `[BotLogs.FieldAliases].UserAgent`), `botlog_alias_mismatch` (tailed paths resolve to non-identical botlog aliases; first path's resolution is used)}. Any non-zero value points at a fixable config — see the matching WARN in stdout/journald for the offending names |
+| `topsrv_collector_config_warnings_total` | counter | kind | Operator-config warnings raised at startup. `kind` ∈ {`high_card_label` (denylisted variable in ExtraLabels), `missing_extract` (ExtraLabels references variable absent from ExtractFields → empty label values), `truncated_extract` (ExtractFields > MaxExtras=8 → tail dropped), `botlog_no_ua_field` (BotLogs enabled but no log_format carries http_user_agent — override via `[BotLogs.FieldAliases].UserAgent`), `botlog_no_time_field` (no log_format carries a request timestamp → events stamped with the agent clock, see `ts` above), `botlog_no_method_field` (no log_format carries the request verb → `method` ships empty), `botlog_alias_mismatch` (tailed paths resolve to non-identical botlog aliases; first path's resolution is used)}. Any non-zero value points at a fixable config — see the matching WARN in stdout/journald for the offending names |

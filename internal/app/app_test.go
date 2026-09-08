@@ -222,3 +222,86 @@ func TestTruncateList(t *testing.T) {
 	got := truncateList([]string{"a", "b", "c", "d", "e"}, 2)
 	assert.Equal(t, []string{"a", "b", "…+more"}, got)
 }
+
+// newLogCollectorTestApp extends newAliasTestApp with what registerLogCollector
+// additionally needs: a registry and the two per-collector metric vectors that
+// addCollector writes into.
+func newLogCollectorTestApp(t *testing.T) *App {
+	t.Helper()
+	a := newAliasTestApp(t, botlog.FieldAliases{})
+	a.cfg.BotLogs.Enabled = true
+	a.registry = prometheus.NewRegistry()
+	a.scrapeDuration = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: "test_scrape_duration_seconds", Help: "test",
+	}, []string{"collector"})
+	a.scrapePanics = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "test_scrape_panics_total", Help: "test",
+	}, []string{"collector"})
+	return a
+}
+
+// A log_format is a static per-host property, so the operator hears about a
+// missing timestamp or verb at startup — not from the parse path, where the
+// first bot line might be hours away, or never arrive at all.
+func TestRegisterLogCollector_WarnsOnMissingTimeAndMethod(t *testing.T) {
+	cases := []struct {
+		name       string
+		format     string
+		wantTime   float64
+		wantMethod float64
+	}{
+		{
+			// Combined carries both: the verb off $request, the time off
+			// $time_local. Coarse, but present — no warning.
+			name:   "combined format warns about neither",
+			format: `$remote_addr [$time_local] "$request" $status "$http_user_agent"`,
+		},
+		{
+			name:       "no timestamp in format",
+			format:     `$remote_addr "$request" $status "$http_user_agent"`,
+			wantTime:   1,
+			wantMethod: 0,
+		},
+		{
+			// $request_uri carries no verb, and $request_time is not a
+			// timestamp — neither must be mistaken for the real thing.
+			name:       "request_uri and request_time are not verb and time",
+			format:     `$remote_addr "$request_uri" $status $request_time "$http_user_agent"`,
+			wantTime:   1,
+			wantMethod: 1,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			a := newLogCollectorTestApp(t)
+			a.registerLogCollector(context.Background(), nginx.LogConfig{
+				LogPaths:  []string{"/var/log/nginx/access.log"},
+				LogFormat: tc.format,
+			})
+
+			assert.InDelta(t, tc.wantTime,
+				counterValue(t, a.configWarnings.WithLabelValues("botlog_no_time_field")), 1e-9, "time warning")
+			assert.InDelta(t, tc.wantMethod,
+				counterValue(t, a.configWarnings.WithLabelValues("botlog_no_method_field")), 1e-9, "method warning")
+		})
+	}
+}
+
+// The resolved names must reach the parser, otherwise a renamed $msec is read
+// as "this host logs no timestamp" and the agent clock is substituted.
+func TestRegisterLogCollector_PassesResolvedMethodAndTimeToParser(t *testing.T) {
+	a := newLogCollectorTestApp(t)
+	format := `{"ts":"$msec","m":"$request_method","u":"$request_uri","ua":"$http_user_agent"}`
+	a.registerLogCollector(context.Background(), nginx.LogConfig{
+		LogPaths:   []string{"/var/log/nginx/access.log"},
+		LogFormats: map[string]string{"/var/log/nginx/access.log": format},
+		JSONPaths:  map[string]bool{"/var/log/nginx/access.log": true},
+	})
+
+	assert.Equal(t, "m", a.botlogAliases.Method)
+	assert.Equal(t, "ts", a.botlogAliases.Time)
+	assert.InDelta(t, 0.0,
+		counterValue(t, a.configWarnings.WithLabelValues("botlog_no_time_field")), 1e-9,
+		"a renamed $msec is still a timestamp — warning would be false")
+}

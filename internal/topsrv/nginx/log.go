@@ -1,14 +1,17 @@
 package nginx
 
 import (
+	"bytes"
 	"context"
 	"encoding/json/v2"
+	"math"
 	"regexp"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unicode/utf8"
 
 	"github.com/vmkteam/topsrv/internal/topsrv"
@@ -27,7 +30,7 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 // DefaultLogFormat — combined + request_time + upstream_response_time.
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
-const maxCardinalityURI = 1000    // cap uri5xx map to prevent unbounded growth
+const maxCardinalityURI = 1000    // cap on uri4xx/uri5xx/bytesByURI keys; eviction policy in uricounters.go
 const maxCardinalityTagged = 500  // cap taggedCounts (status × extra labels) to prevent unbounded growth
 const maxPathDepth = 2            // collapse URI segments beyond this depth
 const maxNormalizedURIBytes = 240 // hard byte cap; Prometheus exposition rejects label values >256 bytes
@@ -45,14 +48,16 @@ var (
 	numericSegment = regexp.MustCompile(`/\d+`)
 	// uuidSegment matches UUID v4 format (8-4-4-4-12 hex, case-insensitive).
 	uuidSegment = regexp.MustCompile(`[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}`)
-	// hexHash matches 32-char hex strings (md5 hashes in media URLs).
-	hexHash = regexp.MustCompile(`[a-f0-9]{32}`)
+	// hexHash matches 32+ char hex strings (md5 hashes in media URLs; longer
+	// tokens too — a 48-hex name used to leave a 16-hex tail after :hash).
+	hexHash = regexp.MustCompile(`[a-f0-9]{32,}`)
 	// slugWithID matches slug-style segments ending with digits (e.g. "tommy-brewster-6401345").
 	slugWithID = regexp.MustCompile(`/[a-z][\w-]*-\d{4,}/`)
 	// hyphenSlug matches hyphenated slugs with 1+ hyphens (people, articles, products).
 	hyphenSlug = regexp.MustCompile(`/[a-z][a-z0-9]*(?:-[a-z0-9]+)+`)
-	// urlEncodedSegment matches path segments containing percent-encoded characters.
-	urlEncodedSegment = regexp.MustCompile(`/[^/]*%[0-9A-Fa-f]{2}[^/]*`)
+	// urlEncodedSegment matches path segments containing percent-encoded characters,
+	// including the non-standard %uXXXX form scanners use (/%u002f%u002eenv).
+	urlEncodedSegment = regexp.MustCompile(`/[^/]*%(?:[0-9A-Fa-f]{2}|u[0-9A-Fa-f]{4})[^/]*`)
 	// xenForoSlug matches XenForo-style segments: text.digits (threads, attachments, blogs, members).
 	xenForoSlug = regexp.MustCompile(`/[\w][\w-]*\.\d+/`)
 	// base64Token matches base64-encoded tokens with padding (containing = or ==).
@@ -82,6 +87,8 @@ type LogCollector struct {
 	parsers       map[string]*gonx.Parser // path → parser (for multi-format)
 	jsonPaths     map[string]bool         // path → true if log is JSON format
 	extractFields []string                // nginx vars read into ParsedLine.Extras (superset of labelFields)
+	methodField   string                  // resolved name of the request-verb field ("" → canonical names only)
+	timeField     string                  // resolved name of the request-time field ("" → canonical names only)
 	labelFields   []string                // nginx vars used as Prometheus labels (must be low-cardinality)
 	labelIdx      []int                   // labelFields[k] is at Extras[labelIdx[k]]; -1 if missing
 	logPaths      []string                // captured from LogConfig.LogPaths for Run
@@ -105,9 +112,9 @@ type LogCollector struct {
 	statusCounts map[string]uint64          // status → count (no extra labels)
 	taggedCounts map[taggedStatusKey]uint64 // status+labels → count
 	cacheCounts  map[string]uint64
-	uri5xx       map[statusURI]uint64
-	uri4xx       map[statusURI]uint64
-	bytesByURI   map[string]uint64
+	uri5xx       uriCounters[statusURI] // bounded, idle keys evicted, overflow → /:other (uricounters.go)
+	uri4xx       uriCounters[statusURI]
+	bytesByURI   uriCounters[string]
 	bytesTotal   atomic.Int64
 
 	observers []LogObserver // set-once before Run; iterated lock-free on the parse goroutine
@@ -154,6 +161,15 @@ type LogConfig struct {
 	// without paying Prometheus cardinality cost. Empty → defaults to
 	// ExtraLabels (single-purpose behaviour).
 	ExtractFields []string
+
+	// MethodField and TimeField name the field carrying the request verb and
+	// the request timestamp: the nginx variable for text formats, the JSON key
+	// for JSON ones. Operators rename these freely (`"ts":"$msec"`), and the
+	// canonical names are only a fallback — looking them up unconditionally is
+	// what made a renamed $msec read as "no timestamp at all". Empty → the
+	// canonical candidates below are the only ones tried.
+	MethodField string
+	TimeField   string
 }
 
 func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
@@ -195,6 +211,8 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		parsers:       parsers,
 		jsonPaths:     cfg.JSONPaths,
 		extractFields: extractFields,
+		methodField:   cfg.MethodField,
+		timeField:     cfg.TimeField,
 		labelFields:   cfg.ExtraLabels,
 		labelIdx:      labelIdx,
 		logPaths:      cfg.LogPaths,
@@ -204,18 +222,18 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		httpRequests:     prometheus.NewDesc("topsrv_nginx_http_requests_total", "HTTP requests by status code.", reqLabels, nil),
 		responseBytes:    prometheus.NewDesc("topsrv_nginx_response_bytes_total", "Total response bytes.", nil, nil),
 		cacheRequests:    prometheus.NewDesc("topsrv_nginx_cache_requests_total", "Requests by upstream cache status.", []string{"status"}, nil),
-		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI.", []string{"status", "uri"}, nil),
-		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI.", []string{"status", "uri"}, nil),
-		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI.", []string{"uri"}, nil),
+		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"uri"}, nil),
 
 		reqBuckets:   make([]uint64, len(defaultHTTPBuckets)+1),
 		upBuckets:    make([]uint64, len(defaultHTTPBuckets)+1),
 		statusCounts: make(map[string]uint64),
 		taggedCounts: make(map[taggedStatusKey]uint64),
 		cacheCounts:  make(map[string]uint64),
-		uri5xx:       make(map[statusURI]uint64),
-		uri4xx:       make(map[statusURI]uint64),
-		bytesByURI:   make(map[string]uint64),
+		uri5xx:       newURICounters[statusURI](maxCardinalityURI),
+		uri4xx:       newURICounters[statusURI](maxCardinalityURI),
+		bytesByURI:   newURICounters[string](maxCardinalityURI),
 	}
 }
 
@@ -263,16 +281,16 @@ func (c *LogCollector) Collect(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.cacheRequests, prometheus.CounterValue, float64(count), status)
 	}
 
-	for key, count := range c.uri5xx {
-		ch <- prometheus.MustNewConstMetric(c.http5xxRequests, prometheus.CounterValue, float64(count), key.status, key.uri)
+	for key, e := range c.uri5xx.m {
+		ch <- prometheus.MustNewConstMetric(c.http5xxRequests, prometheus.CounterValue, float64(e.count), key.status, key.uri)
 	}
 
-	for key, count := range c.uri4xx {
-		ch <- prometheus.MustNewConstMetric(c.http4xxRequests, prometheus.CounterValue, float64(count), key.status, key.uri)
+	for key, e := range c.uri4xx.m {
+		ch <- prometheus.MustNewConstMetric(c.http4xxRequests, prometheus.CounterValue, float64(e.count), key.status, key.uri)
 	}
 
-	for uri, bytes := range c.bytesByURI {
-		ch <- prometheus.MustNewConstMetric(c.responseByteURI, prometheus.CounterValue, float64(bytes), uri)
+	for uri, e := range c.bytesByURI.m {
+		ch <- prometheus.MustNewConstMetric(c.responseByteURI, prometheus.CounterValue, float64(e.count), uri)
 	}
 }
 
@@ -366,8 +384,92 @@ type ParsedLine struct {
 	RequestTime          string
 	UpstreamResponseTime string
 	UpstreamCacheStatus  string
-	Extras               [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
-	NExtras              int
+
+	// Method is the request verb, "" when the log_format carries neither
+	// $request_method nor $request. Typed field rather than an Extras slot:
+	// MaxExtras is a hard budget shared with operator ExtraLabels, and the
+	// verb is needed by every observer, not just the ones extras serve.
+	Method string
+	// Time is the raw request timestamp as logged ($msec / $time_iso8601 /
+	// $time_local), "" when the format carries none. Kept unparsed here —
+	// only observers that need it pay for the parse (see Timestamp).
+	Time string
+
+	Extras  [MaxExtras]string // extra field values (pre-extracted), addressed via LogCollector.ExtractFields()
+	NExtras int
+}
+
+// Timestamp parses Time into a time.Time. ok is false when the log_format
+// carried no timestamp or the value is unparseable, and callers then substitute
+// their own clock — which silently destroys inter-request timing, because think
+// time, request gaps and sequence detection are all computed from this field
+// downstream.
+//
+// The common cause, a format carrying no timestamp at all, is reported once at
+// startup as topsrv_collector_config_warnings_total{kind="botlog_no_time_field"}
+// — it is a static property of the log_format, known before the first request.
+// A per-line failure (garbage value, or one outside the sanity window) carries
+// no separate signal on purpose: this runs on the tail goroutine for every
+// line, and the fix for both is the same edit to the log_format.
+func (p *ParsedLine) Timestamp() (time.Time, bool) { return parseLogTime(p.Time) }
+
+// timeLocalLayout is nginx's $time_local ("18/Aug/2026:11:20:03 +0300").
+const timeLocalLayout = "02/Jan/2006:15:04:05 -0700"
+
+// minLogTime / maxLogSkew bound an accepted timestamp. A "0.000" from a broken
+// format would otherwise land events in 1970 and pass any freshness window,
+// and the other end is just as reachable: gonx matches fields positionally, so
+// a log_format that drifted out of sync with the parser puts an arbitrary — in
+// the limit client-controlled — token in the timestamp field. Unbounded, that
+// writes a year-292277026 event and opens a partition that far out downstream.
+var minLogTime = time.Date(2000, 1, 1, 0, 0, 0, 0, time.UTC)
+
+const maxLogSkew = 24 * time.Hour
+
+// maxEpochSec is a pre-conversion guard: int64() of a float too large to
+// represent is undefined in Go, so the epoch is range-checked before the
+// multiply, not only after. Far past any date minLogTime/maxLogSkew allow.
+const maxEpochSec = 1e12
+
+// parseLogTime decodes one of the three timestamp shapes nginx produces and
+// rejects anything outside the sanity window above.
+func parseLogTime(s string) (time.Time, bool) {
+	t, ok := decodeLogTime(s)
+	if !ok || t.Before(minLogTime) || t.After(time.Now().Add(maxLogSkew)) {
+		return time.Time{}, false
+	}
+	return t, true
+}
+
+// decodeLogTime picks the shape by a marker byte instead of trying each parser
+// in turn: every failed strconv/time parse allocates an error value that the
+// fallthrough would immediately discard, which on a $time_local-only format
+// made the "cheapest first" ordering the most expensive one.
+func decodeLogTime(s string) (time.Time, bool) {
+	if s == "" || s == "-" {
+		return time.Time{}, false
+	}
+	// $time_local ("18/Aug/2026:11:20:03 +0300") is the only shape carrying a
+	// '/', and $time_iso8601 the only one with a '-' past the first byte — a
+	// leading '-' is a negative epoch, which ParseFloat below rejects.
+	if strings.IndexByte(s, '/') > 0 {
+		t, err := time.Parse(timeLocalLayout, s)
+		return t, err == nil
+	}
+	if strings.IndexByte(s, '-') > 0 {
+		t, err := time.Parse(time.RFC3339, s)
+		return t, err == nil
+	}
+	if sec, err := strconv.ParseFloat(s, 64); err == nil {
+		// ParseFloat also accepts "NaN", "Inf", "infinity" and hex floats
+		// ("0x1p10"), none of which are timestamps. NaN is the sharp one: it
+		// fails every comparison, so a bare `sec <= 0` lets it through.
+		if math.IsNaN(sec) || sec <= 0 || sec > maxEpochSec {
+			return time.Time{}, false
+		}
+		return time.UnixMilli(int64(sec * 1e3)).UTC(), true
+	}
+	return time.Time{}, false
 }
 
 func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
@@ -376,27 +478,42 @@ func (c *LogCollector) parseLineWith(parser *gonx.Parser, line, path string) {
 		return
 	}
 
-	var p ParsedLine
-	p.Status, _ = entry.Field("status")
-	p.BodyBytesSent, _ = entry.Field("body_bytes_sent")
-	p.RequestTime, _ = entry.Field("request_time")
-	p.UpstreamResponseTime, _ = entry.Field("upstream_response_time")
-	p.UpstreamCacheStatus, _ = entry.Field("upstream_cache_status")
+	// Read the field map once instead of calling entry.Field per name: on a
+	// miss gonx builds an error with fmt.Errorf("%+v", *entry), formatting the
+	// entire record into a string that the `_` here throws away. A format
+	// without $request_method/$msec/$time_iso8601 misses three times per line,
+	// which costs more than the parse itself. Fields() returns the same map
+	// with no copy, so each lookup below is a plain index.
+	fields := entry.Fields()
 
-	p.URI, p.RawURI = resolveURI(func(name string) string {
-		v, _ := entry.Field(name)
-		return v
-	})
+	p := c.fillLine(func(name string) string { return fields[name] })
+	c.finishLine(&p, path)
+}
+
+// fillLine assembles a ParsedLine from a field accessor. All three parse paths
+// (text, JSON-into-map, JSON-into-struct) share it: they differ only in how a
+// field is looked up by name, and keeping the assembly in one place is what
+// stops them from drifting — the typed JSON path once carried its own URI
+// resolution and silently disagreed with the other two for a year.
+func (c *LogCollector) fillLine(get func(string) string) ParsedLine {
+	var p ParsedLine
+	p.Status = get("status")
+	p.BodyBytesSent = get("body_bytes_sent")
+	p.RequestTime = get("request_time")
+	p.UpstreamResponseTime = get("upstream_response_time")
+	p.UpstreamCacheStatus = get("upstream_cache_status")
+	p.URI, p.RawURI = resolveURI(get)
+	p.Method = c.resolveMethod(get)
+	p.Time = c.resolveTime(get)
 
 	for i, f := range c.extractFields {
 		if i >= len(p.Extras) {
 			break
 		}
-		p.Extras[i], _ = entry.Field(f)
+		p.Extras[i] = get(f)
 		p.NExtras = i + 1
 	}
-
-	c.finishLine(&p, path)
+	return p
 }
 
 func (c *LogCollector) ParseJSONLine(line string) {
@@ -404,30 +521,18 @@ func (c *LogCollector) ParseJSONLine(line string) {
 }
 
 func (c *LogCollector) parseJSONLine(line, path string) {
-	// When extra labels are needed, unmarshal into a generic map once
-	// to get both typed fields and arbitrary extra label values.
+	// When extra fields are needed, unmarshal into a generic map once — it is
+	// the only shape that can answer for a field name the struct below has no
+	// tag for. It costs ~18% more wall time and ~60% more garbage per line
+	// (BenchmarkParseJSONLine), which is why the struct path stays for hosts
+	// that need no extra fields.
 	if len(c.extractFields) > 0 {
-		var m map[string]string
+		var m map[string]logValue
 		if err := json.Unmarshal([]byte(line), &m); err != nil {
 			return
 		}
 
-		var p ParsedLine
-		p.Status = m["status"]
-		p.BodyBytesSent = m["body_bytes_sent"]
-		p.RequestTime = m["request_time"]
-		p.UpstreamResponseTime = m["upstream_response_time"]
-		p.UpstreamCacheStatus = m["upstream_cache_status"]
-		p.URI, p.RawURI = resolveURI(func(name string) string { return m[name] })
-
-		for i, f := range c.extractFields {
-			if i >= len(p.Extras) {
-				break
-			}
-			p.Extras[i] = m[f]
-			p.NExtras = i + 1
-		}
-
+		p := c.fillLine(func(name string) string { return string(m[name]) })
 		c.finishLine(&p, path)
 		return
 	}
@@ -437,16 +542,7 @@ func (c *LogCollector) parseJSONLine(line, path string) {
 		return
 	}
 
-	p := ParsedLine{
-		Status:               entry.Status,
-		BodyBytesSent:        entry.BodyBytesSent,
-		RequestTime:          entry.RequestTime,
-		UpstreamResponseTime: entry.UpstreamResponseTime,
-		UpstreamCacheStatus:  entry.UpstreamCacheStatus,
-		URI:                  normalizeRequestURI(entry.RequestURI, entry.Request),
-		RawURI:               rawURIFromJSON(entry.RequestURI, entry.Request),
-	}
-
+	p := c.fillLine(entry.field)
 	c.finishLine(&p, path)
 }
 
@@ -460,27 +556,191 @@ func (c *LogCollector) finishLine(p *ParsedLine, path string) {
 	}
 }
 
-// jsonLogEntry represents a single JSON-formatted nginx access log line.
-type jsonLogEntry struct {
-	Status               string `json:"status"`
-	BodyBytesSent        string `json:"body_bytes_sent"`
-	RequestTime          string `json:"request_time"`
-	UpstreamResponseTime string `json:"upstream_response_time"`
-	UpstreamCacheStatus  string `json:"upstream_cache_status"`
-	RequestURI           string `json:"request_uri"`
-	Request              string `json:"request"`
+// logValue is a log field that accepts both JSON shapes operators write. An
+// nginx JSON log_format is a hand-written template, and numeric-looking
+// variables are routinely emitted unquoted ('"msec":$msec', '"status":$status').
+// A plain string field rejects those, and since a decode error drops the whole
+// line, a single unquoted field costs the host every nginx metric and every
+// bot-log event — silently, with nothing but the missing series to go on.
+type logValue string
+
+func (v *logValue) UnmarshalJSON(b []byte) error {
+	if len(b) >= 2 && b[0] == '"' {
+		// Fast path: an nginx log value with no escape sequence is the norm
+		// (escape=json emits \xNN only for control bytes), and unquoting it is
+		// a reslice. Handing every field to the decoder instead roughly
+		// doubles decode cost on the tail goroutine's hot path.
+		if body := b[1 : len(b)-1]; bytes.IndexByte(body, '\\') < 0 {
+			*v = logValue(body)
+			return nil
+		}
+		return json.Unmarshal(b, (*string)(v))
+	}
+	if string(b) == "null" {
+		*v = ""
+		return nil
+	}
+	*v = logValue(b) // number or bool literal — kept verbatim, as if quoted
+	return nil
 }
 
-// normalizeRequestURI normalizes a URI from JSON log fields.
-func normalizeRequestURI(requestURI, request string) string {
-	if requestURI != "" {
-		if i := strings.IndexByte(requestURI, '?'); i >= 0 {
-			requestURI = requestURI[:i]
-		}
-		return normalizePath(requestURI)
+// jsonLogEntry represents a single JSON-formatted nginx access log line.
+//
+// Only the fields nginx can plausibly emit unquoted are logValue; the rest are
+// plain strings on purpose. json/v2 interns repeated string values across lines
+// through a decoder-level cache, and a type with its own UnmarshalJSON opts out
+// of it — spending logValue where it buys nothing cost 8 extra allocations per
+// line, on values that repeat constantly in an access log (method, host, cache
+// status).
+type jsonLogEntry struct {
+	Status               logValue `json:"status"`
+	BodyBytesSent        logValue `json:"body_bytes_sent"`
+	RequestTime          logValue `json:"request_time"`
+	UpstreamResponseTime logValue `json:"upstream_response_time"`
+	Msec                 logValue `json:"msec"`
+
+	UpstreamCacheStatus string `json:"upstream_cache_status"`
+	RequestURI          string `json:"request_uri"`
+	Request             string `json:"request"`
+	URI                 string `json:"uri"`
+	Args                string `json:"args"`
+	QueryString         string `json:"query_string"`
+	RequestMethod       string `json:"request_method"`
+	TimeISO8601         string `json:"time_iso8601"`
+	TimeLocal           string `json:"time_local"`
+}
+
+// field answers by nginx variable name so the typed decode path can be filled
+// by the same fillLine as the map one. The two carried separate URI logic
+// before, and the typed copy silently lagged: it counted nginx's "-"
+// placeholder as a real path (uri="/-") and knew nothing about formats that log
+// $uri and $args as separate fields. It must answer for every field the struct
+// decodes, or a resolver written against get would work on one path only.
+//
+// Names outside the struct — an operator's renamed key — return "". Those are
+// only reachable through the map path, which every format needing extra fields
+// already takes.
+func (e *jsonLogEntry) field(name string) string {
+	switch name {
+	case "status":
+		return string(e.Status)
+	case "body_bytes_sent":
+		return string(e.BodyBytesSent)
+	case "request_time":
+		return string(e.RequestTime)
+	case "upstream_response_time":
+		return string(e.UpstreamResponseTime)
+	case "msec":
+		return string(e.Msec)
+	case "upstream_cache_status":
+		return e.UpstreamCacheStatus
+	case "request_uri":
+		return e.RequestURI
+	case "request":
+		return e.Request
+	case "uri":
+		return e.URI
+	case "args":
+		return e.Args
+	case "query_string":
+		return e.QueryString
+	case "request_method":
+		return e.RequestMethod
+	case "time_iso8601":
+		return e.TimeISO8601
+	case "time_local":
+		return e.TimeLocal
 	}
-	if request != "" {
-		return normalizeURI(request)
+	return ""
+}
+
+// maxMethodLen caps an accepted verb. Longest IANA-registered method is
+// "VERSION-CONTROL" (15); 16 leaves one char of headroom without letting a
+// hostile $request grow the receiver's LowCardinality dictionary.
+const maxMethodLen = 16
+
+// MethodCandidates and TimeCandidates are the nginx variables that can carry
+// the request verb and the request timestamp, in resolution order. They are
+// exported because botlog detects which of them an operator's log_format
+// contains: detection and resolution must walk the same names in the same
+// order, or the agent warns about a missing field it then reads happily —
+// or, worse, reports a timestamp of a precision it did not resolve.
+var (
+	MethodCandidates = []string{"request_method", "request"}
+
+	// Ordered by precision: $msec carries milliseconds, $time_iso8601 and
+	// $time_local only whole seconds.
+	TimeCandidates = []string{"msec", "time_iso8601", "time_local"}
+)
+
+// methodOf coerces one logged value into a request verb. The value is either a
+// bare verb ($request_method) or a whole request line ($request, "GET /x
+// HTTP/1.1") — operators log either under either field name, so one function
+// accepts both shapes. Empty when neither applies: callers must NOT substitute
+// a default verb, because a guessed GET is indistinguishable from a real one,
+// which hides POST floods against login/checkout in exactly the traffic this
+// data is collected to inspect.
+func methodOf(s string) string {
+	if v := validMethod(s); v != "" {
+		return v
+	}
+	if i := strings.IndexByte(s, ' '); i > 0 {
+		return validMethod(s[:i])
+	}
+	return ""
+}
+
+// validMethod accepts uppercase ASCII tokens of a sane length, allowing the
+// interior hyphen the two dashed IANA methods carry (VERSION-CONTROL,
+// BASELINE-CONTROL). $request is verbatim client input: without this, a
+// scanner sending binary or randomized verbs writes unbounded distinct values
+// into a downstream LowCardinality column (same class of bug as the
+// normalizeURI binary bypass). A leading or trailing hyphen is rejected, which
+// also covers nginx's "-" placeholder for an absent value.
+func validMethod(s string) string {
+	if s == "" || len(s) > maxMethodLen {
+		return ""
+	}
+	for i := range len(s) {
+		switch c := s[i]; {
+		case c >= 'A' && c <= 'Z':
+		case c == '-' && i > 0 && i < len(s)-1:
+		default:
+			return ""
+		}
+	}
+	return s
+}
+
+// resolveMethod and resolveTime try the operator's resolved field name first
+// (LogConfig.MethodField / TimeField, detected from the log_format), then the
+// canonical candidates in order, stopping at the first hit — a format logging
+// $msec pays one lookup, not three. Both parse paths address fields by name, so
+// the two resolvers are shared between them.
+func (c *LogCollector) resolveMethod(get func(string) string) string {
+	if c.methodField != "" {
+		if v := methodOf(get(c.methodField)); v != "" {
+			return v
+		}
+	}
+	for _, name := range MethodCandidates {
+		if v := methodOf(get(name)); v != "" {
+			return v
+		}
+	}
+	return ""
+}
+
+func (c *LogCollector) resolveTime(get func(string) string) string {
+	if c.timeField != "" {
+		if v := get(c.timeField); v != "" && v != "-" {
+			return v
+		}
+	}
+	for _, name := range TimeCandidates {
+		if v := get(name); v != "" && v != "-" {
+			return v
+		}
 	}
 	return ""
 }
@@ -493,15 +753,6 @@ func rawURIFromRequest(request string) string {
 		return ""
 	}
 	return parts[1]
-}
-
-// rawURIFromJSON picks request_uri (already carries query string from nginx)
-// and falls back to parsing $request. Querystring is preserved.
-func rawURIFromJSON(requestURI, request string) string {
-	if requestURI != "" {
-		return requestURI
-	}
-	return rawURIFromRequest(request)
 }
 
 func stripQuery(p string) string {
@@ -586,27 +837,20 @@ func (c *LogCollector) recordLine(p *ParsedLine) { //nolint:gocognit,nestif
 		}
 
 		uri := p.URI
+		now := nowUnix()
 
 		if strings.HasPrefix(status, "5") && uri != "" {
-			key := statusURI{status, uri}
-			if _, ok := c.uri5xx[key]; ok || len(c.uri5xx) < maxCardinalityURI {
-				c.uri5xx[key]++
-			}
+			c.uri5xx.add(statusURI{status, uri}, statusURI{status, overflowMarker}, 1, now)
 		}
 
 		if strings.HasPrefix(status, "4") && uri != "" {
-			key := statusURI{status, uri}
-			if _, ok := c.uri4xx[key]; ok || len(c.uri4xx) < maxCardinalityURI {
-				c.uri4xx[key]++
-			}
+			c.uri4xx.add(statusURI{status, uri}, statusURI{status, overflowMarker}, 1, now)
 		}
 
 		if v, err := strconv.ParseInt(p.BodyBytesSent, 10, 64); err == nil {
 			c.bytesTotal.Add(v)
 			if uri != "" {
-				if _, ok := c.bytesByURI[uri]; ok || len(c.bytesByURI) < maxCardinalityURI {
-					c.bytesByURI[uri] += uint64(v)
-				}
+				c.bytesByURI.add(uri, overflowMarker, uint64(v), now)
 			}
 		}
 	}
@@ -724,28 +968,12 @@ func normalizePath(path string) string {
 	// Hard byte cap: even after all the above, a single segment can carry
 	// 256+ bytes (long transliterated slugs, concatenated normalized markers).
 	// Prometheus rejects label values >256 bytes, so trim with restMarker
-	// as a final guard. truncateAtRune walks back to a rune boundary so a
+	// as a final guard. TruncateAtRune walks back to a rune boundary so a
 	// multi-byte UTF-8 tail (Cyrillic, CJK) is never cut mid-rune.
 	if len(out) > maxNormalizedURIBytes {
-		return truncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
+		return topsrv.TruncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
 	}
 	return out
-}
-
-// truncateAtRune returns s[:n] adjusted backwards to a UTF-8 rune boundary.
-// Guarantees the result is valid UTF-8 when s is. Used to avoid emitting
-// label values with truncated multi-byte sequences.
-func truncateAtRune(s string, n int) string {
-	if n >= len(s) {
-		return s
-	}
-	if n < 0 {
-		return ""
-	}
-	for n > 0 && !utf8.RuneStart(s[n]) {
-		n--
-	}
-	return s[:n]
 }
 
 // truncatePath collapses path segments beyond maxDepth into restMarker.

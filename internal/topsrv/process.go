@@ -84,10 +84,11 @@ func (c *ProcessCollector) Collect(ch chan<- prometheus.Metric) {
 
 	for _, p := range procs {
 		name, err := p.Name()
-		if err != nil || name == "" {
+		if err != nil {
 			continue
 		}
-		if isKernelThread(name) {
+		name = sanitizeProcessName(name)
+		if name == "" || isKernelThread(name) {
 			continue
 		}
 
@@ -127,6 +128,26 @@ func (c *ProcessCollector) emitGroup(ch chan<- prometheus.Metric, name string, g
 		ch <- prometheus.MustNewConstMetric(c.openFDs, prometheus.GaugeValue, float64(g.openFDs), name)
 		ch <- prometheus.MustNewConstMetric(c.worstFDRatio, prometheus.GaugeValue, g.worstFDRatio, name)
 	}
+}
+
+// maxProcessNameLen caps a group name. comm in /proc/<pid>/status is at most
+// 15 bytes; at >= 15 gopsutil substitutes basename(cmdline[0]), which for a
+// normal binary is still only tens of bytes. Anything longer is an artifact,
+// not a name.
+const maxProcessNameLen = 64
+
+// sanitizeProcessName cleans up the name returned by gopsutil p.Name(). When
+// comm is >= 15 bytes gopsutil falls back to filepath.Base(cmdline[0]), and
+// processes that rewrite argv as one NUL-free string (chrome,
+// chrome-headless-shell) put their whole flag list into cmdline[0] — that
+// yields group label values of several hundred bytes and a new series per flag
+// set. Cut at the first " -" (a flag boundary; a bare space is legal, e.g.
+// "tmux: server", "Web Content") and cap the length without splitting a rune.
+func sanitizeProcessName(name string) string {
+	if i := strings.Index(name, " -"); i > 0 {
+		name = name[:i]
+	}
+	return TruncateAtRune(strings.TrimSpace(name), maxProcessNameLen)
 }
 
 // isKernelThread returns true for Linux kernel thread names that are not useful for monitoring.

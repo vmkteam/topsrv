@@ -260,8 +260,10 @@ func (c *NetstatCollector) resolveProcName(pid int32, cache map[int32]string) st
 	}
 	name, err := p.Name()
 	if err != nil {
-		name = ""
+		cache[pid] = ""
+		return ""
 	}
+	name = sanitizeProcessName(name) // same cmdline artifact as in process groups
 	cache[pid] = name
 	return name
 }

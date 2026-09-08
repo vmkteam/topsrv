@@ -139,7 +139,7 @@ func New(appName, version string, logger embedlog.Logger, cfg Config) *App {
 		}, []string{"collector"}),
 		configWarnings: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "topsrv_collector_config_warnings_total",
-			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field|botlog_alias_mismatch.",
+			Help: "Operator-config warnings raised at startup. kind=high_card_label|missing_extract|truncated_extract|botlog_no_ua_field|botlog_no_time_field|botlog_no_method_field|botlog_alias_mismatch.",
 		}, []string{"kind"}),
 	}
 	a.registry.MustRegister(a.scrapeDuration, a.scrapePanics, a.configWarnings)
@@ -368,9 +368,27 @@ func (a *App) registerLogCollector(ctx context.Context, cfg nginx.LogConfig) {
 	if a.cfg.BotLogs != nil && a.cfg.BotLogs.Enabled {
 		a.botlogAliases = a.resolveBotlogAliases(ctx, cfg)
 		cfg.ExtractFields = mergeUnique(cfg.ExtraLabels, botlog.RequiredFields(a.botlogAliases))
+		// Method and Time bypass ExtractFields — they land in typed ParsedLine
+		// fields, so the resolved names go to the parser directly.
+		cfg.MethodField = a.botlogAliases.Method
+		cfg.TimeField = a.botlogAliases.Time
 		if a.botlogAliases.UserAgent == "" {
 			a.warnConfig(ctx, "botlog_no_ua_field",
 				"BotLogs enabled but no tailed log_format contains http_user_agent; events will never match — check nginx/angie log_format directives, or set [BotLogs.FieldAliases].UserAgent to the custom field name",
+				"log_paths", cfg.LogPaths)
+		}
+		// Both are checked here rather than per line: a log_format is a static
+		// per-host property, so the answer is known before the first request
+		// is read — and on a host with little bot traffic a parse-time warning
+		// could take hours to appear, or never appear at all.
+		if a.botlogAliases.Time == "" {
+			a.warnConfig(ctx, "botlog_no_time_field",
+				"BotLogs enabled but no tailed log_format carries a request timestamp; events will be stamped with the agent's clock at parse time, so request gaps, think time and sequence detection are unreliable — add $msec (preferred; $time_iso8601 and $time_local are whole-second only) to log_format",
+				"log_paths", cfg.LogPaths)
+		}
+		if a.botlogAliases.Method == "" {
+			a.warnConfig(ctx, "botlog_no_method_field",
+				"BotLogs enabled but no tailed log_format carries the request method; events will ship method empty, so POST floods are indistinguishable from ordinary reads — add $request_method (or $request) to log_format",
 				"log_paths", cfg.LogPaths)
 		}
 	}
@@ -509,12 +527,14 @@ func aliasSources(override, detected botlog.FieldAliases) string {
 			return "default"
 		}
 	}
-	return fmt.Sprintf("ua=%s host=%s server=%s remote=%s referer=%s",
+	return fmt.Sprintf("ua=%s host=%s server=%s remote=%s referer=%s method=%s time=%s",
 		src(override.UserAgent, detected.UserAgent),
 		src(override.Host, detected.Host),
 		src(override.ServerName, detected.ServerName),
 		src(override.RemoteAddr, detected.RemoteAddr),
 		src(override.Referer, detected.Referer),
+		src(override.Method, detected.Method),
+		src(override.Time, detected.Time),
 	)
 }
 
