@@ -81,6 +81,15 @@ jobs:
 
       - uses: anchore/sbom-action/download-syft@v0
 
+      # GORELEASER_CURRENT_TAG pins the release to the tag that was pushed.
+      # Left to itself goreleaser picks among the tags pointing at HEAD with
+      # `--sort=-version:refname`, and git's versionsort ranks `v0.1.6-rc.2`
+      # ABOVE `v0.1.6` unless `versionsort.suffix` is set — it reads the
+      # suffix as more refname, not as a semver prerelease. So a final tag
+      # placed on the same commit as its last release candidate, the normal
+      # case when the rc needed no further fixes, rebuilds the rc instead:
+      # every artifact carries the rc version and the upload then fails 422,
+      # because the rc's own release already holds those asset names.
       - name: Release
         uses: goreleaser/goreleaser-action@v7
         with:
@@ -88,3 +97,4 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GOEXPERIMENT: jsonv2
+          GORELEASER_CURRENT_TAG: ${{ github.ref_name }}
