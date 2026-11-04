@@ -89,6 +89,7 @@ func (c *Collector) scanManager(ctx context.Context, m managerFunc, host HostMet
 		c.Error(ctx, "packages: scan failed", "manager", m.name, "error", err)
 		return Snapshot{}, nil, false
 	}
+	snap.RebootRequired = markKernelPackages(m.name, snap.Packages, host.KernelRelease)
 
 	total := len(snap.Packages)
 	if total > limit {
@@ -127,6 +128,7 @@ func buildPendingPayloads(host HostMeta, snaps []Snapshot, now time.Time, pushEn
 	for _, s := range snaps {
 		h := host
 		h.PackageManager = s.Manager
+		h.RebootRequired = s.RebootRequired
 		out = append(out, Payload{
 			Kind:      inventoryKindPackages,
 			ScannedAt: now,

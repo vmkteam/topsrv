@@ -39,12 +39,18 @@ type HostMeta struct {
 	KernelRelease     string   `json:"kernelRelease"`
 	KernelArch        string   `json:"kernelArch,omitempty"`
 	PackageManager    string   `json:"packageManager"`
+	// RebootRequired — a kernel image newer than the running one is installed;
+	// the update takes effect only after a reboot. Per manager snapshot.
+	RebootRequired bool `json:"rebootRequired,omitempty"`
 }
 
 // Snapshot is the data shape for kind="packages".
 type Snapshot struct {
 	Manager  string    `json:"manager"`
 	Packages []Package `json:"packages"`
+	// RebootRequired is set by markKernelPackages and shipped in HostMeta,
+	// not in data.
+	RebootRequired bool `json:"-"`
 }
 
 // Package — security-oriented inventory entry. Field grouping mirrors the
