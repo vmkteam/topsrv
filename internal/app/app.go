@@ -233,11 +233,7 @@ func (a *App) Shutdown() {
 }
 
 func (a *App) goBackground(fn func()) {
-	a.bg.Add(1)
-	go func() {
-		defer a.bg.Done()
-		fn()
-	}()
+	a.bg.Go(fn)
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -901,10 +897,8 @@ func (a *App) registerAngie(ctx context.Context, services []topsrv.Service) {
 
 func findService(services []topsrv.Service, types ...string) *topsrv.Service {
 	for i := range services {
-		for _, t := range types {
-			if services[i].Type == t {
-				return &services[i]
-			}
+		if slices.Contains(types, services[i].Type) {
+			return &services[i]
 		}
 	}
 	return nil

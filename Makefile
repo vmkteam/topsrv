@@ -2,7 +2,7 @@ APP_NAME = topsrv
 BUILD_DIR = bin
 export CGO_ENABLED = 0
 
-.PHONY: build run test test-integration test-certs fmt lint clean init demo demo-stop
+.PHONY: build run test test-integration test-certs fix fmt lint clean init demo demo-stop
 
 build:
 	go build -o $(BUILD_DIR)/$(APP_NAME) ./cmd/$(APP_NAME)
@@ -24,7 +24,14 @@ test-integration: test-certs
 	go test -tags=integration -count=1 -v ./internal/topsrv/...
 	docker compose -f docker-compose.test.yml down
 
-fmt:
+# go fix rewrites only files of the current GOOS and build tags: linux with
+# integration plus windows covers every file. omitzero stays off — replacing
+# omitempty with omitzero changes the JSON sent to the backend.
+fix:
+	@GOOS=linux go fix -tags=integration -omitzero=false ./...
+	@GOOS=windows go fix -omitzero=false ./...
+
+fmt: fix
 	@golangci-lint fmt
 
 lint:

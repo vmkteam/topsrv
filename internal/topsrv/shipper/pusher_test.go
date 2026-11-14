@@ -98,7 +98,7 @@ func decodeBatchLines(t *testing.T, raw []byte) [][]byte {
 	plain, err := io.ReadAll(gz)
 	require.NoError(t, err)
 	out := make([][]byte, 0)
-	for _, l := range strings.Split(strings.TrimRight(string(plain), "\n"), "\n") {
+	for l := range strings.SplitSeq(strings.TrimRight(string(plain), "\n"), "\n") {
 		if l != "" {
 			out = append(out, []byte(l))
 		}

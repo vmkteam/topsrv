@@ -51,7 +51,7 @@ func TestE2E_TailFileToIngest(t *testing.T) {
 		_ = gz.Close()
 
 		var evs []Event
-		for _, line := range strings.Split(strings.TrimRight(string(plain), "\n"), "\n") {
+		for line := range strings.SplitSeq(strings.TrimRight(string(plain), "\n"), "\n") {
 			if line == "" {
 				continue
 			}

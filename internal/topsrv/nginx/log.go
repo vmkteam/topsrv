@@ -858,8 +858,8 @@ func rawURIFromRequest(request string) string {
 // StripQuery cuts a raw URI at the query separator. Exported for observers that
 // filter on the path alone.
 func StripQuery(p string) string {
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		return p[:i]
+	if before, _, ok := strings.Cut(p, "?"); ok {
+		return before
 	}
 	return p
 }
