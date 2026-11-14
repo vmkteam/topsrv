@@ -1,7 +1,7 @@
 package topsrv
 
 import (
-	"github.com/vmkteam/topsrv/internal/topsrv/packages"
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -14,22 +14,23 @@ type Collector interface {
 	Name() string
 }
 
-// QueryMetaProvider returns query metadata for push to gatesrv /v1/meta.
+// QueryMetaProvider returns query metadata for push to /v1/meta.
 type QueryMetaProvider interface {
 	QueryMeta() []postgres.QueryMeta
 }
 
-// InventoryProvider returns inventory snapshots for push to gatesrv
-// /v1/inventory. Each payload carries its own `kind` discriminator
-// (packages, repos, packageHistory, ...). Returns nil/empty when there's
-// nothing fresh to push — pusher won't send empty payloads.
+// InventoryProvider returns inventory snapshots for push to /v1/inventory.
+// Each payload carries its own `kind` discriminator (packages, repos,
+// packageHistory, ...). Returns nil/empty when there's nothing fresh to
+// push — pusher won't send empty payloads.
 //
 // One-shot semantics: provider should drain its buffer after Inventory()
-// is called so each snapshot is sent at most once. The optional
-// InventoryAckReceiver mixin lets the provider learn which sends actually
-// succeeded so it can re-queue on failure.
+// is called so each snapshot is sent at most once. Retries are the pusher's
+// job: a retryable failure goes to the spool, so providers must not re-queue.
+// The optional InventoryAckReceiver mixin reports live sends that succeeded
+// (e.g. for a last-push metric).
 type InventoryProvider interface {
-	Inventory() []packages.Payload
+	Inventory() []inventory.Payload
 }
 
 // InventoryAckReceiver is optionally implemented by an InventoryProvider to

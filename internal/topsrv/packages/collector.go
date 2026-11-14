@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmkteam/embedlog"
 )
@@ -36,7 +38,7 @@ type Collector struct {
 	// pending holds payloads produced by the last scan, drained by Inventory().
 	// One-shot: each scan overwrites the previous pending if the pusher hasn't
 	// drained — only the latest snapshot is ever sent.
-	pending      []Payload
+	pending      []inventory.Payload
 	lastPushUnix map[string]int64 // kind → last successful push unix sec
 	scanErrCount map[string]int   // manager → cumulative scan failure count
 }
@@ -105,7 +107,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 
 // Inventory drains the pending snapshot buffer. Called by Pusher each tick.
 // One-shot: subsequent calls return nil until the next scan finishes.
-func (c *Collector) Inventory() []Payload {
+func (c *Collector) Inventory() []inventory.Payload {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	out := c.pending
@@ -126,7 +128,7 @@ func (c *Collector) OnInventoryPushed(kind string) {
 
 // Run starts the background scan loop. Blocks until ctx is cancelled.
 // Interval gets ±10% jitter per iteration so co-deployed agents don't
-// stampede gatesrv at the same wall-clock instant.
+// stampede the backend at the same wall-clock instant.
 func (c *Collector) Run(ctx context.Context) {
 	interval := c.cfg.ParsedInterval()
 	c.Print(ctx, "packages: started", "interval", interval)

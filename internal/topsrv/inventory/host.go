@@ -1,6 +1,4 @@
-//go:build linux
-
-package packages
+package inventory
 
 import (
 	"bufio"
@@ -9,12 +7,12 @@ import (
 	"strings"
 )
 
-// detectHost populates HostMeta from /etc/os-release + /proc/sys/kernel/osrelease.
-// PackageManager is left empty — the caller fills it per-snapshot since one host
+// DetectHost populates HostMeta from /etc/os-release + /proc/sys/kernel/osrelease.
+// PackageManager is left empty — the caller fills it per snapshot since one host
 // may have multiple managers (rare: dpkg+rpm cohabitation in containers).
-// `root` enables chroot-style scans (e.g. /mnt/host-root for sidecar deployments);
-// the production collector passes "".
-func detectHost(root string) HostMeta {
+// `root` enables chroot-style scans and fixture-based tests; production
+// passes "". Unreadable files leave their fields empty.
+func DetectHost(root string) HostMeta {
 	h := HostMeta{
 		KernelArch: runtime.GOARCH,
 	}

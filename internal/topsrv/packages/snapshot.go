@@ -1,14 +1,5 @@
 package packages
 
-import "time"
-
-// Manager values used in label sets, JSON, and discovery dispatch.
-const (
-	ManagerDpkg = "dpkg"
-	ManagerRpm  = "rpm"
-	ManagerApk  = "apk"
-)
-
 // Status values for Package.Status. dpkg distinguishes installed vs held;
 // rpm and apk collapse to a generic "installed".
 const (
@@ -16,33 +7,6 @@ const (
 	StatusHoldInstalled = "hold ok installed"
 	StatusGeneric       = "installed"
 )
-
-// Payload — body shape for POST /v1/inventory. The kind discriminator routes
-// snapshots on gatesrv. Host-level facts (osId, kernelRelease, ...) live in
-// `host`, not in every package row — keeps payload small.
-type Payload struct {
-	Kind      string    `json:"kind"`
-	ScannedAt time.Time `json:"scannedAt"`
-	Host      HostMeta  `json:"host"`
-	Data      any       `json:"data"` // Snapshot | ReposSnapshot | HistorySnapshot (Phase 4)
-}
-
-// HostMeta — required upstream by Vulners audit (osId+osVersionId+kernelRelease).
-// kernelRelease is critical: Vulners' agent filters kernel-*/linux-image-* not
-// matching `uname -r` to avoid false positives on inactive kernels.
-type HostMeta struct {
-	OsID              string   `json:"osId"`
-	OsVersionID       string   `json:"osVersionId"`
-	OsVersionCodename string   `json:"osVersionCodename,omitempty"`
-	OsIDLike          []string `json:"osIdLike,omitempty"`
-	OsPrettyName      string   `json:"osPrettyName,omitempty"`
-	KernelRelease     string   `json:"kernelRelease"`
-	KernelArch        string   `json:"kernelArch,omitempty"`
-	PackageManager    string   `json:"packageManager"`
-	// RebootRequired — a kernel image newer than the running one is installed;
-	// the update takes effect only after a reboot. Per manager snapshot.
-	RebootRequired bool `json:"rebootRequired,omitempty"`
-}
 
 // Snapshot is the data shape for kind="packages".
 type Snapshot struct {

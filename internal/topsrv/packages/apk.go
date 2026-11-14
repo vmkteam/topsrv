@@ -11,13 +11,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+
 	"github.com/vmkteam/embedlog"
 )
 
-const (
-	apkInstalledPath = "/lib/apk/db/installed"
-	apkWorldPath     = "/etc/apk/world"
-)
+const apkWorldPath = "/etc/apk/world"
 
 // Apk is the apk-tools (Alpine) manager.
 type Apk struct {
@@ -29,7 +28,7 @@ func NewApk(logger embedlog.Logger, root string) *Apk {
 	return &Apk{Logger: logger, root: root}
 }
 
-func (m *Apk) Name() string { return ManagerApk }
+func (m *Apk) Name() string { return inventory.ManagerApk }
 
 // Scan reads /lib/apk/db/installed. apk-tools encodes each package as a
 // paragraph with single-letter keys (P=name, V=version, A=arch, I=installed
@@ -37,7 +36,7 @@ func (m *Apk) Name() string { return ManagerApk }
 // C=checksum, U=URL, T=description). Records are blank-line separated, no
 // continuation lines.
 func (m *Apk) Scan(_ context.Context) (Snapshot, error) {
-	f, err := os.Open(m.root + apkInstalledPath)
+	f, err := os.Open(m.root + inventory.ApkInstalledPath)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("open apk db: %w", err)
 	}
@@ -76,7 +75,7 @@ func (m *Apk) Scan(_ context.Context) (Snapshot, error) {
 
 	m.enrichAutoInstalled(pkgs)
 
-	return Snapshot{Manager: ManagerApk, Packages: pkgs}, nil
+	return Snapshot{Manager: inventory.ManagerApk, Packages: pkgs}, nil
 }
 
 // setChecksum parses apk's "C:" field, which encodes a hash with an algorithm

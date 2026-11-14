@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+
 	"github.com/vmkteam/embedlog"
 )
 
@@ -14,13 +16,13 @@ import (
 // pending kernel past the limit still sets RebootRequired.
 func TestScanManagerMarksKernelsBeforeTruncation(t *testing.T) {
 	c := NewCollector(embedlog.Logger{}, Config{})
-	m := managerFunc{name: ManagerDpkg, scan: func(context.Context) (Snapshot, error) {
-		return Snapshot{Manager: ManagerDpkg, Packages: []Package{
+	m := managerFunc{name: inventory.ManagerDpkg, scan: func(context.Context) (Snapshot, error) {
+		return Snapshot{Manager: inventory.ManagerDpkg, Packages: []Package{
 			deb("linux-image-6.8.0-90-generic", "6.8.0-90.91"),
 			deb("linux-image-6.8.0-147-generic", "6.8.0-147.147"),
 		}}, nil
 	}}
-	host := HostMeta{KernelRelease: "6.8.0-90-generic"}
+	host := inventory.HostMeta{KernelRelease: "6.8.0-90-generic"}
 
 	snap, _, ok := c.scanManager(t.Context(), m, host, 1, time.Now())
 	if !ok {
@@ -35,17 +37,17 @@ func TestScanManagerMarksKernelsBeforeTruncation(t *testing.T) {
 }
 
 func TestBuildPendingPayloadsRebootRequired(t *testing.T) {
-	host := HostMeta{OsID: "ubuntu", KernelRelease: "6.8.0-90-generic"}
+	host := inventory.HostMeta{OsID: "ubuntu", KernelRelease: "6.8.0-90-generic"}
 	snaps := []Snapshot{
-		{Manager: ManagerDpkg, RebootRequired: true},
-		{Manager: ManagerRpm},
+		{Manager: inventory.ManagerDpkg, RebootRequired: true},
+		{Manager: inventory.ManagerRpm},
 	}
 
 	out := buildPendingPayloads(host, snaps, time.Now(), true)
 	if len(out) != 2 {
 		t.Fatalf("got %d payloads, want 2", len(out))
 	}
-	if !out[0].Host.RebootRequired || out[0].Host.PackageManager != ManagerDpkg {
+	if !out[0].Host.RebootRequired || out[0].Host.PackageManager != inventory.ManagerDpkg {
 		t.Errorf("dpkg payload host = %+v, want rebootRequired for dpkg", out[0].Host)
 	}
 	if out[1].Host.RebootRequired {

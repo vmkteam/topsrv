@@ -4,12 +4,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -26,7 +26,7 @@ import (
 // receiver collects bodies and headers from POSTs for assertions.
 type receiver struct {
 	mu       sync.Mutex
-	status   int32 // atomic; default 200
+	status   atomic.Int32 // atomic; default 200
 	bodies   [][]byte
 	headers  []http.Header
 	failOnce atomic.Bool
@@ -34,7 +34,7 @@ type receiver struct {
 
 func newReceiver() *receiver {
 	r := &receiver{}
-	atomic.StoreInt32(&r.status, http.StatusOK)
+	r.status.Store(http.StatusOK)
 	return r
 }
 
@@ -47,7 +47,7 @@ func (r *receiver) handler(w http.ResponseWriter, req *http.Request) {
 		w.WriteHeader(http.StatusServiceUnavailable)
 		return
 	}
-	status := int(atomic.LoadInt32(&r.status))
+	status := int(r.status.Load())
 
 	r.mu.Lock()
 	r.bodies = append(r.bodies, body)
@@ -214,11 +214,11 @@ func TestPusher_DropOnQueueFull(t *testing.T) {
 
 func TestPusher_SpoolOnFailure(t *testing.T) {
 	r := newReceiver()
-	atomic.StoreInt32(&r.status, http.StatusServiceUnavailable)
+	r.status.Store(http.StatusServiceUnavailable)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
-	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 2, "20ms")
+	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 2, "20ms")
 	p.retryBackoff = 10 * time.Millisecond
 	startPusher(t, p)
 
@@ -226,13 +226,13 @@ func TestPusher_SpoolOnFailure(t *testing.T) {
 	p.Enqueue(sampleEvent("/b"))
 
 	require.Eventually(t, func() bool {
-		files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
+		files := p.dir.Files("")
 		return len(files) > 0
 	}, 3*time.Second, 20*time.Millisecond)
 
-	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
+	files := p.dir.Files("")
 	require.Len(t, files, 1)
-	assert.True(t, strings.HasSuffix(files[0], spoolSuffix))
+	assert.True(t, strings.HasSuffix(files[0], spoolExt))
 	assert.Positive(t, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateSpooled, "")))
 }
 
@@ -331,7 +331,7 @@ func TestPusher_TrimSpoolByBudget(t *testing.T) {
 
 	p.trimSpool(context.Background())
 
-	files, _ := filepath.Glob(filepath.Join(cfg.SpoolDir, spoolFileGlob))
+	files := p.dir.Files("")
 	assert.Len(t, files, 2, "oldest file evicted")
 	_, err := os.Stat(filepath.Join(cfg.SpoolDir, "100-aaaa.ndjson.gz"))
 	assert.True(t, os.IsNotExist(err))
@@ -339,11 +339,11 @@ func TestPusher_TrimSpoolByBudget(t *testing.T) {
 
 func TestPusher_PermanentFailureDropsBatch(t *testing.T) {
 	r := newReceiver()
-	atomic.StoreInt32(&r.status, http.StatusBadRequest)
+	r.status.Store(http.StatusBadRequest)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
-	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 1, "20ms")
+	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 1, "20ms")
 	p.retryBackoff = 10 * time.Millisecond
 	startPusher(t, p)
 
@@ -354,7 +354,7 @@ func TestPusher_PermanentFailureDropsBatch(t *testing.T) {
 	}, 2*time.Second, 25*time.Millisecond)
 
 	// Permanent rejection must NOT spool — a 4xx will repeat forever otherwise.
-	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
+	files := p.dir.Files("")
 	assert.Empty(t, files, "4xx batch must be discarded, not spooled")
 	assert.Positive(t, testutil.ToFloat64(p.sendErrors.WithLabelValues(errStatus)))
 }
@@ -363,7 +363,7 @@ func TestPusher_RetrySpoolDiscardsPermanentlyRejected(t *testing.T) {
 	// Pre-seed spool with a valid batch; server returns 400 to every request.
 	// The replay must delete the file instead of breaking the loop forever.
 	r := newReceiver()
-	atomic.StoreInt32(&r.status, http.StatusBadRequest)
+	r.status.Store(http.StatusBadRequest)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
@@ -404,26 +404,28 @@ func TestPusher_RetrySuccess(t *testing.T) {
 		"first attempt's status failure ticked")
 }
 
-func TestIsPermanentFailure(t *testing.T) {
-	cases := []struct {
-		name string
-		err  error
-		want bool
-	}{
-		{"nil", nil, false},
-		{"network", errors.New("dial tcp: connection refused"), false},
-		{"400", &httpStatusError{code: http.StatusBadRequest}, true},
-		{"401", &httpStatusError{code: http.StatusUnauthorized}, true},
-		{"403", &httpStatusError{code: http.StatusForbidden}, true},
-		{"413", &httpStatusError{code: http.StatusRequestEntityTooLarge}, true},
-		{"408 request timeout", &httpStatusError{code: http.StatusRequestTimeout}, false},
-		{"429 rate limit", &httpStatusError{code: http.StatusTooManyRequests}, false},
-		{"500", &httpStatusError{code: http.StatusInternalServerError}, false},
-		{"503", &httpStatusError{code: http.StatusServiceUnavailable}, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			assert.Equal(t, tc.want, isPermanentFailure(tc.err))
+// 401/403 are transient for the spool: a re-issued token may not have reached
+// the agent's config yet, so the batch waits instead of being dropped. The
+// token is read only at startup, so the batch goes to the spool at once — an
+// in-flush retry would only stall the queue for the backoff.
+func TestPusher_UnauthorizedIsSpooled(t *testing.T) {
+	for _, status := range []int{http.StatusUnauthorized, http.StatusForbidden} {
+		t.Run(strconv.Itoa(status), func(t *testing.T) {
+			r := newReceiver()
+			r.status.Store(int32(status))
+			srv := httptest.NewServer(http.HandlerFunc(r.handler))
+			defer srv.Close()
+
+			p, _ := newTestPusher(t, srv.URL, t.TempDir(), 1, "10s") // long interval: no spool replay mid-test
+			p.retryBackoff = time.Hour                               // an in-flush retry would never finish
+			startPusher(t, p)
+
+			p.Enqueue(sampleEvent("/token"))
+
+			require.Eventually(t, func() bool { return len(p.dir.Files("")) > 0 }, 3*time.Second, 20*time.Millisecond,
+				"the batch is spooled without waiting for the retry backoff")
+			assert.Equal(t, 1, r.calls(), "no in-flush retry")
+			assert.Zero(t, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateDropped, dropReasonPermanent)))
 		})
 	}
 }
@@ -434,11 +436,6 @@ func TestNewBatchID_TimestampOrdered(t *testing.T) {
 	id2 := newBatchID()
 	assert.Less(t, id1, id2, "batch ids must sort lexicographically by time")
 	assert.Regexp(t, `^\d+-[0-9a-f]{16}$`, id1)
-}
-
-func TestBatchIDFromPath(t *testing.T) {
-	assert.Equal(t, "1715000000-cafe1234cafe5678", batchIDFromPath("/tmp/spool/botlog/1715000000-cafe1234cafe5678.ndjson.gz"))
-	assert.Equal(t, "no-suffix", batchIDFromPath("no-suffix"))
 }
 
 // Guards the FIFO contract: replacing newBatchID with a non-unix-ms-prefixed
@@ -493,11 +490,11 @@ func TestPusher_RetrySpoolOrderOldestFirst(t *testing.T) {
 // the rolling-restart-with-503 case.
 func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
 	r := newReceiver()
-	atomic.StoreInt32(&r.status, http.StatusServiceUnavailable)
+	r.status.Store(http.StatusServiceUnavailable)
 	srv := httptest.NewServer(http.HandlerFunc(r.handler))
 	defer srv.Close()
 
-	p, spool := newTestPusher(t, srv.URL, t.TempDir(), 100, "10s")
+	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 100, "10s")
 	p.retryBackoff = 10 * time.Millisecond
 	stop := startPusher(t, p)
 
@@ -507,7 +504,7 @@ func TestPusher_DrainSpoolsWhenEndpointDown(t *testing.T) {
 	time.Sleep(50 * time.Millisecond) // let events sit in the queue
 	stop()
 
-	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
+	files := p.dir.Files("")
 	assert.NotEmpty(t, files, "drained batch must hit spool when endpoint is down")
 	assert.Positive(t, testutil.ToFloat64(p.eventsTotal.WithLabelValues(stateSpooled, "")))
 }
@@ -548,25 +545,20 @@ func TestPusher_RetrySpoolDoesNotBlockOnTransientFailures(t *testing.T) {
 	require.Eventually(t, func() bool { return calls.Load() >= 2 }, 2*time.Second, 10*time.Millisecond,
 		"newer batches must not be blocked by a transient-failing older batch")
 
-	files, _ := filepath.Glob(filepath.Join(spool, spoolFileGlob))
+	files := p.dir.Files("")
 	assert.Contains(t, files, filepath.Join(spool, "100-a.ndjson.gz"))
 }
 
-func TestHTTPStatusError_NoBody(t *testing.T) {
-	e := &httpStatusError{code: 500, bodyLen: 234}
-	assert.Equal(t, "HTTP 500 (body 234 bytes)", e.Error())
-}
+func TestPusher_SendErrorHasNoBody(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "Authorization: Bearer SENTINEL")
+	}))
+	defer srv.Close()
+	p, _ := newTestPusher(t, srv.URL, t.TempDir(), 1, "1s")
 
-func TestOwnsSpoolFile_SelfOwned(t *testing.T) {
-	p, dir := newTestPusher(t, "http://x.invalid", t.TempDir(), 1, "1s")
-	require.NoError(t, os.MkdirAll(dir, 0o700))
-	f := filepath.Join(dir, "100-a.ndjson.gz")
-	require.NoError(t, os.WriteFile(f, []byte("x"), 0o600))
-	assert.True(t, p.ownsSpoolFile(context.Background(), f))
-}
+	err := p.send(t.Context(), []byte("x"), "100-a")
 
-func TestOwnsSpoolFile_NonExistent(t *testing.T) {
-	p, dir := newTestPusher(t, "http://x.invalid", t.TempDir(), 1, "1s")
-	assert.False(t, p.ownsSpoolFile(context.Background(), filepath.Join(dir, "ghost.ndjson.gz")),
-		"non-existent path must fail closed")
+	require.Error(t, err)
+	assert.Equal(t, "HTTP 500", err.Error(), "an echoed body must not reach the logs")
 }
