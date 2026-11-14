@@ -68,21 +68,7 @@ func (r *receiver) lastDecoded(t *testing.T) [][]byte {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	require.NotEmpty(t, r.bodies, "no batches received yet")
-
-	gz, err := gzip.NewReader(bytes.NewReader(r.bodies[len(r.bodies)-1]))
-	require.NoError(t, err)
-	defer gz.Close()
-	plain, err := io.ReadAll(gz)
-	require.NoError(t, err)
-
-	lines := strings.Split(strings.TrimRight(string(plain), "\n"), "\n")
-	out := make([][]byte, 0, len(lines))
-	for _, l := range lines {
-		if l != "" {
-			out = append(out, []byte(l))
-		}
-	}
-	return out
+	return decodeBatchLines(t, r.bodies[len(r.bodies)-1])
 }
 
 // decodeBatchLines returns the non-empty ndjson lines from a gzipped batch.

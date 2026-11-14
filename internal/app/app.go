@@ -168,15 +168,15 @@ func (a *App) Run(ctx context.Context) error {
 	a.registerWebLogs(ctx)
 
 	if a.logCollector != nil {
-		a.goBackground(func() { a.logCollector.Run(ctx) })
+		a.bg.Go(func() { a.logCollector.Run(ctx) })
 	}
 
 	if a.pusher != nil {
-		a.goBackground(func() { a.pusher.Run(ctx) })
+		a.bg.Go(func() { a.pusher.Run(ctx) })
 
 		if a.cfg.Update.Enabled {
 			updater := topsrv.NewUpdater(a.Logger, a.appName, a.version, a.cfg.Update, a.cfg.Push)
-			a.goBackground(func() { updater.Run(ctx) })
+			a.bg.Go(func() { updater.Run(ctx) })
 		}
 	}
 
@@ -207,7 +207,7 @@ func (a *App) Shutdown() {
 	defer cancel()
 
 	if a.srv != nil {
-		a.goBackground(func() {
+		a.bg.Go(func() {
 			srvCtx, srvCancel := context.WithTimeout(overall, httpShutdownTimeout)
 			defer srvCancel()
 			if err := a.srv.Shutdown(srvCtx); err != nil {
@@ -230,10 +230,6 @@ func (a *App) Shutdown() {
 	for _, c := range a.closers {
 		_ = c.Close()
 	}
-}
-
-func (a *App) goBackground(fn func()) {
-	a.bg.Go(fn)
 }
 
 func (a *App) handleStatus(w http.ResponseWriter, _ *http.Request) {
@@ -647,7 +643,7 @@ func (a *App) registerBotLogs(ctx context.Context) {
 	bp := botlog.NewPusher(a.Logger, a.appName, a.version, *a.cfg.BotLogs, a.registry)
 	obs := botlog.NewObserver(bp, *a.cfg.BotLogs, a.hostname, a.logCfg.ExtractFields, a.botlogAliases)
 	a.logCollector.AddObserver(obs)
-	a.goBackground(func() { bp.Run(ctx) })
+	a.bg.Go(func() { bp.Run(ctx) })
 	a.Print(ctx, "botlog: observer attached", "endpoint", a.cfg.BotLogs.Endpoint, "spool", a.cfg.BotLogs.SpoolDir)
 }
 
@@ -698,7 +694,7 @@ func (a *App) registerWebLogs(ctx context.Context) {
 	wp := shipper.NewPusher(a.Logger, a.appName, a.version, cfg.ShipperOptions(), a.registry)
 	obs := weblog.NewObserver(wp, m, cfg, a.hostname, tail, a.logCfg.ExtractFields, a.botlogAliases, filters)
 	a.logCollector.AddObserver(obs)
-	a.goBackground(func() { wp.Run(ctx) })
+	a.bg.Go(func() { wp.Run(ctx) })
 	a.Print(ctx, "weblog: observer attached", "endpoint", cfg.Endpoint, "spool", cfg.SpoolDir,
 		"paths", tail, "requireUpstream", filters.RequireUpstream, "upstreamFilter", filters.Upstreams)
 }
@@ -713,7 +709,7 @@ func (a *App) registerSmart(ctx context.Context) {
 	}
 	c := smart.NewCollector(a.Logger, interval)
 	a.addCollector(c)
-	a.goBackground(func() { c.Run(ctx) })
+	a.bg.Go(func() { c.Run(ctx) })
 }
 
 func (a *App) registerPackages(ctx context.Context) {
@@ -730,7 +726,7 @@ func (a *App) registerPackages(ctx context.Context) {
 	}
 	c := packages.NewCollector(a.Logger, *cfg)
 	a.addCollector(c)
-	a.goBackground(func() { c.Run(ctx) })
+	a.bg.Go(func() { c.Run(ctx) })
 
 	if a.pusher != nil && !cfg.DisablePush {
 		a.pusher.AddInventoryProvider(c)

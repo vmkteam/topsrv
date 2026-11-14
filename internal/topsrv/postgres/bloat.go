@@ -86,15 +86,8 @@ func (c *Collector) refreshBloat(ctx context.Context) {
 		indexes    []indexBloatEntry
 		tErr, iErr error
 	)
-	wg.Add(2)
-	go func() {
-		defer wg.Done()
-		tables, tErr = c.scanTableBloat(ctx)
-	}()
-	go func() {
-		defer wg.Done()
-		indexes, iErr = c.scanIndexBloat(ctx)
-	}()
+	wg.Go(func() { tables, tErr = c.scanTableBloat(ctx) })
+	wg.Go(func() { indexes, iErr = c.scanIndexBloat(ctx) })
 	wg.Wait()
 
 	if tErr != nil {

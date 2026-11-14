@@ -564,7 +564,8 @@ Requires Go 1.27 or later (`encoding/json/v2`).
 make build              # Build binary
 make test               # Unit tests
 make test-integration   # Integration tests (requires Docker)
-make fmt                # Format code (golangci-lint fmt)
+make fix                # Apply go fix modernizers (linux and windows builds)
+make fmt                # go fix + golangci-lint fmt
 make lint               # Lint (golangci-lint run)
 make run                # Run with local config
 make demo               # Start demo (VictoriaMetrics + topsrv)

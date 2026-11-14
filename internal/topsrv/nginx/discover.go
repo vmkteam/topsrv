@@ -151,13 +151,12 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 		return nil
 	}
 
-	lines := strings.Split(content, "\n")
 	var currentLocation string
 	var currentPort int
 	var currentHost string
 	var currentIsSSL bool
 
-	for _, line := range lines {
+	for line := range strings.SplitSeq(content, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "#") {
 			continue

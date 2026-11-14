@@ -24,12 +24,14 @@ test-integration: test-certs
 	go test -tags=integration -count=1 -v ./internal/topsrv/...
 	docker compose -f docker-compose.test.yml down
 
-# go fix rewrites only files of the current GOOS and build tags: linux with
-# integration plus windows covers every file. omitzero stays off — replacing
-# omitempty with omitzero changes the JSON sent to the backend.
+# go fix rewrites only files of the current GOOS and build tags, so it runs
+# once per release GOOS (see .goreleaser.yml) with the integration tag on.
+# omitzero stays off — replacing omitempty with omitzero changes the JSON
+# sent to the backend.
+FIX_GOOS = linux windows
+
 fix:
-	@GOOS=linux go fix -tags=integration -omitzero=false ./...
-	@GOOS=windows go fix -omitzero=false ./...
+	@for os in $(FIX_GOOS); do GOOS=$$os go fix -tags=integration -omitzero=false ./... || exit 1; done
 
 fmt: fix
 	@golangci-lint fmt
