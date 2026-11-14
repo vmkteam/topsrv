@@ -558,7 +558,7 @@ Full list of all metrics: [docs/metrics.md](docs/metrics.md)
 
 ## Development
 
-Requires `GOEXPERIMENT=jsonv2` (set automatically by Makefile and goreleaser).
+Requires Go 1.27 or later (`encoding/json/v2`).
 
 ```bash
 make build              # Build binary

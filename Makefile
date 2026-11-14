@@ -1,6 +1,5 @@
 APP_NAME = topsrv
 BUILD_DIR = bin
-export GOEXPERIMENT = jsonv2
 export CGO_ENABLED = 0
 
 .PHONY: build run test test-integration test-certs fmt lint clean init demo demo-stop
