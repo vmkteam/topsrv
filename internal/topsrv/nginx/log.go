@@ -31,6 +31,7 @@ var defaultHTTPBuckets = []float64{0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 
 const DefaultLogFormat = `$remote_addr - $remote_user [$time_local] "$request" $status $body_bytes_sent "$http_referer" "$http_user_agent" $request_time $upstream_response_time`
 
 const maxCardinalityURI = 1000    // cap on uri4xx/uri5xx/bytesByURI keys; eviction policy in uricounters.go
+const maxNewURIsPerDay = 1000     // new uri4xx/uri5xx/bytesByURI keys admitted per UTC day; see uricounters.go
 const maxCardinalityTagged = 500  // cap taggedCounts (status × extra labels) to prevent unbounded growth
 const maxPathDepth = 2            // collapse URI segments beyond this depth
 const maxNormalizedURIBytes = 240 // hard byte cap; Prometheus exposition rejects label values >256 bytes
@@ -71,7 +72,19 @@ var (
 	fileNumericSuffix = regexp.MustCompile(`_\d{3,}`)
 	// phpFile matches .php filename in the last path segment.
 	phpFile = regexp.MustCompile(`/[^/]+\.php$`)
+	// underscoreSegment matches a whole path segment containing an underscore.
+	underscoreSegment = regexp.MustCompile(`/[^/]*_[^/]*`)
 )
+
+// mediaExtensions are file types whose names carry no grouping value: uploads,
+// galleries and proxied images give almost every request a name of its own.
+// .ico is left out so /favicon.ico keeps its name. collapseMediaFile only
+// looks up 3–4 byte extensions — widen its length check before adding others.
+var mediaExtensions = map[string]struct{}{
+	"jpg": {}, "jpeg": {}, "png": {}, "gif": {}, "webp": {}, "avif": {}, "bmp": {}, "svg": {}, "tif": {}, "tiff": {}, "heic": {},
+	"mp4": {}, "webm": {}, "m4v": {}, "mov": {}, "avi": {}, "mkv": {}, "flv": {},
+	"mp3": {}, "ogg": {}, "wav": {}, "flac": {},
+}
 
 // scannerSuffixes are path suffixes that indicate bot/scanner probes and never appear in legitimate traffic.
 var scannerSuffixes = [...]string{".env", ".git", ".aws", ".ssh", ".svn", ".bak", ".sql"}
@@ -223,18 +236,18 @@ func NewLogCollector(logger embedlog.Logger, cfg LogConfig) *LogCollector {
 		httpRequests:     prometheus.NewDesc("topsrv_nginx_http_requests_total", "HTTP requests by status code.", reqLabels, nil),
 		responseBytes:    prometheus.NewDesc("topsrv_nginx_response_bytes_total", "Total response bytes.", nil, nil),
 		cacheRequests:    prometheus.NewDesc("topsrv_nginx_cache_requests_total", "Requests by upstream cache status.", []string{"status"}, nil),
-		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
-		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
-		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI; past the per-host URI cap new paths count as uri=\"/:other\".", []string{"uri"}, nil),
+		http5xxRequests:  prometheus.NewDesc("topsrv_nginx_5xx_requests_total", "5xx requests by status and normalized URI; past the per-host URI cap or the daily new-URI budget new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		http4xxRequests:  prometheus.NewDesc("topsrv_nginx_4xx_requests_total", "4xx requests by status and normalized URI; past the per-host URI cap or the daily new-URI budget new paths count as uri=\"/:other\".", []string{"status", "uri"}, nil),
+		responseByteURI:  prometheus.NewDesc("topsrv_nginx_response_bytes_by_uri_total", "Response bytes by normalized URI; past the per-host URI cap or the daily new-URI budget new paths count as uri=\"/:other\".", []string{"uri"}, nil),
 
 		reqBuckets:   make([]uint64, len(defaultHTTPBuckets)+1),
 		upBuckets:    make([]uint64, len(defaultHTTPBuckets)+1),
 		statusCounts: make(map[string]uint64),
 		taggedCounts: make(map[taggedStatusKey]uint64),
 		cacheCounts:  make(map[string]uint64),
-		uri5xx:       newURICounters[statusURI](maxCardinalityURI),
-		uri4xx:       newURICounters[statusURI](maxCardinalityURI),
-		bytesByURI:   newURICounters[string](maxCardinalityURI),
+		uri5xx:       newURICounters[statusURI](maxCardinalityURI, maxNewURIsPerDay),
+		uri4xx:       newURICounters[statusURI](maxCardinalityURI, maxNewURIsPerDay),
+		bytesByURI:   newURICounters[string](maxCardinalityURI, maxNewURIsPerDay),
 	}
 }
 
@@ -1005,8 +1018,8 @@ func normalizePath(path string) string {
 	//  - control bytes (< 0x20): raw binary in $uri (rare; mostly caught by utf8 above)
 	//  - `\x` literal escape: nginx writes non-printable bytes as printable
 	//    `\xHH` text before logging, defeating the control-byte check above
-	//  - hasUpper: gates two downstream allocations on the all-lowercase path
-	//    (longBase64Token regex below, and the strings.ToLower call right after).
+	//  - hasUpper: lets the all-lowercase path skip the case-dependent passes
+	//    below (strings.ToLower, title segments, longBase64Token).
 	hasUpper := false
 	for i := range len(path) {
 		c := path[i]
@@ -1041,6 +1054,14 @@ func normalizePath(path string) string {
 	path = xenForoSlug.ReplaceAllString(path, "/:slug/")
 	path = urlEncodedSegment.ReplaceAllString(path, "/:slug")
 	path = hexHash.ReplaceAllString(path, ":hash")
+	if hasUpper && strings.IndexByte(path, '_') >= 0 {
+		path = underscoreSegment.ReplaceAllStringFunc(path, func(m string) string {
+			if isTitleSegment(m[1:]) {
+				return "/:slug"
+			}
+			return m
+		})
+	}
 	path = numericSegment.ReplaceAllString(path, "/:id")
 	path = slugWithID.ReplaceAllString(path, "/:slug/")
 	path = hyphenSlug.ReplaceAllString(path, "/:slug")
@@ -1060,6 +1081,8 @@ func normalizePath(path string) string {
 		})
 	}
 
+	path = collapseMediaFile(path)
+
 	out := truncatePath(path, maxPathDepth)
 	// Hard byte cap: even after all the above, a single segment can carry
 	// 256+ bytes (long transliterated slugs, concatenated normalized markers).
@@ -1070,6 +1093,66 @@ func normalizePath(path string) string {
 		return topsrv.TruncateAtRune(out, maxNormalizedURIBytes-len(restMarker)) + restMarker
 	}
 	return out
+}
+
+// isTitleSegment reports whether an underscore-joined segment looks like a
+// page title ("Main_Page"): it starts with an uppercase letter or a digit and
+// mixes cases. Identifiers ("get_user") and codes ("en_US") keep their names;
+// a dot means a file name, left to collapseMediaFile.
+func isTitleSegment(seg string) bool {
+	if len(seg) < 6 || strings.IndexByte(seg, '.') >= 0 {
+		return false
+	}
+	if c := seg[0]; (c < 'A' || c > 'Z') && (c < '0' || c > '9') {
+		return false
+	}
+	var upper, lower bool
+	for i := range len(seg) {
+		switch c := seg[i]; {
+		case c >= 'A' && c <= 'Z':
+			upper = true
+		case c >= 'a' && c <= 'z':
+			lower = true
+		}
+	}
+	return upper && lower
+}
+
+// collapseMediaFile replaces the name of a media file in the last segment with
+// :file, keeping the lowercased extension: /gallery/IMG_0042.JPG → /gallery/:file.jpg.
+// A name that is already a single marker (":hash", ":slug") is kept.
+func collapseMediaFile(path string) string {
+	slash := strings.LastIndexByte(path, '/')
+	dot := strings.LastIndexByte(path[slash+1:], '.')
+	if dot <= 0 { // no extension, or a dotfile
+		return path
+	}
+	dot += slash + 1
+	ext := path[dot+1:]
+	if len(ext) < 3 || len(ext) > 4 { // every media extension is 3–4 bytes; skip ToLower for the rest
+		return path
+	}
+	ext = strings.ToLower(ext)
+	if _, ok := mediaExtensions[ext]; !ok {
+		return path
+	}
+	if isMarker(path[slash+1 : dot]) {
+		return path[:dot+1] + ext
+	}
+	return path[:slash+1] + ":file." + ext
+}
+
+// isMarker reports whether s is a single normalization marker such as ":hash".
+func isMarker(s string) bool {
+	if len(s) < 2 || s[0] != ':' {
+		return false
+	}
+	for i := 1; i < len(s); i++ {
+		if s[i] < 'a' || s[i] > 'z' {
+			return false
+		}
+	}
+	return true
 }
 
 // truncatePath collapses path segments beyond maxDepth into restMarker.

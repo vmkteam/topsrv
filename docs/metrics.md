@@ -174,7 +174,7 @@ regardless of ranking, so latency percentiles have no such gap.
 | `topsrv_nginx_upstream_duration_seconds` | histogram | — | Upstream response time |
 | `topsrv_nginx_http_requests_total` | counter | status, +ExtraLabels | Requests by status code. ExtraLabels comes from `[Nginx]/[Angie] ExtraLabels` (operator-controlled, must be low cardinality — `server_name`, `http_platform`, `http_version`). Variables that botlog needs internally are NOT added here; see warning below. |
 | `topsrv_nginx_cache_requests_total` | counter | status | Cache status (HIT/MISS/EXPIRED) |
-| `topsrv_nginx_5xx_requests_total` | counter | status, uri | 5xx errors with normalized URI. Per-host cap of 1000 URIs: keys idle for an hour are evicted when the map is full, and new paths beyond that count as `uri="/:other"` |
+| `topsrv_nginx_5xx_requests_total` | counter | status, uri | 5xx errors with normalized URI. Per-host cap of 1000 URIs: keys idle for an hour are evicted when the map is full, and new paths beyond that count as `uri="/:other"`. At most 1000 new URIs are admitted per UTC day, the rest go to `/:other` until midnight, so a family reaches about 2000 distinct series a day at most. Media file names collapse to `:file.<ext>` and wiki-style titles (`Main_Page`) to `:slug` |
 | `topsrv_nginx_4xx_requests_total` | counter | status, uri | 4xx errors with normalized URI. Same 1000-URI cap and `/:other` overflow as 5xx — on public hosts the bucket mostly holds one-off scanner paths |
 | `topsrv_nginx_response_bytes_total` | counter | — | Total response bytes |
 | `topsrv_nginx_response_bytes_by_uri_total` | counter | uri | Response bytes by normalized URI. Same 1000-URI cap and `/:other` overflow |
