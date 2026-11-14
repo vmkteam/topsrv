@@ -12,12 +12,10 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"os"
-	"path/filepath"
-	"sort"
-	"strings"
 	"sync"
 	"time"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/spool"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmkteam/appkit"
@@ -45,9 +43,7 @@ const (
 	// app.shutdownTimeout (15s) for spool writes and closers.
 	shutdownDrainBudget = 12 * time.Second
 
-	spoolFileGlob = "*.ndjson.gz"
-	spoolSuffix   = ".ndjson.gz"
-	spoolTmpGlob  = "*" + spoolSuffix + ".tmp"
+	spoolExt = ".ndjson.gz"
 
 	// errBodyDrainCap bounds the bytes we discard from a 4xx/5xx response body.
 	// Reads up to this many bytes to keep the connection eligible for keep-alive
@@ -84,33 +80,6 @@ const defaultRetryBackoff = 5 * time.Second
 // retrySpool pass — without it, a poison oldest file blocks every newer batch
 // until trim evicts it.
 const maxTransientPerRun = 3
-
-// httpStatusError lets callers distinguish permanent (4xx) from transient
-// (5xx, net, timeout) failures. Body content is intentionally omitted —
-// a misbehaving receiver could echo credentials back and they would surface
-// in centralized logs. The receiver-side log is the source of truth for body.
-type httpStatusError struct {
-	code    int
-	bodyLen int
-}
-
-func (e *httpStatusError) Error() string {
-	return fmt.Sprintf("HTTP %d (body %d bytes)", e.code, e.bodyLen)
-}
-
-// isPermanentFailure reports whether the receiver explicitly rejected the
-// batch and retrying would not change the outcome. 408 (request timeout) and
-// 429 (rate limit) are 4xx but transient, so we retry those.
-func isPermanentFailure(err error) bool {
-	var se *httpStatusError
-	if !errors.As(err, &se) {
-		return false
-	}
-	if se.code < 400 || se.code >= 500 {
-		return false
-	}
-	return se.code != http.StatusRequestTimeout && se.code != http.StatusTooManyRequests
-}
 
 // gzipPool reuses gzip writers across flushes — gzip.NewWriter allocates ~256 KB
 // of internal buffers, which adds up at the default flush cadence.
@@ -159,6 +128,7 @@ type Pusher struct {
 	cfg    Options
 	client *http.Client
 	queue  chan Event
+	dir    spool.Dir // SpoolDir, <batchID>.ndjson.gz
 
 	// Fixed at construction; only tests give it another value.
 	retryBackoff time.Duration
@@ -197,6 +167,7 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg Options, reg
 		cfg:    cfg,
 		client: appkit.NewHTTPClient(appName, version, sendTimeout),
 		queue:  make(chan Event, cfg.BatchSize*2),
+		dir:    spool.Dir{Path: cfg.SpoolDir, Ext: spoolExt},
 
 		retryBackoff: defaultRetryBackoff,
 
@@ -260,7 +231,9 @@ func (p *Pusher) Run(ctx context.Context) {
 	interval := p.cfg.BatchInterval
 	p.Print(ctx, p.cfg.MetricPrefix+": shipper started",
 		"endpoint", p.cfg.Endpoint, "interval", interval, "batchSize", p.cfg.BatchSize)
-	p.cleanupSpoolTmp(ctx)
+	if n := p.dir.CleanupTmp(); n > 0 {
+		p.Print(ctx, p.cfg.MetricPrefix+": cleaned up stale spool tmp files", "count", n)
+	}
 	p.refreshSpoolMetrics()
 	p.retrySpool(ctx)
 
@@ -321,7 +294,7 @@ func (p *Pusher) flush(ctx context.Context, batch []Event) {
 
 	batchID := newBatchID()
 	if err := p.sendWithRetry(ctx, payload, batchID); err != nil {
-		if isPermanentFailure(err) {
+		if !spool.Retryable(err) {
 			p.Error(ctx, p.cfg.MetricPrefix+": batch permanently rejected, dropping", "error", err, "events", len(batch), "batchId", batchID)
 			p.cDropPermanent.Add(float64(len(batch)))
 			return
@@ -381,7 +354,7 @@ func (p *Pusher) flushFinal(shutdownCtx context.Context, batch []Event) {
 		p.cSent.Add(float64(len(batch)))
 		return
 	}
-	if isPermanentFailure(err) {
+	if !spool.Retryable(err) {
 		p.Error(shutdownCtx, p.cfg.MetricPrefix+": shutdown batch permanently rejected, dropping", "error", err, "events", len(batch), "batchId", batchID)
 		p.cDropPermanent.Add(float64(len(batch)))
 		return
@@ -395,8 +368,11 @@ func (p *Pusher) sendWithRetry(ctx context.Context, payload []byte, batchID stri
 	if err == nil {
 		return nil
 	}
-	if isPermanentFailure(err) {
-		return err // retry would only repeat the same 4xx
+	if !spool.Retryable(err) || authFailed(err) {
+		// A rejection would only repeat the same 4xx. A token problem lasts
+		// until the config is fixed and the agent restarted — the token is
+		// read once at startup — so waiting here would only stall the queue.
+		return err
 	}
 	// One retry with a fixed backoff — the server could be momentarily reloading.
 	t := time.NewTimer(p.retryBackoff)
@@ -407,6 +383,13 @@ func (p *Pusher) sendWithRetry(ctx context.Context, payload []byte, batchID stri
 	case <-t.C:
 	}
 	return p.send(ctx, payload, batchID)
+}
+
+// authFailed reports a 401/403. The batch belongs in the spool, but an
+// immediate retry with the same token cannot succeed.
+func authFailed(err error) bool {
+	var se *spool.StatusError
+	return errors.As(err, &se) && (se.Code == http.StatusUnauthorized || se.Code == http.StatusForbidden)
 }
 
 func (p *Pusher) send(ctx context.Context, payload []byte, batchID string) error {
@@ -434,186 +417,72 @@ func (p *Pusher) send(ctx context.Context, payload []byte, batchID string) error
 		// Cap the discarded read so a hostile receiver can't make us pull MBs.
 		// Anything past the cap is fine to leave for the keep-alive teardown —
 		// Go's transport will close the connection rather than reuse it.
-		n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, errBodyDrainCap))
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, errBodyDrainCap))
 		p.sendErrors.WithLabelValues(errStatus).Inc()
-		return &httpStatusError{code: resp.StatusCode, bodyLen: int(n)}
+		// No body in the error: a misbehaving receiver could echo credentials
+		// back, and they would surface in centralized logs.
+		return &spool.StatusError{Code: resp.StatusCode}
 	}
 	_, _ = io.Copy(io.Discard, resp.Body)
 	return nil
 }
 
-// spool persists a failed batch under SpoolDir/<batchID>.ndjson.gz, writing
-// to a .tmp and renaming for atomicity (so a SIGKILL mid-write doesn't leave
-// half a gzip that retrySpool would forward). Dir/files are 0o700/0o600 to
-// keep retrySpool from forwarding foreign content under our Bearer token.
-// Orphan .tmp files from a previous crash are removed by cleanupSpoolTmp.
+// spool persists a failed batch as SpoolDir/<batchID>.ndjson.gz.
 func (p *Pusher) spool(ctx context.Context, payload []byte, batchID string) {
 	if p.cfg.SpoolDir == "" {
 		p.cDropSpoolWrite.Inc()
 		return
 	}
-	if err := os.MkdirAll(p.cfg.SpoolDir, 0o700); err != nil {
-		p.Error(ctx, p.cfg.MetricPrefix+": spool mkdir failed", "dir", p.cfg.SpoolDir, "error", err)
+	if err := p.dir.Write(batchID, payload); err != nil {
+		p.Error(ctx, p.cfg.MetricPrefix+": spool write failed", "dir", p.cfg.SpoolDir, "batchId", batchID, "error", err)
 		p.cDropSpoolWrite.Inc()
 		return
 	}
-
-	path := filepath.Join(p.cfg.SpoolDir, batchID+spoolSuffix)
-	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, payload, 0o600); err != nil {
-		p.Error(ctx, p.cfg.MetricPrefix+": spool write failed", "path", tmp, "error", err)
-		p.cDropSpoolWrite.Inc()
-		return
-	}
-	if err := os.Rename(tmp, path); err != nil {
-		p.Error(ctx, p.cfg.MetricPrefix+": spool rename failed", "tmp", tmp, "path", path, "error", err)
-		_ = os.Remove(tmp)
-		p.cDropSpoolWrite.Inc()
-		return
-	}
-
 	p.cSpooled.Inc()
 	p.trimSpool(ctx)
 }
 
-// replayResult is what replayOne reports back to retrySpool: whether the file
-// was successfully forwarded, and whether the failure (if any) was transient.
-type replayResult struct{ sent, transient bool }
-
-// replayOne attempts to forward a single spool file. The file is removed
-// unless the failure is transient — those are kept and retried on the next
-// tick. Foreign-owned files are removed without forwarding (we refuse to
-// ship arbitrary content under our Bearer token).
-func (p *Pusher) replayOne(ctx context.Context, path string) replayResult {
-	if !p.ownsSpoolFile(ctx, path) {
-		_ = os.Remove(path)
-		p.cDropEvict.Inc()
-		return replayResult{}
+// retrySpool replays spooled batches oldest first. Up to maxTransientPerRun
+// transient failures are skipped per pass, so a poison oldest batch can't
+// stall newer ones until trim evicts it. Rejected batches are discarded;
+// entries that are not regular files of the agent's user are removed unsent
+// rather than forwarded under our Bearer token.
+func (p *Pusher) retrySpool(ctx context.Context) {
+	res := p.dir.Replay(spool.Policy{MaxTransient: maxTransientPerRun}, func(batchID string, payload []byte) error {
+		return p.send(ctx, payload, batchID)
+	})
+	for _, r := range res.Rejected {
+		p.Error(ctx, p.cfg.MetricPrefix+": spooled batch rejected, discarding", "batchId", r.Name, "error", r.Err)
 	}
-	data, err := os.ReadFile(path)
-	if err != nil {
-		_ = os.Remove(path)
-		return replayResult{}
+	if res.Dropped > 0 {
+		p.Error(ctx, p.cfg.MetricPrefix+": removed unsent spool entries that are foreign or unreadable", "count", res.Dropped)
+		p.cDropEvict.Add(float64(res.Dropped))
 	}
-	if err := p.send(ctx, data, batchIDFromPath(path)); err != nil {
-		if isPermanentFailure(err) {
-			p.Error(ctx, p.cfg.MetricPrefix+": spooled batch rejected, discarding", "path", path, "error", err)
-			_ = os.Remove(path)
-			return replayResult{}
-		}
-		return replayResult{transient: true}
+	if res.Sent > 0 {
+		p.Print(ctx, p.cfg.MetricPrefix+": resent spooled batches", "count", res.Sent)
 	}
-	_ = os.Remove(path)
-	return replayResult{sent: true}
+	if res.Sent+len(res.Rejected)+res.Dropped > 0 { // the spool shrank
+		p.refreshSpoolMetrics()
+	}
 }
 
-// retrySpool replays spooled batches oldest-first. Transient failures are
-// capped per pass by maxTransientPerRun so a poison oldest batch can't stall
-// newer ones until trim evicts it.
-func (p *Pusher) retrySpool(ctx context.Context) {
-	if p.cfg.SpoolDir == "" {
-		return
-	}
-	files, err := filepath.Glob(filepath.Join(p.cfg.SpoolDir, spoolFileGlob))
-	if err != nil || len(files) == 0 {
-		return
-	}
-	sort.Strings(files) // unix-ms-prefixed names → ascending = oldest first.
-
-	sent, transientFails := 0, 0
-	for _, path := range files {
-		if transientFails >= maxTransientPerRun {
-			break
-		}
-		r := p.replayOne(ctx, path)
-		if r.sent {
-			sent++
-		}
-		if r.transient {
-			transientFails++
-		}
-	}
-	if sent > 0 {
-		p.Print(ctx, p.cfg.MetricPrefix+": resent spooled batches", "count", sent)
+// trimSpool removes the oldest files until disk usage fits MaxSpoolMB.
+func (p *Pusher) trimSpool(ctx context.Context) {
+	budget := int64(p.cfg.MaxSpoolMB) * 1024 * 1024
+	if n := p.dir.TrimBytes(budget); n > 0 {
+		// One increment per evicted file, not per event — exact event count is
+		// unknown without re-reading the gzip. Operators alerting on
+		// {reason="spool_evict"} should treat the rate as "files evicted".
+		p.cDropEvict.Add(float64(n))
+		p.Print(ctx, p.cfg.MetricPrefix+": spool trimmed", "evicted", n, "budget", budget)
 	}
 	p.refreshSpoolMetrics()
 }
 
-// scanSpool returns the spool files sorted oldest-first along with their sizes
-// and total disk usage. Single os.Stat pass shared by trim and metric refresh.
-func (p *Pusher) scanSpool() (files []string, sizes []int64, total int64) {
-	if p.cfg.SpoolDir == "" {
-		return nil, nil, 0
-	}
-	matched, err := filepath.Glob(filepath.Join(p.cfg.SpoolDir, spoolFileGlob))
-	if err != nil || len(matched) == 0 {
-		return nil, nil, 0
-	}
-	sort.Strings(matched)
-	sizes = make([]int64, len(matched))
-	for i, f := range matched {
-		if st, err := os.Stat(f); err == nil {
-			sizes[i] = st.Size()
-			total += st.Size()
-		}
-	}
-	return matched, sizes, total
-}
-
-func (p *Pusher) setSpoolGauges(files []string, total int64) {
-	p.spoolFiles.Set(float64(len(files)))
-	p.spoolBytes.Set(float64(total))
-}
-
-// trimSpool removes oldest files until disk usage <= MaxSpoolMB.
-func (p *Pusher) trimSpool(ctx context.Context) {
-	files, sizes, total := p.scanSpool()
-	budget := int64(p.cfg.MaxSpoolMB) * 1024 * 1024
-	if total <= budget {
-		p.setSpoolGauges(files, total)
-		return
-	}
-	for i, f := range files {
-		if total <= budget {
-			break
-		}
-		if err := os.Remove(f); err != nil {
-			continue
-		}
-		total -= sizes[i]
-		// One increment per evicted file, not per event — exact event count is
-		// unknown without re-reading the gzip. Operators alerting on
-		// {reason="spool_evict"} should treat the rate as "files evicted".
-		p.cDropEvict.Inc()
-	}
-	p.Print(ctx, p.cfg.MetricPrefix+": spool trimmed", "remainingBytes", total, "budget", budget)
-
-	// Re-scan: file count shifted; sizes already accounted for so we only need
-	// the gauges in sync with the post-trim directory.
-	post, _, postTotal := p.scanSpool()
-	p.setSpoolGauges(post, postTotal)
-}
-
 func (p *Pusher) refreshSpoolMetrics() {
-	files, _, total := p.scanSpool()
-	p.setSpoolGauges(files, total)
-}
-
-// cleanupSpoolTmp removes any *.tmp leftovers from a previous process that
-// crashed between spool's WriteFile and Rename. retrySpool's glob skips them,
-// but they'd accumulate in disk usage if never cleaned.
-func (p *Pusher) cleanupSpoolTmp(ctx context.Context) {
-	if p.cfg.SpoolDir == "" {
-		return
-	}
-	tmps, err := filepath.Glob(filepath.Join(p.cfg.SpoolDir, spoolTmpGlob))
-	if err != nil || len(tmps) == 0 {
-		return
-	}
-	for _, t := range tmps {
-		_ = os.Remove(t)
-	}
-	p.Print(ctx, p.cfg.MetricPrefix+": cleaned up stale spool tmp files", "count", len(tmps))
+	files, size := p.dir.Usage()
+	p.spoolFiles.Set(float64(files))
+	p.spoolBytes.Set(float64(size))
 }
 
 // encodeBatch serializes events as gzipped ndjson. One JSON object per line,
@@ -663,36 +532,10 @@ func newBatchID() string {
 	return fmt.Sprintf("%d-%s", time.Now().UnixMilli(), hex.EncodeToString(rnd[:]))
 }
 
-func batchIDFromPath(path string) string {
-	return strings.TrimSuffix(filepath.Base(path), spoolSuffix)
-}
-
 func classifyErr(err error) string {
 	var netErr net.Error
 	if errors.As(err, &netErr) && netErr.Timeout() {
 		return "timeout"
 	}
 	return "connect"
-}
-
-// ownsSpoolFile is defence-in-depth against SpoolDir perms drift — rejects
-// foreign UIDs and symlinks. Non-unix (no Stat_t) trusts directory perms.
-func (p *Pusher) ownsSpoolFile(ctx context.Context, path string) bool {
-	fi, err := os.Lstat(path)
-	if err != nil {
-		return false
-	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		p.Error(ctx, p.cfg.MetricPrefix+": spool entry is a symlink, discarding", "path", path)
-		return false
-	}
-	uid, ok := fileUID(fi)
-	if !ok {
-		return true
-	}
-	if uid == os.Getuid() {
-		return true
-	}
-	p.Error(ctx, p.cfg.MetricPrefix+": spool file not owned by agent user, discarding", "path", path, "fileUID", uid, "agentUID", os.Getuid())
-	return false
 }

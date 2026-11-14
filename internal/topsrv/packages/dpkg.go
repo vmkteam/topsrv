@@ -11,13 +11,12 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+
 	"github.com/vmkteam/embedlog"
 )
 
-const (
-	dpkgStatusPath   = "/var/lib/dpkg/status"
-	aptExtStatesPath = "/var/lib/apt/extended_states"
-)
+const aptExtStatesPath = "/var/lib/apt/extended_states"
 
 // Dpkg is the dpkg/apt manager. Owns parsing of /var/lib/dpkg/status,
 // /var/lib/apt/extended_states (autoInstalled enrichment), and the shared
@@ -31,14 +30,14 @@ func NewDpkg(logger embedlog.Logger, root string) *Dpkg {
 	return &Dpkg{Logger: logger, root: root}
 }
 
-func (m *Dpkg) Name() string { return ManagerDpkg }
+func (m *Dpkg) Name() string { return inventory.ManagerDpkg }
 
 // Scan reads /var/lib/dpkg/status, filters to installed/held packages, and
 // merges apt's auto-installed classification. dpkg's `Version` field
 // already embeds epoch as a prefix ("1:6.7p1-5+deb8u2") — exactly what
 // Vulners expects on the wire.
 func (m *Dpkg) Scan(_ context.Context) (Snapshot, error) {
-	f, err := os.Open(m.root + dpkgStatusPath)
+	f, err := os.Open(m.root + inventory.DpkgStatusPath)
 	if err != nil {
 		return Snapshot{}, fmt.Errorf("open dpkg status: %w", err)
 	}
@@ -78,7 +77,7 @@ func (m *Dpkg) Scan(_ context.Context) (Snapshot, error) {
 
 	m.enrichAutoInstalled(pkgs)
 
-	return Snapshot{Manager: ManagerDpkg, Packages: pkgs}, nil
+	return Snapshot{Manager: inventory.ManagerDpkg, Packages: pkgs}, nil
 }
 
 // parseSource splits dpkg's `Source:` field into name+version. Two valid forms:

@@ -11,6 +11,8 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+
 	rpmdb "github.com/anchore/go-rpmdb/pkg"
 	"github.com/vmkteam/embedlog"
 	// modernc.org/sqlite registers driver "sqlite" — required by anchore/go-rpmdb's
@@ -19,19 +21,6 @@ import (
 	// will gate this import behind a build tag for slim builds.
 	_ "modernc.org/sqlite"
 )
-
-// rpmDBCandidates lists every supported rpm database path in priority order.
-// First-match wins. SQLite (RHEL 9+, Fedora 32+) is tried first, then NDB
-// (SUSE), then BDB (RHEL 7-8). Each variant has a sysimage equivalent for
-// CoreOS / OSTree layouts.
-var rpmDBCandidates = []string{
-	"/var/lib/rpm/rpmdb.sqlite",          // RHEL 9+, Fedora 32+
-	"/var/lib/rpm/Packages.db",           // SUSE / openSUSE NDB
-	"/var/lib/rpm/Packages",              // RHEL 7-8 BDB
-	"/usr/lib/sysimage/rpm/rpmdb.sqlite", // CoreOS / OSTree
-	"/usr/lib/sysimage/rpm/Packages.db",
-	"/usr/lib/sysimage/rpm/Packages",
-}
 
 // keyIDRe extracts the short key id from rpm's PGP/RSAHeader fields. rpm prints
 // signatures as "RSA/SHA256, Mon Nov 20 ..., Key ID 199e2f91fd431d51".
@@ -47,7 +36,7 @@ func NewRpm(logger embedlog.Logger, root string) *Rpm {
 	return &Rpm{Logger: logger, root: root}
 }
 
-func (m *Rpm) Name() string { return ManagerRpm }
+func (m *Rpm) Name() string { return inventory.ManagerRpm }
 
 // Scan parses the rpm database. BDB (`Packages`) is copy-then-parsed
 // (Syft/Trivy pattern) to avoid mid-write inconsistency during `rpm -i` —
@@ -78,25 +67,14 @@ func (m *Rpm) Scan(_ context.Context) (Snapshot, error) {
 
 	m.enrichFromDnfHistory(pkgs)
 
-	return Snapshot{Manager: ManagerRpm, Packages: pkgs}, nil
-}
-
-// findDB returns the first existing rpm database path under m.root, or "" if
-// none found. Used by both Scan() (via openDB) and detectManagers().
-func (m *Rpm) findDB() string {
-	for _, p := range rpmDBCandidates {
-		if fileExists(m.root + p) {
-			return m.root + p
-		}
-	}
-	return ""
+	return Snapshot{Manager: inventory.ManagerRpm, Packages: pkgs}, nil
 }
 
 // openDB locates the rpm database and, for BDB only, copies it to a tempfile
 // to escape mid-write inconsistency. Returns the path to read and a cleanup
 // function. Callers always defer cleanup().
 func (m *Rpm) openDB() (string, func(), error) {
-	dbPath := m.findDB()
+	dbPath := inventory.RpmDB(m.root)
 	if dbPath == "" {
 		return "", func() {}, fmt.Errorf("no rpm database found under %q", m.root)
 	}

@@ -4,7 +4,8 @@ package packages
 
 import (
 	"context"
-	"os"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 
 	"github.com/vmkteam/embedlog"
 )
@@ -18,31 +19,25 @@ type managerFunc struct {
 	scan func(context.Context) (Snapshot, error)
 }
 
-// detectManagers probes the filesystem for marker files of each supported
-// package manager and returns dispatch entries for every match. Order:
-// dpkg first (Ubuntu/Debian) → rpm → apk. Hosts with multiple managers
-// (containers with mixed origin) yield multiple entries.
+// newManagers returns dispatch entries for the named managers, keeping their
+// order. Names come from [Packages].Managers or inventory.Managers; unknown
+// names are skipped.
 //
 // `root` enables chroot-style scans (e.g. /mnt/host-root); production passes "".
-func detectManagers(logger embedlog.Logger, root string) []managerFunc {
-	var out []managerFunc
-	if fileExists(root + dpkgStatusPath) {
-		d := NewDpkg(logger, root)
-		out = append(out, managerFunc{name: d.Name(), scan: d.Scan})
-	}
-	if r := NewRpm(logger, root); r.findDB() != "" {
-		out = append(out, managerFunc{name: r.Name(), scan: r.Scan})
-	}
-	if fileExists(root + apkInstalledPath) {
-		a := NewApk(logger, root)
-		out = append(out, managerFunc{name: a.Name(), scan: a.Scan})
+func newManagers(logger embedlog.Logger, root string, names []string) []managerFunc {
+	out := make([]managerFunc, 0, len(names))
+	for _, name := range names {
+		switch name {
+		case inventory.ManagerDpkg:
+			d := NewDpkg(logger, root)
+			out = append(out, managerFunc{name: d.Name(), scan: d.Scan})
+		case inventory.ManagerRpm:
+			r := NewRpm(logger, root)
+			out = append(out, managerFunc{name: r.Name(), scan: r.Scan})
+		case inventory.ManagerApk:
+			a := NewApk(logger, root)
+			out = append(out, managerFunc{name: a.Name(), scan: a.Scan})
+		}
 	}
 	return out
-}
-
-// fileExists hides the err-ignoring intent of Stat. Marker-file probes
-// don't distinguish "missing" from "no permission" — both mean "skip".
-func fileExists(path string) bool {
-	_, err := os.Stat(path)
-	return err == nil
 }

@@ -6,6 +6,8 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 )
 
 // kernelState says how an installed kernel package relates to the running
@@ -54,7 +56,7 @@ func markKernelPackages(manager string, pkgs []Package, kernelRelease string) (r
 // newer image (not newer headers alone) means a reboot is pending.
 func classifyKernel(manager, kernelRelease string, p *Package) (kernelState, bool) {
 	switch manager {
-	case ManagerDpkg:
+	case inventory.ManagerDpkg:
 		if !strings.HasPrefix(p.Name, "linux-") {
 			return kernelNone, false
 		}
@@ -63,7 +65,7 @@ func classifyKernel(manager, kernelRelease string, p *Package) (kernelState, boo
 			return kernelNone, false
 		}
 		return compareKernel(abi, running), strings.HasPrefix(p.Name, "linux-image-")
-	case ManagerRpm:
+	case inventory.ManagerRpm:
 		image, ok := rpmKernelPackages[p.Name]
 		if !ok {
 			return kernelNone, false
@@ -71,7 +73,7 @@ func classifyKernel(manager, kernelRelease string, p *Package) (kernelState, boo
 		release := p.Version + "-" + p.Release
 		running := strings.TrimSuffix(kernelRelease, "."+p.Arch)
 		return compareKernel(release, running), image
-	case ManagerApk:
+	case inventory.ManagerApk:
 		// uname -r on Alpine is "<version>-<pkgrel>-<flavor>", e.g. 6.6.58-0-lts;
 		// the kernel package is linux-<flavor> with version "<version>-r<pkgrel>".
 		// The "r" is dropped so it doesn't count as a letter run.

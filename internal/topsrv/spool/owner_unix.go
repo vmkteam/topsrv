@@ -1,6 +1,6 @@
 //go:build unix
 
-package shipper
+package spool
 
 import (
 	"os"

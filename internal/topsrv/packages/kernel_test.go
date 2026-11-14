@@ -3,6 +3,8 @@ package packages
 import (
 	"slices"
 	"testing"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 )
 
 // kernelCase is one package and the flag markKernelPackages must give it.
@@ -38,7 +40,7 @@ func rpmPkg(name, version, release string) Package {
 
 func TestMarkKernelPackagesDpkg(t *testing.T) {
 	t.Run("ubuntu with a newer kernel waiting for reboot", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.8.0-90-generic", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.8.0-90-generic", []kernelCase{
 			{deb("linux-image-6.8.0-90-generic", "6.8.0-90.91"), kernelActive},
 			{deb("linux-modules-6.8.0-90-generic", "6.8.0-90.91"), kernelActive},
 			{deb("linux-headers-6.8.0-90", "6.8.0-90.91"), kernelActive},
@@ -55,7 +57,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 	})
 
 	t.Run("newer headers without an image need no reboot", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.8.0-147-generic", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.8.0-147-generic", []kernelCase{
 			{deb("linux-image-6.8.0-147-generic", "6.8.0-147.147"), kernelActive},
 			{deb("linux-headers-6.8.0-149", "6.8.0-149.149"), kernelPending},
 			{deb("linux-hwe-6.17-tools-6.17.0-38", "6.17.0-38.38.1~24.04.1"), kernelPending},
@@ -63,7 +65,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 	})
 
 	t.Run("hwe kernel booted over the ga one", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.17.0-38-generic", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.17.0-38-generic", []kernelCase{
 			{deb("linux-image-6.17.0-38-generic", "6.17.0-38.38.1~24.04.1"), kernelActive},
 			{deb("linux-image-6.8.0-147-generic", "6.8.0-147.147"), kernelOld},
 			{deb("linux-image-generic-hwe-24.04", "6.17.0-38.38.1~24.04.1"), kernelNone},
@@ -71,7 +73,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 	})
 
 	t.Run("debian", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.1.0-28-cloud-amd64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.1.0-28-cloud-amd64", []kernelCase{
 			{deb("linux-image-6.1.0-28-cloud-amd64", "6.1.119-1"), kernelActive},
 			{deb("linux-headers-6.1.0-28-common", "6.1.119-1"), kernelActive},
 			{deb("linux-image-6.1.0-26-cloud-amd64", "6.1.112-1"), kernelOld},
@@ -81,7 +83,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 	})
 
 	t.Run("debian 13 with a newer kernel waiting for reboot", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.12.115+deb13.1-amd64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.12.115+deb13.1-amd64", []kernelCase{
 			{deb("linux-image-6.12.115+deb13.1-amd64", "6.12.115-2"), kernelActive},
 			{deb("linux-headers-6.12.115+deb13.1-common", "6.12.115-2"), kernelActive},
 			{deb("linux-image-6.12.48+deb13-amd64", "6.12.48-1"), kernelOld},
@@ -91,7 +93,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 	})
 
 	t.Run("bookworm with a backports kernel booted", func(t *testing.T) {
-		checkKernelFlags(t, ManagerDpkg, "6.11.10+bpo-amd64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.11.10+bpo-amd64", []kernelCase{
 			{deb("linux-image-6.11.10+bpo-amd64", "6.11.10-1~bpo12+1"), kernelActive},
 			{deb("linux-image-6.1.0-28-amd64", "6.1.119-1"), kernelOld},
 		}, false)
@@ -99,7 +101,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 
 	t.Run("unparseable running release flags nothing", func(t *testing.T) {
 		// a self-built kernel (make bindeb-pkg) carries no ABI
-		checkKernelFlags(t, ManagerDpkg, "6.9.0", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerDpkg, "6.9.0", []kernelCase{
 			{deb("linux-image-6.9.0", "6.9.0-1"), kernelNone},
 			{deb("linux-image-6.8.0-58-generic", "6.8.0-58.60"), kernelNone},
 		}, false)
@@ -108,7 +110,7 @@ func TestMarkKernelPackagesDpkg(t *testing.T) {
 
 func TestMarkKernelPackagesRpm(t *testing.T) {
 	t.Run("el9 with a newer kernel waiting for reboot", func(t *testing.T) {
-		checkKernelFlags(t, ManagerRpm, "5.14.0-503.14.1.el9_5.x86_64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerRpm, "5.14.0-503.14.1.el9_5.x86_64", []kernelCase{
 			{rpmPkg("kernel", "5.14.0", "503.14.1.el9_5"), kernelActive},
 			{rpmPkg("kernel-core", "5.14.0", "503.14.1.el9_5"), kernelActive},
 			{rpmPkg("kernel-modules", "5.14.0", "503.14.1.el9_5"), kernelActive},
@@ -123,7 +125,7 @@ func TestMarkKernelPackagesRpm(t *testing.T) {
 	})
 
 	t.Run("el8.10 GA kernel left by installonly is old, not pending", func(t *testing.T) {
-		checkKernelFlags(t, ManagerRpm, "4.18.0-553.5.1.el8_10.x86_64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerRpm, "4.18.0-553.5.1.el8_10.x86_64", []kernelCase{
 			{rpmPkg("kernel-core", "4.18.0", "553.5.1.el8_10"), kernelActive},
 			{rpmPkg("kernel-core", "4.18.0", "553.el8_10"), kernelOld},
 			{rpmPkg("kernel-modules", "4.18.0", "553.el8_10"), kernelOld},
@@ -131,7 +133,7 @@ func TestMarkKernelPackagesRpm(t *testing.T) {
 	})
 
 	t.Run("el7 GA kernel is old, z-stream update is pending", func(t *testing.T) {
-		checkKernelFlags(t, ManagerRpm, "3.10.0-1160.2.1.el7.x86_64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerRpm, "3.10.0-1160.2.1.el7.x86_64", []kernelCase{
 			{rpmPkg("kernel", "3.10.0", "1160.2.1.el7"), kernelActive},
 			{rpmPkg("kernel", "3.10.0", "1160.el7"), kernelOld},
 			{rpmPkg("kernel", "3.10.0", "1160.6.1.el7"), kernelPending},
@@ -139,7 +141,7 @@ func TestMarkKernelPackagesRpm(t *testing.T) {
 	})
 
 	t.Run("only devel is newer: no reboot", func(t *testing.T) {
-		checkKernelFlags(t, ManagerRpm, "5.14.0-503.14.1.el9_5.x86_64", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerRpm, "5.14.0-503.14.1.el9_5.x86_64", []kernelCase{
 			{rpmPkg("kernel-core", "5.14.0", "503.14.1.el9_5"), kernelActive},
 			{rpmPkg("kernel-devel", "5.14.0", "503.16.1.el9_5"), kernelPending},
 		}, false)
@@ -148,7 +150,7 @@ func TestMarkKernelPackagesRpm(t *testing.T) {
 
 func TestMarkKernelPackagesApk(t *testing.T) {
 	t.Run("booted kernel is current", func(t *testing.T) {
-		checkKernelFlags(t, ManagerApk, "6.6.58-0-lts", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerApk, "6.6.58-0-lts", []kernelCase{
 			{Package{Name: "linux-lts", Version: "6.6.58-r0"}, kernelActive},
 			{Package{Name: "linux-virt", Version: "6.6.58-r0"}, kernelNone},
 			{Package{Name: "linux-firmware-none", Version: "20241017-r0"}, kernelNone},
@@ -156,20 +158,20 @@ func TestMarkKernelPackagesApk(t *testing.T) {
 	})
 
 	t.Run("upgraded in place, not rebooted", func(t *testing.T) {
-		checkKernelFlags(t, ManagerApk, "6.6.58-0-lts", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerApk, "6.6.58-0-lts", []kernelCase{
 			{Package{Name: "linux-lts", Version: "6.6.60-r0"}, kernelPending},
 		}, true)
 	})
 
 	t.Run("pkgrel bump only", func(t *testing.T) {
-		checkKernelFlags(t, ManagerApk, "6.6.58-0-lts", []kernelCase{
+		checkKernelFlags(t, inventory.ManagerApk, "6.6.58-0-lts", []kernelCase{
 			{Package{Name: "linux-lts", Version: "6.6.58-r1"}, kernelPending},
 		}, true)
 	})
 }
 
 func TestMarkKernelPackagesNoRelease(t *testing.T) {
-	checkKernelFlags(t, ManagerDpkg, "", []kernelCase{
+	checkKernelFlags(t, inventory.ManagerDpkg, "", []kernelCase{
 		{deb("linux-image-6.8.0-58-generic", "6.8.0-58.60"), kernelNone},
 	}, false)
 	checkKernelFlags(t, "freebsdPkg", "14.1-RELEASE", []kernelCase{
