@@ -2,6 +2,7 @@ package postgres
 
 import (
 	"context"
+	"maps"
 	"strconv"
 	"time"
 
@@ -64,10 +65,7 @@ func (c *Collector) collectSettings(ctx context.Context, ch chan<- prometheus.Me
 		}
 	}
 	// Copy under lock, emit outside.
-	snapshot := make(map[string]float64, len(c.settingsCache))
-	for k, v := range c.settingsCache {
-		snapshot[k] = v
-	}
+	snapshot := maps.Clone(c.settingsCache)
 	c.settingsMu.Unlock()
 	for name, val := range snapshot {
 		ch <- prometheus.MustNewConstMetric(c.settingGauge, prometheus.GaugeValue, val, name)

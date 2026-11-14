@@ -858,10 +858,8 @@ func rawURIFromRequest(request string) string {
 // StripQuery cuts a raw URI at the query separator. Exported for observers that
 // filter on the path alone.
 func StripQuery(p string) string {
-	if i := strings.IndexByte(p, '?'); i >= 0 {
-		return p[:i]
-	}
-	return p
+	before, _, _ := strings.Cut(p, "?")
+	return before
 }
 
 // resolveURI walks the nginx URI variables an operator might log in priority
@@ -989,11 +987,7 @@ func normalizeURI(request string) string {
 	if len(parts) < 2 {
 		return invalidMarker
 	}
-	path := parts[1]
-	if i := strings.IndexByte(path, '?'); i >= 0 {
-		path = path[:i]
-	}
-	return normalizePath(path)
+	return normalizePath(StripQuery(parts[1]))
 }
 
 func normalizePath(path string) string {

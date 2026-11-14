@@ -1,7 +1,6 @@
 package nginx
 
 import (
-	"context"
 	"encoding/json/v2"
 	"net/http"
 	"net/http/httptest"
@@ -479,8 +478,7 @@ func TestLogCollectorJSONTail(t *testing.T) {
 		JSONPaths: map[string]bool{logPath: true},
 	})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go c.runPaths(ctx, []string{logPath})
 
 	time.Sleep(100 * time.Millisecond)
@@ -511,8 +509,7 @@ func TestLogCollectorTail(t *testing.T) {
 
 	c := NewLogCollector(embedlog.Logger{}, LogConfig{LogPaths: []string{logPath}, LogFormat: DefaultLogFormat})
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
+	ctx := t.Context()
 	go c.runPaths(ctx, []string{logPath})
 
 	time.Sleep(100 * time.Millisecond)

@@ -151,13 +151,12 @@ func findDirective(content string, re *regexp.Regexp, pathFn func(line, currentL
 		return nil
 	}
 
-	lines := strings.Split(content, "\n")
 	var currentLocation string
 	var currentPort int
 	var currentHost string
 	var currentIsSSL bool
 
-	for _, line := range lines {
+	for line := range strings.SplitSeq(content, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "#") {
 			continue
@@ -263,7 +262,7 @@ func extractSSLCertificates(content, baseDir string, result *DiscoverResult) {
 		seen[p] = true
 	}
 
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "#") {
 			continue
@@ -314,7 +313,7 @@ func extractACMECertificates(content string, result *DiscoverResult) (found, pic
 	for _, p := range result.SSLCertificates {
 		seen[p] = true
 	}
-	for _, line := range strings.Split(content, "\n") {
+	for line := range strings.SplitSeq(content, "\n") {
 		l := strings.TrimSpace(line)
 		if strings.HasPrefix(l, "#") {
 			continue

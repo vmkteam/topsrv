@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -92,11 +93,8 @@ func (c *NetworkCollector) collectInterfaces(ch chan<- prometheus.Metric) {
 		}
 
 		operstate := "down"
-		for _, f := range iface.Flags {
-			if f == "up" {
-				operstate = "up"
-				break
-			}
+		if slices.Contains(iface.Flags, "up") {
+			operstate = "up"
 		}
 
 		ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,

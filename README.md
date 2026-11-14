@@ -558,13 +558,14 @@ Full list of all metrics: [docs/metrics.md](docs/metrics.md)
 
 ## Development
 
-Requires `GOEXPERIMENT=jsonv2` (set automatically by Makefile and goreleaser).
+Requires Go 1.27 or later (`encoding/json/v2`).
 
 ```bash
 make build              # Build binary
 make test               # Unit tests
 make test-integration   # Integration tests (requires Docker)
-make fmt                # Format code (golangci-lint fmt)
+make fix                # Apply go fix modernizers (linux and windows builds)
+make fmt                # go fix + golangci-lint fmt
 make lint               # Lint (golangci-lint run)
 make run                # Run with local config
 make demo               # Start demo (VictoriaMetrics + topsrv)
