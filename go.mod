@@ -17,6 +17,7 @@ require (
 	github.com/stretchr/testify v1.11.1
 	github.com/vmkteam/appkit v0.1.2
 	github.com/vmkteam/embedlog v0.1.3
+	golang.org/x/sys v0.42.0
 	modernc.org/sqlite v1.50.1
 )
 
@@ -57,7 +58,6 @@ require (
 	golang.org/x/crypto v0.47.0 // indirect
 	golang.org/x/net v0.48.0 // indirect
 	golang.org/x/sync v0.20.0 // indirect
-	golang.org/x/sys v0.42.0 // indirect
 	golang.org/x/text v0.33.0 // indirect
 	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 	google.golang.org/protobuf v1.36.9 // indirect

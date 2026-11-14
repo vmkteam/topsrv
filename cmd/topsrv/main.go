@@ -32,6 +32,8 @@ var (
 	flVerbose    = fs.Bool("verbose", false, "verbose logging")
 	flJSONLogs   = fs.Bool("json", false, "output logs in JSON format")
 	flVersion    = fs.Bool("version", false, "print version and exit")
+	flSecDryRun  = fs.Bool("security-dry-run", false, "print the security snapshot the agent would send, and exit")
+	flSecSection = fs.String("security-section", "", "with -security-dry-run: comma-separated sections to collect, e.g. kernel,sysctl")
 	cfg          app.Config
 )
 
@@ -52,6 +54,14 @@ func main() {
 	if _, err := toml.DecodeFile(*flConfigPath, &cfg); err != nil {
 		slog.Error("failed to load config", "error", err) //nolint:sloglint
 		os.Exit(1)
+	}
+
+	if *flSecDryRun {
+		securityDryRun(sl)
+		return
+	}
+	if *flSecSection != "" {
+		exitOnError(errors.New("-security-section works with -security-dry-run only"))
 	}
 
 	// app
@@ -76,6 +86,21 @@ func main() {
 	slog.Info("shutting down") //nolint:sloglint
 	cancel()
 	a.Shutdown()
+}
+
+// securityDryRun prints the security snapshot as JSON to stdout: nothing is
+// sent, and no key or state is written. Logs go to the usual logger.
+func securityDryRun(logger embedlog.Logger) {
+	var sections []string
+	for s := range strings.SplitSeq(*flSecSection, ",") {
+		if s = strings.TrimSpace(s); s != "" {
+			sections = append(sections, s)
+		}
+	}
+	out, err := app.SecurityDryRun(context.Background(), logger, cfg, sections)
+	exitOnError(err)
+	_, err = os.Stdout.Write(append(out, '\n'))
+	exitOnError(err)
 }
 
 func exitOnError(err error) {

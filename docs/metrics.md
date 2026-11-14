@@ -376,6 +376,19 @@ Installed-package inventory by manager (dpkg / rpm / apk). The full per-package 
 | `topsrv_packages_last_push_timestamp_seconds` | gauge | kind | Unix ts of last successful inventory push to `/v1/inventory`, by kind (`packages`, future `repos`/`packageHistory`). Alert: `time() - X > 24h` = gatesrv unreachable |
 | `topsrv_packages_manager_info` | gauge | manager, os_id, os_version | Always 1 — labels carry distro context for joining with other metrics |
 
+## Security (`topsrv_security_*`)
+
+Health of the security collector. The snapshot itself ships to `/v1/inventory` as `kind="security"` — its fields are in [security.md](security.md); `/metrics` carries only its timing and error counts (a handful of series per host).
+
+| Metric | Type | Labels | Description |
+|--------|------|--------|-------------|
+| `topsrv_security_scan_duration_seconds` | gauge | section | Duration of the last run of a section (`environment` included). Alert on growth |
+| `topsrv_security_scan_errors_total` | counter | section, reason | Sections that came out `unknown`, or with a gap, by reason (`permission_denied`, `timeout`, `container_env`, …). Rising `timeout` = a stuck read, see `section_inflight` |
+| `topsrv_security_last_scan_timestamp_seconds` | gauge | — | Unix time of the last pass. Alert: `time() - X > 13h` (Interval=6h default + slack) = collector stuck |
+| `topsrv_security_last_push_timestamp_seconds` | gauge | — | Unix time of the last snapshot accepted by `/v1/inventory` |
+| `topsrv_security_snapshot_bytes` | gauge | — | JSON size of the last snapshot (10–60 KB expected) |
+| `topsrv_security_section_inflight` | gauge | section | 1 while a section that ran out of its budget has not returned — a read hung on NFS or similar. It is not restarted until it returns |
+
 ## Self-monitoring (`topsrv_collector_*`)
 
 Per-collector instrumentation. Any collector registered via `addCollector` is wrapped to record its last scrape duration and recover from panics without breaking `/metrics`.

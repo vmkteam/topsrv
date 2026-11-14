@@ -19,6 +19,7 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv/nginx"
 	"github.com/vmkteam/topsrv/internal/topsrv/packages"
 	"github.com/vmkteam/topsrv/internal/topsrv/postgres"
+	"github.com/vmkteam/topsrv/internal/topsrv/security"
 	"github.com/vmkteam/topsrv/internal/topsrv/shipper"
 	"github.com/vmkteam/topsrv/internal/topsrv/smart"
 	"github.com/vmkteam/topsrv/internal/topsrv/weblog"
@@ -41,6 +42,7 @@ type Config struct {
 	BotLogs  *botlog.Config      `toml:"BotLogs,omitempty"`
 	WebLogs  *weblog.Config      `toml:"WebLogs,omitempty"`
 	Packages *packages.Config    `toml:"Packages,omitempty"`
+	Security *security.Config    `toml:"Security,omitempty"`
 }
 
 type ServerConfig struct {
@@ -267,6 +269,9 @@ func (a *App) registerCollectors(ctx context.Context, services []topsrv.Service)
 
 	// Package inventory — opt-out, [Packages].Disabled=true to skip.
 	a.registerPackages(ctx)
+
+	// Security snapshot — opt-out, [Security].Disabled=true to skip.
+	a.registerSecurity(ctx)
 }
 
 // discoverAccessLogs extracts access logs from a DiscoverResult and returns a LogConfig.
@@ -731,6 +736,43 @@ func (a *App) registerPackages(ctx context.Context) {
 	if a.pusher != nil && !cfg.DisablePush {
 		a.pusher.AddInventoryProvider(c)
 	}
+}
+
+// registerSecurity starts the security collector unless [Security].Disabled;
+// with DisablePush it collects for /metrics only.
+func (a *App) registerSecurity(ctx context.Context) {
+	cfg := a.cfg.Security
+	if cfg != nil && cfg.Disabled {
+		return
+	}
+	if cfg == nil {
+		cfg = &security.Config{}
+	}
+	if err := cfg.Validate(); err != nil {
+		a.Error(ctx, "security: invalid config", "error", err)
+		return
+	}
+	c := security.NewCollector(a.Logger, *cfg, topsrv.StateDir(a.cfg.Push.SpoolDir))
+	a.addCollector(c)
+	a.bg.Go(func() { c.Run(ctx) })
+
+	if a.pusher != nil && !cfg.DisablePush {
+		a.pusher.AddInventoryProvider(c)
+	}
+}
+
+// SecurityDryRun returns what the security collector would send, without
+// sending or writing anything. sections limits the pass; empty means all
+// enabled sections. Logs go to logger.
+func SecurityDryRun(ctx context.Context, logger embedlog.Logger, cfg Config, sections []string) ([]byte, error) {
+	sc := cfg.Security
+	if sc == nil {
+		sc = &security.Config{}
+	}
+	if err := sc.Validate(); err != nil {
+		return nil, err
+	}
+	return security.DryRun(ctx, logger, *sc, topsrv.StateDir(cfg.Push.SpoolDir), sections)
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

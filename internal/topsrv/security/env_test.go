@@ -1,0 +1,142 @@
+package security
+
+import (
+	"testing"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestEnvironment(t *testing.T) {
+	cases := []struct {
+		name   string
+		files  map[string]string
+		want   envData
+		status Status
+	}{
+		{
+			name:  "host with systemd and glibc",
+			files: merge(hostProc(), map[string]string{"lib64/ld-linux-x86-64.so.2": "", "run/systemd/system/": ""}),
+			want:  envData{PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "glibc", Init: "systemd"},
+		},
+		{
+			name: "Alpine host with openrc and musl",
+			files: merge(hostProc(), map[string]string{
+				"proc/1/comm":                     "init\n",
+				"run/openrc/":                     "",
+				"lib/ld-musl-x86_64.so.1":         "",
+				"usr/lib/ld-linux-x86-64.so.2.no": "",
+			}),
+			want: envData{PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "musl", Init: "openrc"},
+		},
+		{
+			name: "docker container",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/1/comm":      "topsrv\n",
+				".dockerenv":       "",
+			}),
+			want: envData{ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "other"},
+		},
+		{
+			name: "systemd marker wins over a stray .dockerenv",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid":      "-> pid:[4026532501]",
+				"run/systemd/container": "lxc\n",
+				".dockerenv":            "",
+			}),
+			want: envData{ContainerKind: containerLXC, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "container= in the environment of PID 1, other variables ignored",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/1/environ":   "LD_PRELOAD=/SENTINEL.so\x00container=systemd-nspawn\x00HOME=/",
+			}),
+			want: envData{ContainerKind: containerNspawn, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "podman",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid":  "-> pid:[4026532501]",
+				"run/.containerenv": "",
+				"proc/1/comm":       "sh\n",
+			}),
+			want: envData{ContainerKind: containerPodman, NetNsHost: true, Libc: "unknown", Init: "other"},
+		},
+		{
+			name: "k8s pod",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/1/comm":      "pause\n",
+				"var/run/secrets/kubernetes.io/serviceaccount/": "",
+			}),
+			want: envData{ContainerKind: containerK8s, NetNsHost: true, Libc: "unknown", Init: "other"},
+		},
+		{
+			name: "--pid=host container: same pid namespace, another root",
+			files: merge(hostProc(), map[string]string{
+				"proc/1/root": "-> /",
+				".dockerenv":  "",
+			}),
+			want: envData{PidNsHost: true, ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "own net namespace",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/net": "-> net:[4026532600]",
+			}),
+			want: envData{PidNsHost: true, RootIsHostRoot: true, ContainerKind: containerNone, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "PID 1 namespaces unreadable",
+			files: map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026531836]",
+				"proc/self/ns/net": "-> net:[4026531840]",
+			},
+			want:   envData{PidNsHost: true, ContainerKind: containerNone, Libc: "unknown", Init: "other"},
+			status: StatusPartial,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec, env := collectEnvironment(fixture(t, tc.files))
+
+			assert.Equal(t, tc.want, env)
+			want := tc.status
+			if want == "" {
+				want = StatusOK
+			}
+			assert.Equal(t, want, sec.Status, "gaps: %v", sec.Gaps)
+			assert.NotContains(t, toJSON(t, sec), "SENTINEL")
+		})
+	}
+
+	t.Run("no /proc: unknown", func(t *testing.T) {
+		sec, env := collectEnvironment(fixture(t, nil))
+		assert.Equal(t, StatusUnknown, sec.Status)
+		assert.Equal(t, ReasonNotFound, sec.Reason)
+		assert.Equal(t, containerUnknown, env.ContainerKind)
+	})
+}
+
+func TestAppContainer(t *testing.T) {
+	assert.True(t, envData{ContainerKind: containerDocker}.appContainer())
+	assert.True(t, envData{ContainerKind: containerK8s}.appContainer())
+	assert.True(t, envData{ContainerKind: containerPodman}.appContainer())
+	assert.False(t, envData{ContainerKind: containerDocker, RootIsHostRoot: true}.appContainer(), "the host root is visible")
+	assert.False(t, envData{ContainerKind: containerLXC}.appContainer(), "a system container is a machine")
+	assert.False(t, envData{ContainerKind: containerNone}.appContainer())
+	assert.False(t, envData{ContainerKind: containerUnknown}.appContainer())
+}
+
+func TestAgentInfo(t *testing.T) {
+	a, err := readAgent(fixture(t, map[string]string{
+		"proc/self/status": "Name:\ttopsrv\nUid:\t1000\t998\t998\t998\nCapEff:\t0000000000081004\n",
+	}))
+	require.NoError(t, err)
+	assert.Equal(t, 998, a.UID, "the effective uid")
+	assert.Equal(t, []string{"CAP_DAC_READ_SEARCH", "CAP_NET_ADMIN", "CAP_SYS_PTRACE"}, a.CapEff)
+
+	assert.Equal(t, []string{"CAP_CHOWN", "CAP_41"}, bitNames(1|1<<41, capabilities, "CAP_"))
+}
