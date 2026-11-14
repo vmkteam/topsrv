@@ -3,13 +3,16 @@ package security
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -309,4 +312,30 @@ func TestTriggerCoalescesWithoutLoss(t *testing.T) {
 	assert.Len(t, c.wakeup, 1, "one wakeup for any number of triggers")
 	c.Trigger("overflow")
 	assert.Nil(t, c.queued.trigger().Sections, "a trigger without sections makes the pass full")
+}
+
+func TestRecoverPass(t *testing.T) {
+	c, _ := newTestCollector(t, hostProc())
+	logger, logged := captureLogs(t)
+	c.Logger = logger
+
+	_, ok := c.recoverPass(t.Context(), func() inventory.Payload { panic(errors.New("SENTINELLINE")) })
+
+	assert.False(t, ok, "the snapshot is dropped, the agent goes on")
+	assert.Contains(t, logged(), "panic *errors.errorString at scan_test.go:")
+	assert.NotContains(t, logged(), "SENTINEL")
+}
+
+func TestReasonOf(t *testing.T) {
+	for err, want := range map[error]Reason{
+		fs.ErrPermission:         ReasonPermissionDenied,
+		fs.ErrNotExist:           ReasonNotFound,
+		errTooLarge:              ReasonBudgetExceeded,
+		context.DeadlineExceeded: ReasonTimeout,
+		&fs.PathError{Op: "open", Err: errNotRegular}: ReasonNotRegular,
+		fmt.Errorf("line 3: %w", errParse):            ReasonParseError,
+		syscall.EIO:                                   ReasonIOError,
+	} {
+		assert.Equal(t, want, reasonOf(err), "%v", err)
+	}
 }

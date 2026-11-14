@@ -17,17 +17,16 @@ func TestEnvironment(t *testing.T) {
 		{
 			name:  "host with systemd and glibc",
 			files: merge(hostProc(), map[string]string{"lib64/ld-linux-x86-64.so.2": "", "run/systemd/system/": ""}),
-			want:  envData{PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "glibc", Init: "systemd"},
+			want:  envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "glibc", Init: "systemd"},
 		},
 		{
 			name: "Alpine host with openrc and musl",
 			files: merge(hostProc(), map[string]string{
-				"proc/1/comm":                     "init\n",
-				"run/openrc/":                     "",
-				"lib/ld-musl-x86_64.so.1":         "",
-				"usr/lib/ld-linux-x86-64.so.2.no": "",
+				"proc/1/comm":             "init\n",
+				"run/openrc/":             "",
+				"lib/ld-musl-x86_64.so.1": "",
 			}),
-			want: envData{PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "musl", Init: "openrc"},
+			want: envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "musl", Init: "openrc"},
 		},
 		{
 			name: "docker container",
@@ -36,7 +35,7 @@ func TestEnvironment(t *testing.T) {
 				"proc/1/comm":      "topsrv\n",
 				".dockerenv":       "",
 			}),
-			want: envData{ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "other"},
+			want: envData{UserNsHost: true, ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "other"},
 		},
 		{
 			name: "systemd marker wins over a stray .dockerenv",
@@ -45,7 +44,7 @@ func TestEnvironment(t *testing.T) {
 				"run/systemd/container": "lxc\n",
 				".dockerenv":            "",
 			}),
-			want: envData{ContainerKind: containerLXC, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+			want: envData{UserNsHost: true, ContainerKind: containerLXC, NetNsHost: true, Libc: "unknown", Init: "systemd"},
 		},
 		{
 			name: "container= in the environment of PID 1, other variables ignored",
@@ -53,7 +52,7 @@ func TestEnvironment(t *testing.T) {
 				"proc/self/ns/pid": "-> pid:[4026532501]",
 				"proc/1/environ":   "LD_PRELOAD=/SENTINEL.so\x00container=systemd-nspawn\x00HOME=/",
 			}),
-			want: envData{ContainerKind: containerNspawn, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+			want: envData{UserNsHost: true, ContainerKind: containerNspawn, NetNsHost: true, Libc: "unknown", Init: "systemd"},
 		},
 		{
 			name: "podman",
@@ -62,7 +61,7 @@ func TestEnvironment(t *testing.T) {
 				"run/.containerenv": "",
 				"proc/1/comm":       "sh\n",
 			}),
-			want: envData{ContainerKind: containerPodman, NetNsHost: true, Libc: "unknown", Init: "other"},
+			want: envData{UserNsHost: true, ContainerKind: containerPodman, NetNsHost: true, Libc: "unknown", Init: "other"},
 		},
 		{
 			name: "k8s pod",
@@ -71,7 +70,7 @@ func TestEnvironment(t *testing.T) {
 				"proc/1/comm":      "pause\n",
 				"var/run/secrets/kubernetes.io/serviceaccount/": "",
 			}),
-			want: envData{ContainerKind: containerK8s, NetNsHost: true, Libc: "unknown", Init: "other"},
+			want: envData{UserNsHost: true, ContainerKind: containerK8s, NetNsHost: true, Libc: "unknown", Init: "other"},
 		},
 		{
 			name: "--pid=host container: same pid namespace, another root",
@@ -79,14 +78,71 @@ func TestEnvironment(t *testing.T) {
 				"proc/1/root": "-> /",
 				".dockerenv":  "",
 			}),
-			want: envData{PidNsHost: true, ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+			want: envData{UserNsHost: true, PidNsHost: true, ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "systemd"},
 		},
 		{
 			name: "own net namespace",
 			files: merge(hostProc(), map[string]string{
 				"proc/self/ns/net": "-> net:[4026532600]",
 			}),
-			want: envData{PidNsHost: true, RootIsHostRoot: true, ContainerKind: containerNone, Libc: "unknown", Init: "systemd"},
+			want: envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, ContainerKind: containerNone, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "container=oci (UBI images) does not end the search",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/1/environ":   "container=oci\x00",
+				".dockerenv":       "",
+			}),
+			want: envData{UserNsHost: true, ContainerKind: containerDocker, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "another pid namespace without any marker",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/1/environ":   "container=oci\x00",
+			}),
+			want: envData{UserNsHost: true, ContainerKind: containerUnknown, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "OpenVZ container",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid": "-> pid:[4026532501]",
+				"proc/vz/":         "",
+			}),
+			want: envData{UserNsHost: true, ContainerKind: containerOpenVZ, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name:  "OpenVZ host: /proc/bc is there",
+			files: merge(hostProc(), map[string]string{"proc/vz/": "", "proc/bc/": ""}),
+			want:  envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "unprivileged container: another user namespace",
+			files: merge(hostProc(), map[string]string{
+				"proc/self/ns/pid":  "-> pid:[4026532501]",
+				"proc/self/ns/user": "-> user:[4026532700]",
+				"proc/1/environ":    "container=lxc\x00",
+			}),
+			want: envData{ContainerKind: containerLXC, NetNsHost: true, Libc: "unknown", Init: "systemd"},
+		},
+		{
+			name: "both loaders on Debian: the musl package",
+			files: merge(hostProc(), map[string]string{
+				"lib/ld-musl-x86_64.so.1":    "",
+				"lib64/ld-linux-x86-64.so.2": "",
+				"etc/os-release":             "PRETTY_NAME=\"Debian GNU/Linux 12\"\nID=debian\n",
+			}),
+			want: envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "glibc", Init: "systemd"},
+		},
+		{
+			name: "both loaders on Alpine: gcompat",
+			files: merge(hostProc(), map[string]string{
+				"lib/ld-musl-x86_64.so.1":    "",
+				"lib64/ld-linux-x86-64.so.2": "",
+				"etc/os-release":             "ID=alpine\n",
+			}),
+			want: envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "musl", Init: "systemd"},
 		},
 		{
 			name: "PID 1 namespaces unreadable",
@@ -94,7 +150,7 @@ func TestEnvironment(t *testing.T) {
 				"proc/self/ns/pid": "-> pid:[4026531836]",
 				"proc/self/ns/net": "-> net:[4026531840]",
 			},
-			want:   envData{PidNsHost: true, ContainerKind: containerNone, Libc: "unknown", Init: "other"},
+			want:   envData{PidNsHost: true, ContainerKind: containerUnknown, Libc: "unknown", Init: "other"},
 			status: StatusPartial,
 		},
 	}
@@ -127,7 +183,9 @@ func TestAppContainer(t *testing.T) {
 	assert.False(t, envData{ContainerKind: containerDocker, RootIsHostRoot: true}.appContainer(), "the host root is visible")
 	assert.False(t, envData{ContainerKind: containerLXC}.appContainer(), "a system container is a machine")
 	assert.False(t, envData{ContainerKind: containerNone}.appContainer())
-	assert.False(t, envData{ContainerKind: containerUnknown}.appContainer())
+	assert.True(t, envData{ContainerKind: containerUnknown}.appContainer(), "another pid namespace, no marker")
+	assert.False(t, envData{ContainerKind: containerUnknown, PidNsHost: true}.appContainer(), "the host pid namespace")
+	assert.False(t, envData{ContainerKind: containerOpenVZ}.appContainer(), "a system container")
 }
 
 func TestAgentInfo(t *testing.T) {

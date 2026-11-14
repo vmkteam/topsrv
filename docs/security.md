@@ -62,6 +62,8 @@ Every section has the same shape:
 | `permission_denied` | The agent may not read the source: not root, missing capability, `/proc` mounted with `hidepid` |
 | `not_found` | The source does not exist where it should (e.g. securityfs not mounted in a container) |
 | `parse_error` | The source was read but not understood. Logged as `{section, file, line}` only, never the content |
+| `not_regular` | A FIFO, device or directory where a file should be, or the file was swapped while being opened — never read |
+| `io_error` | Any other read failure (EIO and the like) |
 | `timeout` | The section ran out of its time budget (a read hung on NFS), or was not rebuilt for two intervals. A section stuck in a blocking read is not started again until it returns |
 | `container_env` | The agent runs in an app container (docker, podman, k8s) without the host root in view: host facts are not visible |
 | `budget_exceeded` | A file was larger than the section reads |
@@ -79,12 +81,13 @@ Where the agent runs. Without it every other section could give a false pass: in
 |-------|------|-------------|
 | `pidNsHost` | bool | The agent sees the initial pid namespace |
 | `rootIsHostRoot` | bool | The agent's `/` is the root of PID 1 (`false` for a container started with `--pid=host`) |
-| `netNsHost` | bool | The agent shares the network namespace of PID 1 |
-| `containerKind` | string | `none`, `docker`, `podman`, `k8s`, `lxc`, `nspawn` or `unknown`. A system container (`lxc`, `nspawn`) is a machine of its own and is collected in full |
-| `libc` | string | `glibc`, `musl` or `unknown` |
+| `netNsHost` | bool | The agent shares the network namespace of PID 1. In an app container that is the container's own PID 1, so `true` there says nothing about the host |
+| `userNsHost` | bool | The agent is in the initial user namespace. `false` in an unprivileged LXC/LXD container or rootless podman: uid 0 and a full `capEff` are then not root of the host |
+| `containerKind` | string | `none`, `docker`, `podman`, `k8s`, `lxc`, `nspawn`, `openvz` or `unknown`. A system container (`lxc`, `nspawn`, `openvz`) is a machine of its own and is collected in full. `unknown` in another pid namespace (no marker: a pod without a service account token, nerdctl) is treated as an app container; `unknown` in the host pid namespace means the agent could not tell (no `CAP_SYS_PTRACE` to compare its root with PID 1's) |
+| `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`) without the host root, `sysctl` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -92,8 +95,8 @@ In an app container (`docker`, `podman`, `k8s`) without the host root, `sysctl` 
 |-------|------|-------------|
 | `taint.value` | uint64 | `/proc/sys/kernel/tainted`. `taint` is `null` if unreadable |
 | `taint.flags` | []string | Set taint flags as letters, below. Bits past the table come as `bitN` |
-| `modules[]` | object | Loaded modules: `{name, taint}`; `taint` is the module's flags (`PO`, `OE`, …) |
-| `hiddenModules` | []string | Loadable modules in `/sys/module` that are missing from `/proc/modules` — how rootkits such as Diamorphine hide. Confirmed by a second read against load/unload races. `null` when `/proc/modules` was unreadable |
+| `modules[]` | object | Loaded modules: `{name, taint, state}`; `taint` is the module's flags (`PO`, `OE`, …), `state` is set only while `Loading` or `Unloading` |
+| `hiddenModules` | []string | Loadable modules in `/sys/module` that are missing from `/proc/modules` — how rootkits such as Diamorphine and Reptile hide. Confirmed by a second read against load/unload races; built-in modules have no `initstate` and never match. A rootkit that also removes its sysfs entry (Suterusu) is not caught. `null` when `/proc/modules` was unreadable |
 | `cpuVulnerabilities` | map | `/sys/devices/system/cpu/vulnerabilities/*`: name → `{raw, class}`, below. `raw` is the kernel's line as is |
 | `lsm.active` | []string | Active LSMs, `/sys/kernel/security/lsm`. `null` without securityfs |
 | `lsm.lockdown` | string | Selected lockdown mode: `none`, `integrity`, `confidentiality` |
@@ -101,7 +104,12 @@ In an app container (`docker`, `podman`, `k8s`) without the host root, `sysctl` 
 | `lsm.selinux` | string | `enforcing`, `permissive`, `disabled` (the LSM list is known and has no selinux) or `unknown` |
 | `livepatch[]` | object | `{name, enabled, transition}`. `transition` that stays `true` means a stuck patch |
 | `time` | object | Clock state from `adjtimex` (read-only): `{unsync, clockErr, maxErrorUs, offsetUs}`. `unsync` also follows any `settimeofday` (ntpdate, VMware Tools, Hyper-V), so weigh `maxErrorUs`, not the flag alone. In a container this is the host clock |
-| `cmdline` | map | Only these `/proc/cmdline` tokens: `mitigations`, `lockdown`, `apparmor`, `selinux`, `security`, `module.sig_enforce`. The rest of the line is never sent: it may carry passwords |
+| `cmdline` | map | Only whitelisted `/proc/cmdline` tokens, up to `--` (the rest goes to init). Keys with their values: `mitigations`, `lockdown`, `apparmor`, `selinux`, `security`, `lsm`, `module.sig_enforce`, `audit`, `audit_backlog_limit`, `ima_appraise`, `init_on_alloc`, `init_on_free`, `vsyscall`, `pti`, `spectre_v2`, `spec_store_bypass_disable`, `randomize_kstack_offset`, `page_alloc.shuffle`, `debugfs`, `iommu`, `intel_iommu`, `efi`. Flags, with an empty value: `nosmt`, `nokaslr`, `nopti`, `nospectre_v1`, `nospectre_v2`, `nosmap`, `nosmep`, `noibrs`, `slab_nomerge`. The rest of the line is never sent: it may carry passwords |
+| `moduleSigEnforce` | bool | Only signed modules load (`/sys/module/module/parameters/sig_enforce`) — the effective value, set by the cmdline, `CONFIG_MODULE_SIG_FORCE` or lockdown. Absent without module signing |
+| `secureBoot` | object | `{efi, enabled, setupMode}`. `efi: false` — a legacy BIOS boot, Secure Boot impossible. `enabled`/`setupMode` from the EFI variables; `null` when efivarfs is not readable. `setupMode: true` means keys are not enrolled and nothing is enforced |
+| `kexec` | object | `{loaded, crashLoaded}`: a loaded kexec image boots without firmware and Secure Boot; a crash kernel (kdump) is normal. Absent without kexec |
+| `smt` | object | `{control, active}`: `control` is `on`, `off`, `forceoff`, `notsupported` or `notimplemented`. With SMT active the `mitigated_smt_vulnerable` class stays open |
+| `microcode` | string | CPU microcode revision (`0xf0`), x86 only |
 
 Taint flags (`Documentation/admin-guide/tainted-kernels.rst`):
 
@@ -125,10 +133,10 @@ Flags stay set until reboot.
 | Class | When |
 |-------|------|
 | `not_affected` | `Not affected` |
-| `vulnerable` | `Vulnerable…`, `Processor vulnerable`, or a mitigation with a part still open (`…; BHI: Vulnerable`) |
+| `vulnerable` | `vulnerable` anywhere in the line, other than `SMT vulnerable`: `Vulnerable…`, `Processor vulnerable`, a mitigation with a part still open (`…; BHI: Vulnerable`, `VMX: vulnerable`, `… - vulnerable module loaded`), arm64 `Mitigation: CSV2, but not BHB`, and SRSO on LTS kernels worded as a mitigation (`Mitigation: safe RET, no microcode`, `Mitigation: microcode`) |
 | `mitigated_smt_vulnerable` | Mitigated, but `SMT vulnerable` |
 | `mitigated` | `Mitigation: …` |
-| `unknown` | Anything else (`Unknown: Dependent on hypervisor status`) |
+| `unknown` | `Unknown…` and anything else (`Unknown: Dependent on hypervisor status`) |
 
 ## `sysctl`
 
@@ -136,10 +144,10 @@ Raw values; norms depend on the host role and are the backend's job. A key the k
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `values` | map | Key → raw value for the KSPP set (`kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.unprivileged_bpf_disabled`, `kernel.yama.ptrace_scope`, `kernel.kexec_load_disabled`, `kernel.randomize_va_space`, `kernel.modules_disabled`, `kernel.perf_event_paranoid`, `kernel.io_uring_disabled`, `net.core.bpf_jit_harden`, `dev.tty.ldisc_autoload`, `fs.protected_*`, `fs.suid_dumpable`, `vm.unprivileged_userfaultfd`, `vm.memfd_noexec`), user namespaces (`user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, `kernel.apparmor_restrict_unprivileged_userns`), `kernel.core_pattern`, forwarding and `net.bridge.bridge-nf-call-iptables` |
-| `ipv4Conf` | map | Interface (`all`, `default`, `eth0`, …) → `rp_filter`, `accept_redirects`, `send_redirects`, `accept_source_route`, `log_martians`. The effective `rp_filter` is max(all, iface), so `all` alone is not enough |
-| `ipv6Conf` | map | Interface → `accept_redirects`, `accept_source_route` |
-| `confTruncated` | bool | More than 64 interfaces; container-side interfaces (`veth*`, `cali*`, `lxc*`) are always skipped |
+| `values` | map | Key → raw value. KSPP: `kernel.kptr_restrict`, `kernel.dmesg_restrict`, `kernel.unprivileged_bpf_disabled`, `kernel.yama.ptrace_scope`, `kernel.kexec_load_disabled`, `kernel.randomize_va_space`, `kernel.modules_disabled`, `kernel.perf_event_paranoid`, `kernel.warn_limit`, `kernel.oops_limit`, `net.core.bpf_jit_harden`, `dev.tty.ldisc_autoload`, `dev.tty.legacy_tiocsti`, `fs.protected_*`, `fs.suid_dumpable`, `vm.unprivileged_userfaultfd`, `vm.mmap_min_addr`, `vm.mmap_rnd_bits`, `vm.mmap_rnd_compat_bits`. Other hardening: `kernel.io_uring_disabled`, `vm.memfd_noexec`, `kernel.sysrq`. User namespaces: `user.max_user_namespaces`, `kernel.unprivileged_userns_clone`, `kernel.apparmor_restrict_unprivileged_userns`, `kernel.apparmor_restrict_unprivileged_unconfined`. Paths the kernel executes: `kernel.core_pattern`, `kernel.modprobe`, `kernel.hotplug`. Network: `net.ipv4.ip_forward`, `net.ipv4.tcp_syncookies`, `net.ipv6.conf.all.forwarding`, `net.ipv4.icmp_echo_ignore_broadcasts`, `net.ipv4.icmp_ignore_bogus_error_responses`, `net.ipv4.ip_unprivileged_port_start`, `net.bridge.bridge-nf-call-iptables`, `net.bridge.bridge-nf-call-ip6tables`. `net.core.bpf_jit_harden` is root-only (0600): without root the section is `partial` |
+| `ipv4Conf` | map | Interface (`all`, `default`, `eth0`, …) → `rp_filter`, `accept_redirects`, `secure_redirects`, `send_redirects`, `accept_source_route`, `log_martians`, `forwarding`, `route_localnet`. The effective `rp_filter` is max(all, iface); `accept_redirects` is all AND iface on a forwarding interface, all OR iface otherwise — hence `forwarding` per interface |
+| `ipv6Conf` | map | Interface → `accept_redirects`, `accept_ra`, `accept_source_route`, `forwarding`, `disable_ipv6`. The kernel reads `accept_redirects` and `accept_ra` from the interface only (writing `all` does not change existing interfaces), and forwarding on the interface switches them off (`accept_ra=2` excepted), so `all.accept_ra=0` alone proves nothing |
+| `confTruncated` | bool | More than 64 interfaces. Physical interfaces are taken first, per-guest ones (`fwbr*`, `fwln*`, `fwpr*`, `tap*`, `vnet*`, `vif*`) last; container-side interfaces (`veth*`, `cali*`, `lxc*`) are always skipped |
 
 ## `roleSignals`
 
@@ -147,12 +155,15 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `processes` | []string | Running role processes, by executable (or `argv[0]` when the executable link is unreadable): `dockerd`, `containerd`, `kubelet`, `k3s`, `crio`, `conmon`, `libvirtd`, `virtqemud`, `qemu-system-*`, `lxd`, `incus`, `incusd`, `tailscaled`, `openvpn`, `cilium-agent`, `calico-node` |
+| `processes` | []string | Running role processes in the host network namespace, by executable (or `argv[0]` when the executable link is unreadable). Containers: `dockerd`, `containerd`, `crio`, `conmon`. Kubernetes: `kubelet`, `kubelite`, `k3s`, `rke2`, `k0s`, `kube-proxy`, `kube-apiserver`, `etcd`. Cluster networking: `cilium-agent`, `calico-node`, `flanneld`, `kube-router`, `antrea-agent`, `ovs-vswitchd`, `nomad`. Virtualization: `libvirtd`, `virtqemud`, `qemu-system-*`, `lxd`, `incus`, `incusd`, `firecracker`, `cloud-hypervisor`, `pvedaemon`. VPN: `tailscaled`, `openvpn`, `wireguard-go`, `charon`, `pluto`, `zerotier-one`, `nebula`, `netbird`. Routing: `bird`, `zebra`, `bgpd`, `keepalived`. A process in another network namespace (a VPN client or kubelet in a container) is not counted |
 | `interfaces.total` | int | Network interfaces without `lo` |
-| `interfaces.devTypes` | map | `DEVTYPE` → count (`bridge`, `wireguard`, `vlan`, …) |
+| `interfaces.devTypes` | map | `DEVTYPE` → count (`bridge`, `wireguard`, `vlan`, `vxlan`, `bond`, …) |
+| `interfaces.linkTypes` | map | Tunnels without a `DEVTYPE`, by link type: `gre`, `ipip`, `sit`, `ip6tnl`, `ip6gre` |
 | `interfaces.tun` | int | tun/tap interfaces (wireguard-go, tailscale, openvpn) |
-| `interfaces.names` | []string | Interfaces named `docker0`, `cni0`, `cilium_host`, `br-*`, `virbr*`, at most 32; `namesTruncated` when there were more |
-| `defaultRoutes.v4` / `.v6` | int | Default routes; more than one suggests several uplinks |
+| `interfaces.names` | []string | Interfaces named `docker0`, `podman0`, `cni-podman0`, `cni0`, `cilium_host`, `flannel.1`, `vxlan.calico`, `tunl0`, `kube-ipvs0`, `lxdbr0`, `incusbr0`, `nomad`, `br-*`, `virbr*`, `vmbr*`, at most 32; `namesTruncated` when there were more. `br-*` also matches non-Docker bridges (`br-int` of OVS) |
+| `defaultRoutes.v4` / `.v6` | int | Interfaces with a default route, not routes: ECMP gives one interface several. Blackhole and unreachable defaults do not count. IPv4 shows the main table only; IPv6 shows every table, so a VPN with its own table (wg-quick, tailscale) shows up too |
+| `defaultRoutes.interfaces` | []string | Those interfaces, at most 16 — tell an uplink from a VPN by name |
+| `markers` | []string | Role files that exist, checked with `lstat` only (never opened, so no daemon wakes up): `/dev/kvm`, `/etc/kubernetes/manifests/kube-apiserver.yaml`, `/var/lib/kubelet/config.yaml`, `/var/lib/rancher/k3s`, `/var/lib/rancher/rke2`, `/var/snap/microk8s`, `/var/lib/k0s`, `/etc/cni/net.d`, `/var/lib/containers/storage`, `/sys/module/wireguard`, `/proc/net/ip_vs`; and `/proc/xen/capabilities:control_d` for a Xen dom0 |
 
 ## What never leaves the host
 
@@ -161,6 +172,7 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | `/proc/cmdline` | Six whitelisted tokens, above |
 | Environment of PID 1 | Only whether `container=` is set and its value |
 | Command lines of processes | Only the base name of `argv[0]`, and only if it is a role process |
+| Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |
 | A panic in a parser | Its type and source location in the agent, not its value |
@@ -192,7 +204,7 @@ Trimmed; an Ubuntu host:
     "agent": { "keyId": "a1b2c3d4", "uid": 0, "capEff": ["CAP_CHOWN", "CAP_DAC_OVERRIDE", "…"] },
     "environment": {
       "status": "ok", "durationMs": 1,
-      "data": { "pidNsHost": true, "rootIsHostRoot": true, "netNsHost": true, "containerKind": "none", "libc": "glibc", "init": "systemd" }
+      "data": { "pidNsHost": true, "rootIsHostRoot": true, "netNsHost": true, "userNsHost": true, "containerKind": "none", "libc": "glibc", "init": "systemd" }
     },
     "sections": {
       "kernel": {
@@ -205,7 +217,12 @@ Trimmed; an Ubuntu host:
           "lsm": { "active": ["lockdown", "capability", "landlock", "yama", "apparmor"], "lockdown": "none",
                    "apparmor": { "enabled": true, "profiles": { "enforce": 118, "complain": 2 }, "childNamespaceProfiles": 0 }, "selinux": "disabled" },
           "time": { "unsync": false, "clockErr": false, "maxErrorUs": 16000, "offsetUs": -12 },
-          "cmdline": { "mitigations": "auto" }
+          "cmdline": { "mitigations": "auto" },
+          "moduleSigEnforce": false,
+          "secureBoot": { "efi": true, "enabled": true, "setupMode": false },
+          "kexec": { "loaded": false, "crashLoaded": false },
+          "smt": { "control": "on", "active": true },
+          "microcode": "0xf0"
         }
       },
       "sysctl": {
@@ -221,8 +238,9 @@ Trimmed; an Ubuntu host:
         "gaps": [{ "path": "/proc", "reason": "permission_denied" }],
         "data": {
           "processes": ["containerd", "dockerd"],
-          "interfaces": { "total": 3, "devTypes": { "bridge": 1 }, "tun": 0, "names": ["docker0"] },
-          "defaultRoutes": { "v4": 1, "v6": 1 }
+          "interfaces": { "total": 3, "devTypes": { "bridge": 1 }, "linkTypes": {}, "tun": 0, "names": ["docker0"] },
+          "defaultRoutes": { "v4": 1, "v6": 1, "interfaces": ["eth0"] },
+          "markers": []
         }
       }
     }

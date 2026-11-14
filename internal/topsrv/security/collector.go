@@ -3,6 +3,7 @@ package security
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"runtime"
 	"slices"
@@ -182,9 +183,24 @@ func (c *Collector) Run(ctx context.Context) {
 		case <-timer.C:
 		}
 		if t, ok := s.due(c.now()); ok {
-			c.finish(ctx, c.pass(ctx, t))
+			if p, ok := c.recoverPass(ctx, func() inventory.Payload { return c.pass(ctx, t) }); ok {
+				c.finish(ctx, p)
+			}
 		}
 	}
+}
+
+// recoverPass runs a pass. Sections recover on their own; a panic outside
+// them (environment, host facts) drops this snapshot rather than the agent,
+// logged with its type and site only.
+func (c *Collector) recoverPass(ctx context.Context, pass func() inventory.Payload) (p inventory.Payload, ok bool) {
+	defer func() {
+		if r := recover(); r != nil {
+			c.Error(ctx, "security: pass panicked", "error", fmt.Sprintf("panic %T at %s", r, panicSite()))
+			ok = false
+		}
+	}()
+	return pass(), true
 }
 
 // finish records a pass and queues its snapshot for the pusher.
@@ -258,5 +274,9 @@ func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir st
 		c.sections = slices.DeleteFunc(c.sections, func(d sectionDef) bool { return !slices.Contains(sections, d.name) })
 	}
 	c.key = existingOrEphemeralKey(stateDir)
-	return json.MarshalIndent(c.pass(ctx, Trigger{Cause: "dry-run"}), "", "  ")
+	p, ok := c.recoverPass(ctx, func() inventory.Payload { return c.pass(ctx, Trigger{Cause: "dry-run"}) })
+	if !ok {
+		return nil, errors.New("security: the pass panicked, see the log")
+	}
+	return json.MarshalIndent(p, "", "  ")
 }

@@ -13,8 +13,11 @@ const (
 		"eth0\t00000000\t010200C0\t0003\t0\t0\t0\t00000000\t0\t0\t0\n" +
 		"eth1\t00000000\t016433C6\t0003\t0\t0\t100\t00000000\t0\t0\t0\n" +
 		"eth0\t000200C0\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n" +
+		"*\t00000000\t00000000\t0001\t0\t0\t0\t00000000\t0\t0\t0\n" + // blackhole default
+		"eth0\t00000000\t020200C0\t0003\t0\t0\t200\t00000000\t0\t0\t0\n" + // a second default via eth0
 		"eth2\t00000000\t00000000\t0201\t0\t0\t0\t00000000\t0\t0\t0\n"
 	testRouteV6 = "00000000000000000000000000000000 00 00000000000000000000000000000000 00 20010db8000000000000000000000001 00000400 00000001 00000000 00000003     eth0\n" +
+		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 20010db8000000000000000000000002 00000400 00000001 00000000 00000003     eth0\n" + // ECMP
 		"00000000000000000000000000000000 00 00000000000000000000000000000000 00 00000000000000000000000000000000 ffffffff 00000001 00000000 00200200       lo\n" +
 		"20010db8000000000000000000000000 40 00000000000000000000000000000000 00 00000000000000000000000000000000 00000100 00000002 00000000 00000001     eth0\n"
 )
@@ -22,6 +25,17 @@ const (
 func rolesFixture() map[string]string {
 	return map[string]string{
 		"proc/self":                            "-> 100",
+		"proc/1/exe":                           "-> /usr/lib/systemd/systemd",
+		"proc/1/ns/net":                        "-> net:[4026531840]",
+		"proc/107/exe":                         "-> /usr/bin/kubelet", // kind: kubelet in a container's netns
+		"proc/107/ns/net":                      "-> net:[4026532900]",
+		"proc/108/exe":                         "-> /usr/sbin/keepalived",
+		"proc/108/ns/net":                      "-> net:[4026531840]",
+		"sys/class/net/gre1/uevent":            "INTERFACE=gre1\n",
+		"sys/class/net/gre1/type":              "778\n",
+		"sys/class/net/vmbr0/uevent":           "DEVTYPE=bridge\nINTERFACE=vmbr0\n",
+		"dev/kvm":                              "",
+		"sys/module/wireguard/":                "",
 		"proc/2/cmdline":                       "",
 		"proc/100/exe":                         "-> /usr/bin/dockerd",
 		"proc/101/exe":                         "-> /usr/bin/containerd (deleted)",
@@ -50,15 +64,18 @@ func TestRoleSignals(t *testing.T) {
 
 	require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
 	d := sec.Data.(roleData)
-	assert.Equal(t, []string{"containerd", "dockerd", "k3s", "qemu-system-x86_64", "tailscaled"}, d.Processes,
-		"by exe, argv[0] when exe is unreadable; deduplicated and sorted")
+	assert.Equal(t, []string{"containerd", "dockerd", "k3s", "keepalived", "qemu-system-x86_64", "tailscaled"}, d.Processes,
+		"by exe, argv[0] when exe is unreadable; deduplicated and sorted; kubelet in another netns is not the host's")
 	assert.Equal(t, ifaceSignals{
-		Total:    6,
-		DevTypes: map[string]int{"bridge": 2, "wireguard": 1},
-		Tun:      1,
-		Names:    []string{"br-0a1b2c3d4e5f", "docker0"},
+		Total:     8,
+		DevTypes:  map[string]int{"bridge": 3, "wireguard": 1},
+		LinkTypes: map[string]int{"gre": 1},
+		Tun:       1,
+		Names:     []string{"br-0a1b2c3d4e5f", "docker0", "vmbr0"},
 	}, d.Interfaces)
-	assert.Equal(t, defaultRoutes{V4: 2, V6: 1}, d.DefaultRoutes, "rejecting routes and lo do not count")
+	assert.Equal(t, defaultRoutes{V4: 2, V6: 1, Interfaces: []string{"eth0", "eth1"}}, d.DefaultRoutes,
+		"interfaces, not routes: ECMP, rejecting and blackhole routes and lo do not add uplinks")
+	assert.Equal(t, []string{"/dev/kvm", "/sys/module/wireguard"}, d.Markers)
 	assert.NotContains(t, toJSON(t, sec), "SENTINEL")
 }
 
@@ -95,4 +112,16 @@ func TestRoleSignalsHidepid(t *testing.T) {
 	d := sec.Data.(roleData)
 	assert.NotContains(t, d.Processes, "tailscaled")
 	assert.Contains(t, d.Processes, "dockerd", "what was readable is kept")
+}
+
+func TestRoleSignalsHidepid2(t *testing.T) {
+	files := rolesFixture()
+	delete(files, "proc/1/exe")
+	delete(files, "proc/1/ns/net")
+	sc := fixture(t, files) // hidepid=2: other users' processes, PID 1 included, are not listed
+
+	sec := collectRoleSignals(t.Context(), sc)
+
+	assert.Equal(t, StatusPartial, sec.Status)
+	assert.Equal(t, []Gap{{Path: "/proc", Reason: ReasonPermissionDenied}}, sec.Gaps)
 }

@@ -52,12 +52,13 @@ func unreadable(t *testing.T, sc *scanCtx, path string) {
 // namespaces, the same root as PID 1, systemd as init.
 func hostProc() map[string]string {
 	return map[string]string{
-		"proc/self/ns/pid": "-> pid:[4026531836]",
-		"proc/self/ns/net": "-> net:[4026531840]",
-		"proc/1/ns/net":    "-> net:[4026531840]",
-		"proc/1/root":      "-> ../..",
-		"proc/1/comm":      "systemd\n",
-		"proc/self/status": "Name:\ttopsrv\nUid:\t0\t0\t0\t0\nCapEff:\t000001ffffffffff\n",
+		"proc/self/ns/pid":  "-> pid:[4026531836]",
+		"proc/self/ns/net":  "-> net:[4026531840]",
+		"proc/self/ns/user": "-> user:[4026531837]",
+		"proc/1/ns/net":     "-> net:[4026531840]",
+		"proc/1/root":       "-> ../..",
+		"proc/1/comm":       "systemd\n",
+		"proc/self/status":  "Name:\ttopsrv\nUid:\t0\t0\t0\t0\nCapEff:\t000001ffffffffff\n",
 	}
 }
 

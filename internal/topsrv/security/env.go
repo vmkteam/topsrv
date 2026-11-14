@@ -6,11 +6,20 @@ import (
 	"strings"
 )
 
-// hostPidNs is the inode of the initial pid namespace, fixed since Linux 3.8.
-const hostPidNs = "pid:[4026531836]"
+// Inodes of the initial pid and user namespaces, fixed since Linux 3.8.
+const (
+	hostPidNs  = "pid:[4026531836]"
+	hostUserNs = "user:[4026531837]"
+)
 
 // smallFileLimit caps the one-line files of /proc, /sys and /run.
 const smallFileLimit = 64 << 10
+
+// Values of envData.Libc.
+const (
+	libcGlibc = "glibc"
+	libcMusl  = "musl"
+)
 
 // Values of envData.Init.
 const (
@@ -27,34 +36,44 @@ const (
 	containerK8s     = "k8s"
 	containerLXC     = "lxc"
 	containerNspawn  = "nspawn"
+	containerOpenVZ  = "openvz"
 	containerUnknown = valueUnknown
 )
 
 // envData says where the agent runs. Without it every other section may give
 // a false pass: in a container /etc belongs to the container.
 type envData struct {
-	PidNsHost      bool   `json:"pidNsHost"`
-	RootIsHostRoot bool   `json:"rootIsHostRoot"`
-	NetNsHost      bool   `json:"netNsHost"`
-	ContainerKind  string `json:"containerKind"`
-	Libc           string `json:"libc"`
-	Init           string `json:"init"`
+	PidNsHost      bool `json:"pidNsHost"`
+	RootIsHostRoot bool `json:"rootIsHostRoot"`
+	// NetNsHost: the agent shares the net namespace of PID 1 — in an app
+	// container that is the container's own PID 1, not the host's.
+	NetNsHost bool `json:"netNsHost"`
+	// UserNsHost: the initial user namespace. Outside it (unprivileged LXC,
+	// rootless podman) uid 0 and a full capEff are not root of the host.
+	UserNsHost    bool   `json:"userNsHost"`
+	ContainerKind string `json:"containerKind"`
+	Libc          string `json:"libc"`
+	Init          string `json:"init"`
 }
 
-// appContainer: docker, podman or k8s without the host root in view. Host
-// sections report unknown/container_env there. A system container (lxc,
-// nspawn) is a machine of its own and is collected.
+// appContainer: docker, podman or k8s without the host root in view, or an
+// unidentified container (another pid namespace, no marker: a pod without a
+// service account token, nerdctl). Host sections report
+// unknown/container_env there. A system container (lxc, nspawn, openvz) is a
+// machine of its own and is collected.
 func (e envData) appContainer() bool {
 	switch e.ContainerKind {
 	case containerDocker, containerPodman, containerK8s:
 		return !e.RootIsHostRoot
+	case containerUnknown:
+		return !e.PidNsHost
 	}
 	return false
 }
 
-// collectEnvironment follows the order of systemd's virt.c: the pid
-// namespace first, then the container manager markers, the most reliable
-// first.
+// collectEnvironment checks the pid namespace first: in the initial one the
+// agent is on the host unless its root differs from PID 1's. Outside it the
+// container markers are read in the order of systemd's virt.c.
 func collectEnvironment(sc *scanCtx) (Section, envData) {
 	env := envData{ContainerKind: containerUnknown}
 	pidNs, err := sc.readlink("/proc/self/ns/pid")
@@ -64,22 +83,22 @@ func collectEnvironment(sc *scanCtx) (Section, envData) {
 	env.PidNsHost = pidNs == hostPidNs
 
 	var gaps gapList
-	pid1Unreadable := false
 	if env.PidNsHost {
 		// With the host pid namespace a different root than PID 1's means a
-		// container started with --pid=host.
-		same, err := sc.sameFile("/", "/proc/1/root")
-		gaps.add("/proc/1/root", err)
-		pid1Unreadable = err != nil
+		// container started with --pid=host. Without CAP_SYS_PTRACE that is
+		// unknowable: no marker leaves the kind unknown, not "none".
+		same, sameErr := sc.sameFile("/", "/proc/1/root")
+		gaps.add("/proc/1/root", sameErr)
 		env.RootIsHostRoot = same
 	}
 	env.ContainerKind = containerNone
 	if !env.RootIsHostRoot {
 		env.ContainerKind = detectContainer(sc)
-		if pid1Unreadable && env.ContainerKind == containerUnknown {
-			env.ContainerKind = containerNone // host pid namespace, no marker: a host without CAP_SYS_PTRACE
-		}
 	}
+
+	userNs, err := sc.readlink("/proc/self/ns/user")
+	gaps.add("/proc/self/ns/user", err)
+	env.UserNsHost = userNs == hostUserNs
 
 	selfNet, err1 := sc.readlink("/proc/self/ns/net")
 	initNet, err2 := sc.readlink("/proc/1/ns/net")
@@ -94,16 +113,25 @@ func collectEnvironment(sc *scanCtx) (Section, envData) {
 	return collected(gaps, env), env
 }
 
-// detectContainer reads the container manager markers in order of
-// reliability; /.dockerenv comes last, it may be left in an image by mistake.
+// detectContainer reads the container markers in the order of systemd's
+// virt.c, the most reliable first; /.dockerenv comes last, it may be left in
+// an image by mistake. A manager name it does not know ("oci" in UBI images)
+// does not end the search.
 func detectContainer(sc *scanCtx) string {
+	if sc.exists("/proc/vz") && !sc.exists("/proc/bc") {
+		return containerOpenVZ // a container, not the OpenVZ host
+	}
 	for _, p := range []string{"/run/host/container-manager", "/run/systemd/container"} {
 		if b, err := sc.read(p, smallFileLimit); err == nil {
-			return containerOfManager(sc, strings.TrimSpace(string(b)))
+			if kind := containerOfManager(sc, strings.TrimSpace(string(b))); kind != containerUnknown {
+				return kind
+			}
 		}
 	}
 	if v, ok := initEnv(sc, "container"); ok {
-		return containerOfManager(sc, v)
+		if kind := containerOfManager(sc, v); kind != containerUnknown {
+			return kind
+		}
 	}
 	switch {
 	case sc.exists("/run/.containerenv"):
@@ -156,17 +184,34 @@ func initEnv(sc *scanCtx, key string) (string, bool) {
 	return "", false
 }
 
+// detectLibc goes by the dynamic loaders present. Both is common: the musl
+// package on Debian, gcompat on Alpine — the distribution decides then.
 func detectLibc(sc *scanCtx) string {
-	for _, c := range []struct{ libc, glob string }{
-		{"musl", "/lib/ld-musl-*"},
-		{"glibc", "/lib*/ld-linux*.so.*"},
-		{"glibc", "/usr/lib*/ld-linux*.so.*"},
-	} {
-		if sc.glob(c.glob) {
-			return c.libc
+	musl := sc.glob("/lib/ld-musl-*")
+	glibc := sc.glob("/lib*/ld-linux*.so.*") || sc.glob("/usr/lib*/ld-linux*.so.*")
+	switch {
+	case musl && glibc:
+		if osID(sc) == "alpine" {
+			return libcMusl
 		}
+		return libcGlibc
+	case musl:
+		return libcMusl
+	case glibc:
+		return libcGlibc
 	}
 	return valueUnknown
+}
+
+// osID is ID from /etc/os-release.
+func osID(sc *scanCtx) string {
+	b, _ := sc.read("/etc/os-release", smallFileLimit)
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "ID="); ok {
+			return strings.Trim(v, `"`)
+		}
+	}
+	return ""
 }
 
 func detectInit(sc *scanCtx) string {

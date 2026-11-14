@@ -27,6 +27,10 @@ func sysctlFixture() map[string]string {
 		"proc/sys/net/ipv4/conf/veth1a2b3c/rp_filter":  "0\n",
 		"proc/sys/net/ipv6/conf/all/accept_redirects":  "1\n",
 		"proc/sys/net/ipv6/conf/eth0/accept_redirects": "0\n",
+		"proc/sys/net/ipv6/conf/eth0/accept_ra":        "1\n",
+		"proc/sys/net/ipv4/conf/eth0/forwarding":       "1\n",
+		"proc/sys/kernel/modprobe":                     "/sbin/modprobe\n",
+		"proc/sys/dev/tty/legacy_tiocsti":              "0\n",
 	}
 }
 
@@ -46,24 +50,31 @@ func TestSysctl(t *testing.T) {
 		"net.ipv4.ip_forward":                "1",
 		"net.bridge.bridge-nf-call-iptables": "1",
 		"net.ipv6.conf.all.forwarding":       "0",
+		"kernel.modprobe":                    "/sbin/modprobe",
+		"dev.tty.legacy_tiocsti":             "0",
 	}, d.Values, "keys the kernel does not have are absent, not empty")
 	assert.Equal(t, map[string]map[string]string{
 		"all":      {"rp_filter": "0", "accept_redirects": "0"},
 		"default":  {"rp_filter": "2"},
-		"eth0":     {"rp_filter": "1", "accept_redirects": "1"},
+		"eth0":     {"rp_filter": "1", "accept_redirects": "1", "forwarding": "1"},
 		"eth0.100": {"rp_filter": "2"},
 	}, d.IPv4Conf, "container-side veth interfaces are skipped")
 	assert.Equal(t, map[string]map[string]string{
-		"all":  {"accept_redirects": "1"},
-		"eth0": {"accept_redirects": "0"},
+		"all":  {"accept_redirects": "1", "forwarding": "0"},
+		"eth0": {"accept_redirects": "0", "accept_ra": "1"},
 	}, d.IPv6Conf)
 	assert.False(t, d.ConfTruncated)
 }
 
 func TestSysctlConfLimit(t *testing.T) {
-	files := map[string]string{"proc/sys/net/ipv4/conf/all/rp_filter": "1\n"}
-	for i := range maxConfInterfaces + 6 {
-		files[fmt.Sprintf("proc/sys/net/ipv4/conf/dummy%02d/rp_filter", i)] = "1\n"
+	files := map[string]string{
+		"proc/sys/net/ipv4/conf/all/rp_filter":   "1\n",
+		"proc/sys/net/ipv4/conf/vmbr0/rp_filter": "1\n", // the host bridge, after the alphabet of fw*
+		"proc/sys/net/ipv4/conf/eth0/rp_filter":  "1\n", // physical
+		"sys/class/net/eth0/device":              "-> ../../../0000:00:03.0",
+	}
+	for i := range maxConfInterfaces {
+		files[fmt.Sprintf("proc/sys/net/ipv4/conf/fwbr%03di0/rp_filter", i)] = "1\n" // Proxmox per-VM bridges
 	}
 	sc := fixture(t, files)
 
@@ -72,6 +83,8 @@ func TestSysctlConfLimit(t *testing.T) {
 	d := sec.Data.(sysctlData)
 	assert.Len(t, d.IPv4Conf, maxConfInterfaces+1, "all + the first maxConfInterfaces")
 	assert.Contains(t, d.IPv4Conf, "all")
+	assert.Contains(t, d.IPv4Conf, "eth0", "physical interfaces come first")
+	assert.Contains(t, d.IPv4Conf, "vmbr0", "guest interfaces come last")
 	assert.True(t, d.ConfTruncated)
 }
 

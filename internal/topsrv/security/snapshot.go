@@ -35,7 +35,9 @@ type Reason string
 const (
 	ReasonPermissionDenied    Reason = "permission_denied"
 	ReasonNotFound            Reason = "not_found"
-	ReasonParseError          Reason = "parse_error"
+	ReasonParseError          Reason = "parse_error" // read, but not understood
+	ReasonNotRegular          Reason = "not_regular" // a FIFO, device or directory where a file should be, or swapped while opened
+	ReasonIOError             Reason = "io_error"    // any other read failure (EIO, ...)
 	ReasonTimeout             Reason = "timeout"
 	ReasonContainerEnv        Reason = "container_env"
 	ReasonBudgetExceeded      Reason = "budget_exceeded"
@@ -124,7 +126,11 @@ func reasonOf(err error) Reason {
 		return ReasonBudgetExceeded
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return ReasonTimeout
-	default:
+	case errors.Is(err, errNotRegular):
+		return ReasonNotRegular
+	case errors.Is(err, errParse):
 		return ReasonParseError
+	default:
+		return ReasonIOError
 	}
 }

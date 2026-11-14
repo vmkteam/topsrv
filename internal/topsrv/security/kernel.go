@@ -32,6 +32,11 @@ type kernelData struct {
 	Livepatch          []livepatch        `json:"livepatch,omitempty"`
 	Time               *timeSync          `json:"time,omitempty"`
 	Cmdline            map[string]string  `json:"cmdline"`
+	ModuleSigEnforce   *bool              `json:"moduleSigEnforce,omitempty"` // absent without module signing
+	SecureBoot         *secureBoot        `json:"secureBoot"`
+	Kexec              *kexecState        `json:"kexec,omitempty"`
+	SMT                *smtState          `json:"smt,omitempty"`
+	Microcode          string             `json:"microcode,omitempty"`
 }
 
 type taint struct {
@@ -42,6 +47,7 @@ type taint struct {
 type module struct {
 	Name  string `json:"name"`
 	Taint string `json:"taint,omitempty"`
+	State string `json:"state,omitempty"` // Loading or Unloading; absent when Live
 }
 
 type cpuVuln struct {
@@ -80,9 +86,20 @@ type timeSync struct {
 	OffsetUs   int64 `json:"offsetUs"`
 }
 
-// cmdlineKeys are the only /proc/cmdline tokens reported: the line itself
-// may carry passwords (iscsi and the like).
-var cmdlineKeys = []string{"mitigations", "lockdown", "apparmor", "selinux", "security", "module.sig_enforce"}
+// cmdlineKeys and cmdlineFlags are the only /proc/cmdline tokens reported:
+// the line itself may carry passwords (iscsi and the like). Their values are
+// enums and numbers.
+var (
+	cmdlineKeys = []string{
+		"mitigations", "lockdown", "apparmor", "selinux", "security", "lsm", "module.sig_enforce",
+		"audit", "audit_backlog_limit", "ima_appraise", "init_on_alloc", "init_on_free", "vsyscall",
+		"pti", "spectre_v2", "spec_store_bypass_disable", "randomize_kstack_offset",
+		"page_alloc.shuffle", "debugfs", "iommu", "intel_iommu", "efi",
+	}
+	cmdlineFlags = []string{
+		"nosmt", "nokaslr", "nopti", "nospectre_v1", "nospectre_v2", "nosmap", "nosmep", "noibrs", "slab_nomerge",
+	}
+)
 
 // taintLetters by bit, from Documentation/admin-guide/tainted-kernels.rst.
 var taintLetters = strings.Split("PFSRMBUDAWCIOELKXTNJ", "")
@@ -118,6 +135,7 @@ func collectKernel(_ context.Context, sc *scanCtx) Section {
 
 	d.Cmdline, err = readCmdline(sc)
 	gaps.add("/proc/cmdline", err)
+	readBootFacts(sc, &d, &gaps)
 	return collected(gaps, d)
 }
 
@@ -146,8 +164,11 @@ func readModules(sc *scanCtx) ([]module, error) {
 			continue
 		}
 		m := module{Name: f[0]}
+		if len(f) >= 5 && f[4] != "Live" {
+			m.State = f[4]
+		}
 		if len(f) >= 7 {
-			m.Taint = strings.Trim(f[6], "()")
+			m.Taint = strings.Trim(f[6], "()+-") // "(OE+)": + loading, - unloading
 		}
 		out = append(out, m)
 	}
@@ -214,24 +235,30 @@ func readVulnerabilities(sc *scanCtx) (map[string]cpuVuln, error) {
 			return nil, err
 		}
 		raw := strings.TrimSpace(string(b))
-		out[e.Name()] = cpuVuln{Raw: raw, Class: vulnClass(raw)}
+		out[e.Name()] = cpuVuln{Raw: raw, Class: vulnClass(e.Name(), raw)}
 	}
 	return out, nil
 }
 
 // vulnClass classifies a vulnerabilities/* line. The raw line is reported as
-// well: parsers that keep only the class lose "SMT vulnerable" and the
-// "KVM:" lines. A mitigation with a part still open ("...; BHI: Vulnerable")
-// is vulnerable.
-func vulnClass(raw string) string {
+// well: parsers that keep only the prefix lose "SMT vulnerable" and the
+// "KVM:" lines. Any part still open makes the line vulnerable, whatever its
+// prefix: "...; BHI: Vulnerable", "VMX: vulnerable", "- vulnerable module
+// loaded", arm64 "CSV2, but not BHB".
+func vulnClass(name, raw string) string {
+	lower := strings.ToLower(raw)
+	rest := strings.ReplaceAll(lower, "smt vulnerable", "")
 	switch {
-	case raw == "Not affected":
+	case strings.HasPrefix(raw, "Not affected"):
 		return vulnNotAffected
-	case strings.HasPrefix(raw, "Vulnerable"), strings.HasPrefix(raw, "Processor vulnerable"),
-		strings.Contains(raw, ": Vulnerable"):
+	case strings.HasPrefix(raw, "Unknown"): // "Unknown (XEN PV ... mitigation required)"
+		return vulnUnknown
+	case name == "spec_rstack_overflow" && (strings.Contains(lower, "no microcode") || lower == "mitigation: microcode"):
+		return vulnVulnerable // LTS kernels word a missing SRSO fix as a mitigation
+	case strings.Contains(lower, "but not bhb"), strings.Contains(rest, "vulnerable"):
 		return vulnVulnerable
-	case strings.Contains(raw, "Mitigation"):
-		if strings.Contains(raw, "SMT vulnerable") {
+	case strings.Contains(lower, "mitigation"):
+		if rest != lower {
 			return vulnMitigatedSMT
 		}
 		return vulnMitigated
@@ -344,8 +371,15 @@ func readCmdline(sc *scanCtx) (map[string]string, error) {
 	}
 	out := map[string]string{}
 	for tok := range strings.FieldsSeq(string(b)) {
-		if k, v, found := strings.Cut(tok, "="); found && slices.Contains(cmdlineKeys, k) {
+		if tok == "--" {
+			break // the rest goes to init, not the kernel
+		}
+		k, v, found := strings.Cut(tok, "=")
+		switch {
+		case found && slices.Contains(cmdlineKeys, k):
 			out[k] = v
+		case !found && slices.Contains(cmdlineFlags, k):
+			out[k] = ""
 		}
 	}
 	return out, nil
