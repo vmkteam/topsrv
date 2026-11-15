@@ -138,11 +138,24 @@ type accountAnomalies struct {
 	PrimaryGroupMissing []string `json:"primaryGroupMissing"`
 }
 
-// accountsResult is what authorizedKeys builds on: every user, not only the
-// listed ones, with home directories.
+// accountsResult is what later sections build on: every user, not only the
+// listed ones, with home directories (authorizedKeys); the groups (docker,
+// for its socket's gid).
 type accountsResult struct {
-	users  []account
-	groups map[string][]string // user → names of the primary and supplementary groups; nil when group is unread
+	users        []account
+	groups       map[string][]string   // user → names of the primary and supplementary groups; nil when group is unread
+	groupsByName map[string]groupEntry // /etc/group; nil when unread
+}
+
+// gidGroup is a group as the kernel checks access: by gid, whatever the
+// name.
+type gidGroup struct {
+	// Name is what getgrgid returns from files: the first line of
+	// /etc/group with the gid; null when no line has it.
+	Name *string `json:"name"`
+	// Members: see gidMembers; at most maxUsers.
+	Members   []string `json:"members"`
+	Truncated bool     `json:"truncated,omitempty"` // more than maxUsers members
 }
 
 type passwdEntry struct {
@@ -158,7 +171,10 @@ type shadowEntry struct {
 type groupEntry struct {
 	gid     int64
 	members []string
-	dups    int // more lines of the same name; the first one counts
+	line    int // getgrgid takes the first line with a gid
+	// dups are more lines of the same name: getgrnam takes the first, but
+	// initgroups reads every line, so their gids count for gidMembers.
+	dups []groupEntry
 }
 
 func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
@@ -212,11 +228,11 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 	d.Anomalies = accountAnomaliesOf(users, shadow)
 	d.Malformed = d.Malformed[:min(len(d.Malformed), maxLineRefs)]
 	if groups != nil {
-		d.PrivilegedGroups = privilegedMembers(users, groups)
+		d.PrivilegedGroups = privilegedMembers(all, groups)
 		d.Anomalies.addGroups(users, groups)
 	}
 	d.Files = filesMeta(sc, []string{pathPasswd, pathShadow, pathGroup, pathGshadow})
-	return collected(gaps, d), &accountsResult{users: all, groups: groupsByUser(users, groups)}
+	return collected(gaps, d), &accountsResult{users: all, groups: groupsByUser(users, groups), groupsByName: groups}
 }
 
 // parsePasswd parses name:pw:uid:gid:gecos:home:shell. GECOS is skipped
@@ -283,18 +299,20 @@ func parseGroup(b []byte) (groups map[string]groupEntry, malformed []lineRef, ni
 			malformed = append(malformed, lineRef{File: pathGroup, Line: n, Code: codeID})
 			continue
 		}
-		if g, dup := groups[f[0]]; dup {
-			g.dups++
-			groups[f[0]] = g
-			continue
-		}
+		// Cloned, as in parsePasswd: the result outlives the pass.
 		var members []string
 		for m := range strings.SplitSeq(f[3], ",") {
 			if m = strings.TrimSpace(m); m != "" {
-				members = append(members, m)
+				members = append(members, strings.Clone(m))
 			}
 		}
-		groups[f[0]] = groupEntry{gid: gid, members: members}
+		e := groupEntry{gid: gid, members: members, line: n}
+		if g, dup := groups[f[0]]; dup {
+			g.dups = append(g.dups, e)
+			groups[f[0]] = g
+			continue
+		}
+		groups[strings.Clone(f[0])] = e
 	}
 	return groups, malformed, nisCompat
 }
@@ -478,8 +496,32 @@ func accountAnomaliesOf(users []passwdEntry, shadow map[string]shadowEntry) acco
 	return a
 }
 
-// privilegedMembers lists the members of each privileged group present:
-// those in the member list and those whose primary group it is.
+// groupOf returns the group with gid; nil when /etc/group is unread.
+// Members come from files only: users a directory (sssd, LDAP) serves are
+// not seen, see nss.
+func (r *accountsResult) groupOf(gid int64) *gidGroup {
+	if r.groupsByName == nil {
+		return nil
+	}
+	g := &gidGroup{Members: gidMembers(r.users, r.groupsByName, gid)}
+	first := 0
+	pick := func(name string, e groupEntry) {
+		if e.gid == gid && (g.Name == nil || e.line < first) {
+			g.Name, first = &name, e.line
+		}
+	}
+	for name, e := range r.groupsByName {
+		pick(name, e)
+		for _, d := range e.dups {
+			pick(name, d)
+		}
+	}
+	if len(g.Members) > maxUsers {
+		g.Members, g.Truncated = g.Members[:maxUsers], true
+	}
+	return g
+}
+
 // groupsByUser lists each user's groups by name, as getgrouplist does from
 // files: the primary GID's group and those naming the user. nil without
 // group.
@@ -513,7 +555,7 @@ func (a *accountAnomalies) addGroups(users []passwdEntry, groups map[string]grou
 	byGID := map[int64]int{}
 	for name, g := range groups {
 		byGID[g.gid]++
-		if g.dups > 0 {
+		if len(g.dups) > 0 {
 			a.DuplicateGroupNames = append(a.DuplicateGroupNames, name)
 		}
 		if g.gid == 0 && name != "root" {
@@ -537,24 +579,39 @@ func (a *accountAnomalies) addGroups(users []passwdEntry, groups map[string]grou
 	a.PrimaryGroupMissing = slices.Compact(a.PrimaryGroupMissing)
 }
 
-func privilegedMembers(users []passwdEntry, groups map[string]groupEntry) map[string][]string {
+// privilegedMembers lists the members of each privileged group present, by
+// its gid.
+func privilegedMembers(users []account, groups map[string]groupEntry) map[string][]string {
 	out := map[string][]string{}
 	for _, name := range privilegedGroupNames {
-		g, ok := groups[name]
-		if !ok {
-			continue
-		}
-		members := slices.Clone(g.members)
-		for _, u := range users {
-			if u.gid == g.gid {
-				members = append(members, u.name)
-			}
-		}
-		slices.Sort(members)
-		out[name] = slices.Compact(members)
-		if out[name] == nil {
-			out[name] = []string{}
+		if g, ok := groups[name]; ok {
+			out[name] = gidMembers(users, groups, g.gid)
 		}
 	}
 	return out
+}
+
+// gidMembers lists who holds gid, as the kernel and sudo check it whatever
+// the name: the members of every group line with the gid (two names may
+// share one, a name may have two lines) and the users whose primary group
+// it is. Sorted, never nil.
+func gidMembers(users []account, groups map[string]groupEntry, gid int64) []string {
+	members := []string{}
+	for _, g := range groups {
+		if g.gid == gid {
+			members = append(members, g.members...)
+		}
+		for _, d := range g.dups {
+			if d.gid == gid {
+				members = append(members, d.members...)
+			}
+		}
+	}
+	for _, u := range users {
+		if u.GID == gid {
+			members = append(members, u.Name)
+		}
+	}
+	slices.Sort(members)
+	return slices.Compact(members)
 }

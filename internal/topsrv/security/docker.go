@@ -68,7 +68,7 @@ type dockerData struct {
 	Config dockerConfig `json:"config"`
 	Hosts  []dockerHost `json:"hosts"`
 	// Socket is the unix socket of the API; null when there is none.
-	Socket *fileMeta `json:"socket"`
+	Socket *dockerSocket `json:"socket"`
 	// Published are the ports of running containers bound on the host;
 	// null when the API did not answer.
 	Published          []dockerPort `json:"published"`
@@ -109,6 +109,16 @@ type dockerConfigFile struct {
 	// it expects. A dockerd that runs read it at start: an invalid file
 	// stops the next start.
 	Valid bool `json:"valid"`
+}
+
+// dockerSocket is the API's unix socket. Members of its group are root in
+// all but name, and the group need not be called docker: dockerd's --group,
+// SocketGroup= of docker.socket, dockerroot on old RHEL.
+type dockerSocket struct {
+	fileMeta
+	// Group of the socket's gid, from the accounts section; null when
+	// /etc/group was not read (accounts disabled or failed).
+	Group *gidGroup `json:"group"`
 }
 
 type dockerHost struct {
@@ -248,7 +258,8 @@ func readDockerConfig(sc *scanCtx, droot, path string, gaps *gapList) (*dockerCo
 
 // dockerSocketMeta stats the socket under root without following it, and
 // without connecting: nil, with a gap, when it is missing or not a socket.
-func dockerSocketMeta(sc *scanCtx, root, socket string, gaps *gapList) *fileMeta {
+// A gid is the same in every mount namespace: the group is the host's.
+func dockerSocketMeta(sc *scanCtx, root, socket string, gaps *gapList) *dockerSocket {
 	fi, err := sc.lstat(root + socket)
 	if err == nil && fi.Mode()&fs.ModeSocket == 0 {
 		err = errNotRegular
@@ -257,8 +268,12 @@ func dockerSocketMeta(sc *scanCtx, root, socket string, gaps *gapList) *fileMeta
 		gaps.add(socket, err)
 		return nil
 	}
-	m := metaOf(socket, fi)
-	return &m
+	s := &dockerSocket{fileMeta: metaOf(socket, fi)}
+	_, res, _ := sc.dep(SectionAccounts)
+	if acc, ok := res.(*accountsResult); ok {
+		s.Group = acc.groupOf(s.GID)
+	}
+	return s
 }
 
 func dockerConfigOf(s dockerapi.Settings, file *dockerConfigFile) dockerConfig {
