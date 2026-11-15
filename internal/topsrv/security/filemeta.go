@@ -20,8 +20,12 @@ func statFile(sc *scanCtx, path string) (fileMeta, error) {
 	if err != nil {
 		return fileMeta{}, err
 	}
+	return metaOf(path, fi), nil
+}
+
+func metaOf(path string, fi fs.FileInfo) fileMeta {
 	uid, gid := fileOwner(fi)
-	return fileMeta{Path: path, Mode: modeString(fi.Mode()), UID: uid, GID: gid}, nil
+	return fileMeta{Path: path, Mode: modeString(fi.Mode()), UID: uid, GID: gid}
 }
 
 func modeString(m fs.FileMode) string {

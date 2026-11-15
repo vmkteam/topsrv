@@ -89,7 +89,7 @@ Where the agent runs. Without it every other section could give a false pass: in
 | `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -188,6 +188,27 @@ Users and groups from `/etc/passwd`, `/etc/shadow`, `/etc/group` and `/etc/nsswi
 | `hash` | A hash in shadow |
 | `hashInPasswd` | A hash in passwd, readable by every user. shadow is not consulted then |
 
+## `sshd`
+
+The configuration sshd would apply, parsed as sshd parses it (`servconf.c`): no `sshd -T`, nothing is executed. `na` when sshd is not installed; `unknown` when the main configuration is unreadable (RHEL keeps drop-ins at 0600: without root that is `permission_denied`, never the defaults); an unreadable drop-in is a gap.
+
+The command line is taken from the running listener in the host mount namespace — sshd keeps it in its title, `sshd: /usr/sbin/sshd -D [listener] …` — or, without one, from `ExecStart` of `ssh.service`/`sshd.service` with its drop-ins and `EnvironmentFile`, or from `/etc/conf.d/sshd` on Alpine. `-f` names the file, `-o` comes before the files and wins, `-p` drops the `Port` lines.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `configFile` | string | The main file, `/etc/ssh/sshd_config` without `-f` |
+| `configValid` | bool | sshd would start with it: no refused line, every file read. An unknown keyword does not count, distribution builds add their own |
+| `effective` | map | Every keyword of the list below → `{value, source}`, as sshd applies them before any `Match`. `value` is a string; an array for `Port`, `ListenAddress`, `Allow/Deny Users/Groups`, `AuthorizedKeysFile`, `AuthenticationMethods`; `true`/`false` for `AuthorizedKeysCommand`, `TrustedUserCAKeys`, `Banner` (set and not `none` — a command line is never sent); `null` when not set. `source` is `file:line`, `cmdline` or `unset`. **Defaults are not filled in**: they depend on the OpenSSH version and the distribution, which the backend knows from packages |
+| `matchBlocks[]` | object | `{criteria, source, evaluable, keys}`: the criteria as written, `file:line`, `evaluable` when only `User`/`Group` criteria (the backend can match them with `accounts`; `Address`, `Host` depend on the connection), and the listed keywords the block sets |
+| `files[]` | object | Files read, in order: `{path, mode, uid, gid, sha256, mtime}` |
+| `unknownKeywords[]` | object | `{file, line, code}`, `code` is the keyword (`DebianBanner`), or `invalid` when it does not look like one |
+| `parseErrors[]` | object | Lines sshd refuses: `{file, line, code}`, `code` is `unterminated_quote`, `missing_argument`, `extra_arguments`, `not_allowed_in_match`, `include_depth` (deeper than 16 — also how a loop shows), `too_many_files` (more than 256), `bad_match`. Never the text of a line |
+| `listener` | object | `{found, flagsFromCmdline, startedAt}`. sshd reads its files at start and on SIGHUP: a file with `mtime` after `startedAt` may not be in force |
+| `socketActivated` | bool | `ssh.socket` is enabled (Ubuntu 24.04): there may be no listener until the first connection, and the ports come from the socket unit |
+| `pamCompiled` | bool | The sshd binaries (sshd-session since 9.8) link libpam. Alpine ships `openssh-server` without PAM: `UsePAM` does nothing then, and a `*` password is not a lock. `null` when the binaries are unreadable |
+
+Keywords in `effective`: `PermitRootLogin` (`without-password` comes as `prohibit-password`), `PasswordAuthentication`, `KbdInteractiveAuthentication` (`ChallengeResponseAuthentication` sets it too), `PermitEmptyPasswords`, `PubkeyAuthentication`, `AuthenticationMethods`, `UsePAM`, `MaxAuthTries`, `LoginGraceTime`, `Port`, `ListenAddress`, `AddressFamily`, `AllowUsers`, `DenyUsers`, `AllowGroups`, `DenyGroups`, `AuthorizedKeysFile`, `AuthorizedKeysCommand`, `AuthorizedKeysCommandUser`, `TrustedUserCAKeys`, `StrictModes`, `PermitUserEnvironment`, `HostbasedAuthentication`, `IgnoreRhosts`, `GSSAPIAuthentication`, `X11Forwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`, `PermitTunnel`, `GatewayPorts`, `Ciphers`, `MACs`, `KexAlgorithms`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`, `LogLevel`, `ClientAliveInterval`, `ClientAliveCountMax`, `MaxSessions`, `MaxStartups`, `Banner`.
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -214,6 +235,8 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | Command lines of processes | Only the base name of `argv[0]`, and only if it is a role process |
 | `/etc/shadow` | The class of each password field, its algorithm and a keyed token; never the hash |
 | `/etc/passwd` | Name, uid, gid, shell; GECOS is not read, home directories are not sent |
+| sshd configuration | The listed keywords with `file:line`; `AuthorizedKeysCommand`, `TrustedUserCAKeys`, `Banner` only as set or not |
+| Command line of the sshd listener | Only `-f`, `-o`, `-p`, to parse the configuration as sshd does |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |

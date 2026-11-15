@@ -281,6 +281,7 @@ var allSections = []sectionDef{
 	{name: SectionKernel, budget: 2 * time.Second, run: noResult(collectKernel)},
 	{name: SectionSysctl, budget: 2 * time.Second, host: true, run: noResult(collectSysctl)},
 	{name: SectionAccounts, budget: 2 * time.Second, host: true, run: collectAccounts},
+	{name: SectionSSHD, budget: 3 * time.Second, host: true, run: collectSSHD},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
 

@@ -29,7 +29,7 @@ import (
 func hostFixture() map[string]string {
 	roles := rolesFixture()
 	delete(roles, "proc/self") // a directory here
-	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), roles, map[string]string{
+	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), sshdFixture(), roles, map[string]string{
 		"etc/os-release":             "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
 		"proc/sys/kernel/osrelease":  "6.1.0-27-amd64\n",
 		"var/lib/dpkg/status":        "",
@@ -284,8 +284,8 @@ func TestDryRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "dry-run writes nothing")
 
-	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionSSHD})
-	require.ErrorContains(t, err, `"sshd" is not collected by this version`)
+	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionFirewall})
+	require.ErrorContains(t, err, `"firewall" is not collected by this version`)
 
 	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{DisabledSections: []string{SectionSysctl}}, stateDir, "1.2.3", []string{SectionSysctl})
 	require.ErrorContains(t, err, `"sysctl" is disabled`)
