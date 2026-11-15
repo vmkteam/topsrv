@@ -22,9 +22,11 @@ var afterStat = func(string) {}
 // openFile opens a regular file without the side effects of opening anything
 // else: a FIFO would block the open and a device may act on it
 // (/dev/watchdog). The file is stat-ed first, opened non-blocking and without
-// becoming a controlling terminal, and its (dev, ino) checked again after the
-// open, so swapping the path in between does not help. With noFollow a
-// symlink at the last path component is refused.
+// becoming a controlling terminal, and its (dev, ino) and type checked again
+// after the open, so swapping the path in between does not help: the inode of
+// a removed file may go to its replacement at once, so (dev, ino) alone can
+// match a FIFO. With noFollow a symlink at the last path component is
+// refused.
 func openFile(path string, noFollow bool) (*os.File, error) {
 	stat, flags := os.Stat, os.O_RDONLY|openFlags
 	if noFollow {
@@ -48,7 +50,7 @@ func openFile(path string, noFollow bool) (*os.File, error) {
 		f.Close()
 		return nil, err
 	}
-	if !os.SameFile(before, after) {
+	if !os.SameFile(before, after) || !after.Mode().IsRegular() {
 		f.Close()
 		return nil, &fs.PathError{Op: opOpen, Path: path, Err: errNotRegular}
 	}

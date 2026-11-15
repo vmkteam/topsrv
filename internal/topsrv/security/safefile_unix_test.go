@@ -40,8 +40,11 @@ func TestReadFileSwappedForSpecialFile(t *testing.T) {
 	cases := map[string]struct {
 		noFollow bool
 		swap     func(t *testing.T, path string)
+		want     error // nil: any error
 	}{
-		"regular file swapped for a FIFO": {swap: func(t *testing.T, path string) {
+		// The FIFO may get the inode of the removed file (ext4 reuses it), so
+		// (dev, ino) alone does not tell; the type check after open does.
+		"regular file swapped for a FIFO": {want: errNotRegular, swap: func(t *testing.T, path string) {
 			require.NoError(t, os.Remove(path))
 			require.NoError(t, syscall.Mkfifo(path, 0o600))
 		}},
@@ -67,6 +70,9 @@ func TestReadFileSwappedForSpecialFile(t *testing.T) {
 			select {
 			case err := <-done:
 				require.Error(t, err, "the swapped file is never read")
+				if tc.want != nil {
+					require.ErrorIs(t, err, tc.want)
+				}
 			case <-time.After(2 * time.Second):
 				t.Fatal("open blocked on the swapped FIFO")
 			}
