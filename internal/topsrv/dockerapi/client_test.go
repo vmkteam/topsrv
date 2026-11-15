@@ -40,9 +40,11 @@ func serve(t *testing.T, h http.Handler) string {
 }
 
 // write answers a test request. The client may stop reading (at the end
-// of the JSON value, or at its limit): a broken pipe is not a failure.
+// of the JSON value, or at its limit), and the server closes when the test
+// ends: neither is a failure.
 func write(t *testing.T, w http.ResponseWriter, b []byte) {
-	if _, err := w.Write(b); err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
+	_, err := w.Write(b)
+	if err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) && !errors.Is(err, net.ErrClosed) {
 		t.Errorf("test server: %v", err)
 	}
 }
@@ -153,7 +155,7 @@ func TestClientContainersStream(t *testing.T) {
 		assert.Len(t, list, 1)
 	})
 	t.Run("past the limit inside the list", func(t *testing.T) {
-		big := `[` + strings.Repeat(`{"Names": ["/a"]},`, MaxResponseSize/17) + `{"Names": ["/b"]}]`
+		big := `[{"Names": ["/a"]}, {"Names": ["/` + strings.Repeat("b", MaxResponseSize) + `"]}]` // fast under -race too
 		c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { write(t, w, []byte(big)) })))
 		_, _, err := c.Containers(t.Context())
 		require.ErrorIs(t, err, ErrTooLarge)
