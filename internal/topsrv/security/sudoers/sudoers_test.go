@@ -143,6 +143,46 @@ Defaults authenticate
 	}, p.Scoped, "only bound Defaults that set a tracked flag")
 }
 
+func TestParseDefaultsAuth(t *testing.T) {
+	p := parse(map[string]string{"/etc/sudoers": `Defaults targetpw
+Defaults !runaspw
+Defaults timestamp_timeout=15
+Defaults logfile=/var/log/SENTINEL.log
+Defaults:alice targetpw
+Defaults>root runaspw
+`})
+	require.Empty(t, p.Errors)
+	assert.True(t, *p.Defaults.TargetPW, "openSUSE: the target user's password")
+	assert.False(t, *p.Defaults.RunasPW)
+	assert.Equal(t, "15", *p.Defaults.Timeout)
+	assert.True(t, *p.Defaults.Logfile)
+	assert.Nil(t, p.Defaults.RootPW)
+	assert.Equal(t, []ScopedDefault{
+		{Source: "/etc/sudoers:5", Binding: "user", List: []string{"alice"}, TargetPW: true},
+		{Source: "/etc/sudoers:6", Binding: "runas", List: []string{"root"}, RunasPW: true},
+	}, p.Scoped)
+
+	for value, want := range map[string]string{"-1": "-1", "2.5": "2.5", "1h30m": "1h30m", `"5"`: "5", "SENTINEL": "invalid"} {
+		got := parse(map[string]string{"/etc/sudoers": "Defaults timestamp_timeout=" + value + "\n"})
+		assert.Equal(t, want, *got.Defaults.Timeout, value)
+	}
+	p = parse(map[string]string{"/etc/sudoers": "Defaults !timestamp_timeout\n"})
+	assert.Equal(t, "0", *p.Defaults.Timeout)
+}
+
+func TestParseCommandNegation(t *testing.T) {
+	p := parse(map[string]string{"/etc/sudoers": `Cmnd_Alias NOSU = ALL, !/bin/su
+alice ALL = ALL, !/usr/bin/passwd
+bob ALL = NOSU
+carol ALL = /usr/bin/ls
+`})
+	require.Empty(t, p.Errors)
+	require.Len(t, p.Rules, 3)
+	assert.True(t, p.Rules[0].CommandNegation)
+	assert.True(t, p.Rules[1].CommandNegation, "through an alias")
+	assert.False(t, p.Rules[2].CommandNegation)
+}
+
 func TestParseIncludes(t *testing.T) {
 	t.Run("relative to the including file, %h, quoted paths", func(t *testing.T) {
 		p := parse(map[string]string{

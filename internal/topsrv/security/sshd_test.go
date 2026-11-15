@@ -245,3 +245,27 @@ func TestSSHDConfigSymlinkedDir(t *testing.T) {
 	assert.Equal(t, "no", d.Effective["PermitRootLogin"].Value, "a symlinked drop-in directory is followed, as sshd does")
 	assert.Len(t, d.Effective, len(sshdEffectiveKeys))
 }
+
+func TestSSHDHostKeysAndHardening(t *testing.T) {
+	t.Run("default host keys, those there", func(t *testing.T) {
+		_, d, _ := sshdOf(t, merge(sshdFixture(), map[string]string{
+			"etc/ssh/ssh_host_ed25519_key": "",
+			"etc/ssh/ssh_host_rsa_key":     "",
+		}))
+		assert.Equal(t, []string{"/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_ed25519_key"}, pathsOf(d.HostKeys))
+	})
+	t.Run("HostKey lines and the hardening keys", func(t *testing.T) {
+		_, d, _ := sshdOf(t, merge(sshdFixture(), map[string]string{
+			"etc/ssh/sshd_config.d/10-hard.conf": "HostKey /etc/ssh/keys/host_ed25519\nDisableForwarding yes\n" +
+				"ForceCommand /usr/bin/SENTINEL --token SENTINELSECRET\nRequiredRSASize 3072\n",
+			"etc/ssh/keys/host_ed25519": "",
+			"etc/ssh/ssh_host_rsa_key":  "", // not loaded: HostKey is set
+		}))
+		assert.Equal(t, []string{"/etc/ssh/keys/host_ed25519"}, pathsOf(d.HostKeys))
+		assert.Equal(t, "yes", d.Effective["DisableForwarding"].Value)
+		assert.Equal(t, true, d.Effective["ForceCommand"].Value, "presence only")
+		assert.Equal(t, "3072", d.Effective["RequiredRSASize"].Value)
+		assert.Nil(t, d.Effective["PermitTTY"].Value, "unset")
+		assert.NotContains(t, toJSON(t, d), "SENTINEL")
+	})
+}

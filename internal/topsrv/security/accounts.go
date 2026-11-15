@@ -96,6 +96,14 @@ type account struct {
 	// LastChangeDays is the shadow field as kept: days since 1970-01-01 of
 	// the last change, 0 — change at next login.
 	LastChangeDays *int64 `json:"lastChangeDays"`
+	// The aging fields of shadow as kept, in days; null when empty: min and
+	// max age of the password, warning before, inactive days after it
+	// expires, and the account expiry (days since 1970-01-01).
+	MinDays      *int64 `json:"minDays"`
+	MaxDays      *int64 `json:"maxDays"`
+	WarnDays     *int64 `json:"warnDays"`
+	InactiveDays *int64 `json:"inactiveDays"`
+	ExpireDays   *int64 `json:"expireDays"`
 	// Expired: the account expiry date passed, or the password expired and
 	// its inactive period ran out. Either blocks key logins too.
 	Expired     *bool `json:"expired"`
@@ -111,6 +119,13 @@ type accountAnomalies struct {
 	// PasswdShadowMismatch: users with "x" in passwd and no shadow entry,
 	// and shadow entries without a passwd user. null when shadow is unread.
 	PasswdShadowMismatch []string `json:"passwdShadowMismatch"`
+	// Of /etc/group, null when it is unread: names and GIDs used twice,
+	// groups with GID 0 other than root, users whose primary GID has no
+	// group.
+	DuplicateGroupNames []string `json:"duplicateGroupNames"`
+	DuplicateGIDs       []int64  `json:"duplicateGids"`
+	GID0Groups          []string `json:"gid0Groups"`
+	PrimaryGroupMissing []string `json:"primaryGroupMissing"`
 }
 
 // accountsResult is what authorizedKeys builds on: every user, not only the
@@ -125,13 +140,14 @@ type passwdEntry struct {
 }
 
 type shadowEntry struct {
-	pw                                 string
-	lastChange, max, inactive, expires *int64
+	pw                                               string
+	lastChange, minAge, max, warn, inactive, expires *int64
 }
 
 type groupEntry struct {
 	gid     int64
 	members []string
+	dups    int // more lines of the same name; the first one counts
 }
 
 func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
@@ -177,6 +193,7 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 	d.Malformed = d.Malformed[:min(len(d.Malformed), maxLineRefs)]
 	if groups != nil {
 		d.PrivilegedGroups = privilegedMembers(users, groups)
+		d.Anomalies.addGroups(users, groups)
 	}
 	d.Files = filesMeta(sc, []string{pathPasswd, pathShadow, pathGroup, pathGshadow})
 	return collected(gaps, d), &accountsResult{users: all}
@@ -222,7 +239,8 @@ func parseShadow(b []byte) (map[string]shadowEntry, []lineRef) {
 		if _, dup := out[f[0]]; dup {
 			continue
 		}
-		out[f[0]] = shadowEntry{pw: f[1], lastChange: optInt(f[2]), max: optInt(f[4]), inactive: optInt(f[6]), expires: optInt(f[7])}
+		out[f[0]] = shadowEntry{pw: f[1], lastChange: optInt(f[2]), minAge: optInt(f[3]), max: optInt(f[4]),
+			warn: optInt(f[5]), inactive: optInt(f[6]), expires: optInt(f[7])}
 	}
 	return out, malformed
 }
@@ -245,7 +263,9 @@ func parseGroup(b []byte) (groups map[string]groupEntry, malformed []lineRef, ni
 			malformed = append(malformed, lineRef{File: pathGroup, Line: n, Code: codeID})
 			continue
 		}
-		if _, dup := groups[f[0]]; dup {
+		if g, dup := groups[f[0]]; dup {
+			g.dups++
+			groups[f[0]] = g
 			continue
 		}
 		var members []string
@@ -302,6 +322,7 @@ func buildAccounts(sc *scanCtx, users []passwdEntry, shadow map[string]shadowEnt
 		case ok:
 			a.setPW(sc, classifyPW(s.pw, false))
 			a.LastChangeDays = s.lastChange
+			a.MinDays, a.MaxDays, a.WarnDays, a.InactiveDays, a.ExpireDays = s.minAge, s.max, s.warn, s.inactive, s.expires
 			expired := s.expired(today)
 			a.Expired = &expired
 		}
@@ -439,6 +460,36 @@ func accountAnomaliesOf(users []passwdEntry, shadow map[string]shadowEntry) acco
 
 // privilegedMembers lists the members of each privileged group present:
 // those in the member list and those whose primary group it is.
+// addGroups adds the anomalies of /etc/group.
+func (a *accountAnomalies) addGroups(users []passwdEntry, groups map[string]groupEntry) {
+	a.DuplicateGroupNames, a.DuplicateGIDs, a.GID0Groups, a.PrimaryGroupMissing = []string{}, []int64{}, []string{}, []string{}
+	byGID := map[int64]int{}
+	for name, g := range groups {
+		byGID[g.gid]++
+		if g.dups > 0 {
+			a.DuplicateGroupNames = append(a.DuplicateGroupNames, name)
+		}
+		if g.gid == 0 && name != "root" {
+			a.GID0Groups = append(a.GID0Groups, name)
+		}
+	}
+	for gid, n := range byGID {
+		if n > 1 {
+			a.DuplicateGIDs = append(a.DuplicateGIDs, gid)
+		}
+	}
+	for _, u := range users {
+		if byGID[u.gid] == 0 {
+			a.PrimaryGroupMissing = append(a.PrimaryGroupMissing, u.name)
+		}
+	}
+	slices.Sort(a.DuplicateGroupNames)
+	slices.Sort(a.DuplicateGIDs)
+	slices.Sort(a.GID0Groups)
+	slices.Sort(a.PrimaryGroupMissing)
+	a.PrimaryGroupMissing = slices.Compact(a.PrimaryGroupMissing)
+}
+
 func privilegedMembers(users []passwdEntry, groups map[string]groupEntry) map[string][]string {
 	out := map[string][]string{}
 	for _, name := range privilegedGroupNames {

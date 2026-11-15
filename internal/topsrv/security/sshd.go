@@ -33,6 +33,10 @@ var sshdEffectiveKeys = []string{
 	"GSSAPIAuthentication", "X11Forwarding", "AllowTcpForwarding", "AllowAgentForwarding", "PermitTunnel",
 	"GatewayPorts", "Ciphers", "MACs", "KexAlgorithms", "HostKeyAlgorithms", "PubkeyAcceptedAlgorithms",
 	"LogLevel", "ClientAliveInterval", "ClientAliveCountMax", "MaxSessions", "MaxStartups", "Banner",
+	// CIS and STIG checks beyond the above
+	"DisableForwarding", "PermitTTY", "PermitUserRC", "AllowStreamLocalForwarding", "X11UseLocalhost",
+	"Compression", "KerberosAuthentication", "IgnoreUserKnownHosts", "PrintLastLog", "UseDNS",
+	"RequiredRSASize", "ForceCommand",
 }
 
 // sshdListKeys are sent as arrays, the rest as strings.
@@ -43,7 +47,11 @@ var sshdListKeys = []string{
 
 // sshdPresenceKeys are sent as true/false: a command line or a path, of
 // which only whether it is set matters ("none" is unset).
-var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "Banner"}
+var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "Banner", "ForceCommand"}
+
+// defaultHostKeys are the host keys sshd loads without a HostKey line
+// (fill_default_server_options), those that exist.
+var defaultHostKeys = []string{"/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_ecdsa_key", "/etc/ssh/ssh_host_ed25519_key"}
 
 // sshdUnits are the service units sshd runs as, Debian and RHEL names.
 var sshdUnits = []string{"ssh.service", "sshd.service"}
@@ -71,6 +79,9 @@ type sshdData struct {
 	// PAMCompiled: the sshd binaries link libpam. Without it UsePAM does
 	// nothing and a "*" password is not a lock. null when unreadable.
 	PAMCompiled *bool `json:"pamCompiled"`
+	// HostKeys are the private host key files, by HostKey or the defaults:
+	// owner and mode only.
+	HostKeys []fileMeta `json:"hostKeys"`
 }
 
 // sshdValue is a keyword's value — a string, an array for list keywords,
@@ -159,6 +170,7 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 		Listener:        listener,
 		SocketActivated: socket,
 		PAMCompiled:     sshdPAMCompiled(sc),
+		HostKeys:        filesMeta(sc, sshdHostKeys(cfg)),
 	}
 	for _, p := range cfg.Files {
 		if m, err := sshdFileMeta(sc, p, hashes[p]); err == nil {
@@ -166,6 +178,14 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 		}
 	}
 	return collected(gaps, d), sshdResultOf(cfg)
+}
+
+// sshdHostKeys are the HostKey files of the configuration, or the defaults.
+func sshdHostKeys(cfg *sshdconf.Config) []string {
+	if v, ok := cfg.Global["HostKey"]; ok {
+		return v.Values
+	}
+	return defaultHostKeys
 }
 
 // sshdFlags finds the -f, -o and -p in force: from the running listener in

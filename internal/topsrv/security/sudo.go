@@ -47,6 +47,8 @@ type sudoRule struct {
 	NopasswdAll bool       `json:"nopasswdAll"`
 	NopasswdAny bool       `json:"nopasswdAny"`
 	Setenv      bool       `json:"setenv"`
+	// CommandNegation: a command excluded with "!" — never a protection.
+	CommandNegation bool `json:"commandNegation,omitempty"`
 }
 
 type sudoRunas struct {
@@ -56,10 +58,14 @@ type sudoRunas struct {
 }
 
 type sudoDefaults struct {
-	Authenticate *bool `json:"authenticate"`
-	RootPW       *bool `json:"rootpw"`
-	UsePTY       *bool `json:"usePty"`
-	EnvKeepLD    bool  `json:"envKeepLD"`
+	Authenticate *bool   `json:"authenticate"`
+	RootPW       *bool   `json:"rootpw"`
+	UsePTY       *bool   `json:"usePty"`
+	EnvKeepLD    bool    `json:"envKeepLD"`
+	TargetPW     *bool   `json:"targetpw"`
+	RunasPW      *bool   `json:"runaspw"`
+	Timeout      *string `json:"timestampTimeout"`
+	Logfile      *bool   `json:"logfile"`
 }
 
 type sudoScoped struct {
@@ -69,6 +75,8 @@ type sudoScoped struct {
 	NoAuthenticate bool     `json:"noAuthenticate,omitempty"`
 	RootPW         bool     `json:"rootpw,omitempty"`
 	EnvKeepLD      bool     `json:"envKeepLD,omitempty"`
+	TargetPW       bool     `json:"targetpw,omitempty"`
+	RunasPW        bool     `json:"runaspw,omitempty"`
 }
 
 type doasRule struct {
@@ -172,7 +180,8 @@ func sudoRules(rules []sudoers.Rule) []sudoRule {
 	out := make([]sudoRule, 0, len(rules))
 	for i, r := range rules {
 		sr := sudoRule{Order: i + 1, Source: r.Source, Principals: r.Principals, HostsAll: r.HostsAll,
-			CommandsAll: r.CommandsAll, NopasswdAll: r.NopasswdAll, NopasswdAny: r.NopasswdAny, Setenv: r.Setenv}
+			CommandsAll: r.CommandsAll, NopasswdAll: r.NopasswdAll, NopasswdAny: r.NopasswdAny, Setenv: r.Setenv,
+			CommandNegation: r.CommandNegation}
 		sr.Runas = (*sudoRunas)(r.Runas)
 		out = append(out, sr)
 	}

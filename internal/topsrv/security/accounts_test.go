@@ -307,3 +307,42 @@ func TestParseNSSwitch(t *testing.T) {
 	assert.Nil(t, c.Netgroup, "not listed")
 	assert.True(t, c.ExternalIdentities)
 }
+
+func TestAccountsAgingAndGroups(t *testing.T) {
+	_, d, _ := accountsOf(t, merge(accountsFixture(), map[string]string{
+		"etc/group": strings.Join([]string{
+			"root:x:0:", "sudo:x:27:alice", "docker:x:999:bob,alice", "adm:x:4:syslog",
+			"alice:x:1000:", "bob:x:1001:",
+			"wheel:x:0:",        // GID 0, not root
+			"backup:x:1001:",    // bob's GID again
+			"sudo:x:28:mallory", // a second sudo: the first counts
+		}, "\n"),
+	}))
+	a := d.Anomalies
+	assert.Equal(t, []string{"sudo"}, a.DuplicateGroupNames)
+	assert.Equal(t, []int64{0, 1001}, a.DuplicateGIDs)
+	assert.Equal(t, []string{"wheel"}, a.GID0Groups)
+	assert.Equal(t, []string{"daemon", "gone", "legacy", "locked", "nopw", "svc", "sync"}, a.PrimaryGroupMissing,
+		"passwd GIDs without a group line; sync's 65534 too")
+
+	byName := map[string]account{}
+	for _, u := range d.Users {
+		byName[u.Name] = u
+	}
+	toor := byName["toor"]
+	assert.Equal(t, int64(0), *toor.MinDays)
+	assert.Equal(t, int64(30), *toor.MaxDays)
+	assert.Equal(t, int64(7), *toor.WarnDays)
+	assert.Equal(t, int64(10), *toor.InactiveDays)
+	assert.Nil(t, toor.ExpireDays, "empty field")
+	assert.Equal(t, int64(20000), *byName["locked"].ExpireDays)
+	assert.Nil(t, byName["bob"].MaxDays)
+}
+
+func TestAccountsGroupUnread(t *testing.T) {
+	files := accountsFixture()
+	delete(files, "etc/group")
+	_, d, _ := accountsOf(t, files)
+	assert.Nil(t, d.Anomalies.DuplicateGIDs, "null: not read")
+	assert.Nil(t, d.Anomalies.PrimaryGroupMissing)
+}

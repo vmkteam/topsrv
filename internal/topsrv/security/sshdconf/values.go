@@ -46,7 +46,7 @@ func buildValueChecks() map[string]func(string) bool {
 	add(oneOf("daemon", "user", "auth", "authpriv",
 		"local0", "local1", "local2", "local3", "local4", "local5", "local6", "local7"), "SyslogFacility")
 	add(oneOf("md5", "sha256"), "FingerprintHash")
-	add(isInt, "MaxAuthTries", "MaxSessions", "ClientAliveCountMax")
+	add(isInt, "MaxAuthTries", "MaxSessions", "ClientAliveCountMax", "RequiredRSASize")
 	add(isTime, "LoginGraceTime", "ClientAliveInterval")
 	add(isMaxStartups, "MaxStartups")
 	add(isAlgorithmList, "Ciphers", "MACs", "KexAlgorithms", "HostKeyAlgorithms", "PubkeyAcceptedAlgorithms",

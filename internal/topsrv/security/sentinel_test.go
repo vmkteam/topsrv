@@ -54,6 +54,7 @@ func sentinelFiles() map[string]string {
 		// doas: the command and its arguments
 		"etc/sudoers.d/sentinel": "Defaults mailto=\"SENTINEL@example.com\"\n" +
 			"Defaults env_keep += \"SENTINELVAR\"\n" +
+			"Defaults logfile=/var/log/SENTINEL.log, timestamp_timeout=SENTINELSECRET\n" +
 			"Cmnd_Alias SVC = /usr/bin/SENTINEL --token SENTINELSECRET\n" +
 			"alice ALL = NOPASSWD: SVC\n" +
 			"SENTINELLINE is not sudoers\n",
@@ -158,6 +159,8 @@ func requireMarkersRead(t *testing.T, d Data) {
 	assert.True(t, slices.ContainsFunc(sudo.Rules, func(r sudoRule) bool { return slices.Contains(r.Principals, "alice") }),
 		"the rule using the alias")
 	assert.Len(t, sudo.DoasRules, 1)
+	assert.True(t, *sudo.Defaults.Logfile, "the logfile read, its path dropped")
+	assert.Equal(t, valueInvalid, *sudo.Defaults.Timeout)
 
 	apt := d.Sections[SectionUpdates].Data.(updatesData).APT
 	require.NotNil(t, apt)
