@@ -5,6 +5,7 @@
 package dockerapi
 
 import (
+	"cmp"
 	"errors"
 	"net"
 	"net/url"
@@ -128,10 +129,13 @@ const StockSocket = "/run/docker.sock"
 
 // ResolvedHost is an address dockerd listens on and where it is set. Err
 // is set for an address dockerd refuses: it would not start again.
+// Systemd: a socket systemd creates and passes (fd://) — in the host's
+// mount namespace, not dockerd's.
 type ResolvedHost struct {
 	Host
-	Source string
-	Err    error
+	Source  string
+	Err     error
+	Systemd bool
 }
 
 // ResolveHosts lists the addresses dockerd listens on, as dockerd picks
@@ -146,8 +150,7 @@ func ResolveHosts(flags, file Settings, listenStreams []string) []ResolvedHost {
 	}
 	var out []ResolvedHost
 	if len(raw) == 0 {
-		s := Merge(flags, file)
-		for _, h := range DefaultHosts(isTrue(s.TLS) || isTrue(s.TLSVerify)) {
+		for _, h := range DefaultHosts(defaultTLS(flags, file)) {
 			out = append(out, ResolvedHost{Host: h, Source: SourceDefault})
 		}
 		return out
@@ -155,32 +158,45 @@ func ResolveHosts(flags, file Settings, listenStreams []string) []ResolvedHost {
 	for _, r := range raw {
 		h, err := ParseHost(r)
 		out = append(out, ResolvedHost{Host: h, Source: source, Err: err})
-		if err != nil || h.Proto != ProtoFD {
-			continue
-		}
-		passed := 0
-		for _, l := range listenStreams {
-			lh, err := ListenStreamHost(l)
-			if err == nil {
-				out, passed = append(out, ResolvedHost{Host: lh, Source: SourceSocketUnit}), passed+1
-			}
-		}
-		if passed == 0 {
-			out = append(out, ResolvedHost{Proto: ProtoUnix, Addr: StockSocket, Source: SourceDefault})
+		if err == nil && h.Proto == ProtoFD {
+			out = append(out, SocketUnitHosts(listenStreams)...)
 		}
 	}
 	return out
 }
 
-// Socket is the first unix socket with a path among hosts: the one to talk
-// to; "" when there is none (TCP only, an abstract socket).
-func Socket(hosts []ResolvedHost) string {
-	for _, h := range hosts {
-		if h.Err == nil && h.Proto == ProtoUnix && strings.HasPrefix(h.Addr, "/") {
-			return h.Addr
+// SocketUnitHosts are the sockets systemd passes for fd://: the
+// ListenStream= of the socket unit, StockSocket without one.
+func SocketUnitHosts(listenStreams []string) []ResolvedHost {
+	var out []ResolvedHost
+	for _, l := range listenStreams {
+		if h, err := ListenStreamHost(l); err == nil {
+			out = append(out, ResolvedHost{Host: h, Source: SourceSocketUnit, Systemd: true})
 		}
 	}
-	return ""
+	if len(out) == 0 {
+		out = append(out, ResolvedHost{Proto: ProtoUnix, Addr: StockSocket, Source: SourceDefault, Systemd: true})
+	}
+	return out
+}
+
+// defaultTLS: dockerd listens on the TLS port of localhost without hosts
+// when --tls is true, --tlsverify is given with any value, or daemon.json
+// sets "tls": true (daemon/command/daemon.go); "tlsverify" of the file
+// alone does not count.
+func defaultTLS(flags, file Settings) bool {
+	return flags.TLSVerify != nil || isTrue(cmp.Or(flags.TLS, file.TLS))
+}
+
+// Socket is the first unix socket with a path among hosts: the one to talk
+// to; ok is false when there is none (TCP only, an abstract socket).
+func Socket(hosts []ResolvedHost) (ResolvedHost, bool) {
+	for _, h := range hosts {
+		if h.Err == nil && h.Proto == ProtoUnix && strings.HasPrefix(h.Addr, "/") {
+			return h, true
+		}
+	}
+	return ResolvedHost{}, false
 }
 
 func nonBlank(hosts []string) []string {

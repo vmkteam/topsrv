@@ -125,6 +125,10 @@ func TestClientEngines(t *testing.T) {
 			assert.True(t, strings.HasPrefix(info.ServerVersion, tc.version+"."), info.ServerVersion)
 			assert.Equal(t, tc.firewall, info.FirewallBackend)
 			assert.Equal(t, []string{"seccomp", "cgroupns"}, info.SecurityOptions)
+			assert.Equal(t, "builtin", info.SeccompProfile)
+			assert.Equal(t, "inactive", info.SwarmState)
+			assert.Zero(t, info.AuthorizationPlugins)
+			assert.Empty(t, info.Exposed, "unix socket only")
 			require.NotNil(t, info.ContainersRunning)
 			assert.Equal(t, 3, *info.ContainersRunning)
 
@@ -143,6 +147,31 @@ func TestClientEngines(t *testing.T) {
 			assert.Equal(t, inspectPorts(t, filepath.Join(dir, "inspect-ports.txt")), published, "the same ports docker inspect shows")
 		})
 	}
+}
+
+func TestClientInfoPosture(t *testing.T) {
+	c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/info":
+			write(t, w, []byte(`{"SecurityOptions": ["name=apparmor", "name=seccomp,profile=unconfined", "name=userns"],
+				"Swarm": {"LocalNodeState": "active", "ControlAvailable": true}, "Plugins": {"Authorization": ["opa-docker-authz"]},
+				"Warnings": ["[DEPRECATION NOTICE]: API is accessible on http://0.0.0.0:2375 without encryption.\n  Access to the remote API is equivalent to root access",
+					"[DEPRECATION NOTICE]: API is accessible on https://[::]:2376 without TLS client verification.", "WARNING: bridge-nf-call-iptables is disabled"]}`))
+		case "/containers/json":
+			write(t, w, []byte(`[{"Names": ["/agent"], "HostConfig": {"NetworkMode": "host"},
+				"Mounts": [{"Type": "bind", "Source": "/var/run/docker.sock", "Destination": "/var/run/docker.sock"}]}]`))
+		}
+	})))
+	info, err := c.Info(t.Context())
+	require.NoError(t, err)
+	assert.Equal(t, Info{SecurityOptions: []string{"apparmor", "seccomp", "userns"}, SeccompProfile: "unconfined",
+		SwarmState: "active", SwarmManager: true, AuthorizationPlugins: 1,
+		Exposed: []Exposure{{Addr: "0.0.0.0:2375", NoTLS: true}, {Addr: "[::]:2376"}}}, info)
+	list, _, err := c.Containers(t.Context())
+	require.NoError(t, err)
+	require.Len(t, list, 1)
+	assert.Equal(t, "host", list[0].HostConfig.NetworkMode)
+	assert.Equal(t, []Mount{{Type: "bind", Source: "/var/run/docker.sock"}}, list[0].Mounts)
 }
 
 func TestClientContainersStream(t *testing.T) {

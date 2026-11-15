@@ -60,6 +60,12 @@ func unitValues(sc *scanCtx, unit, key string) []string {
 	return out
 }
 
+// unitEnabled: a link to the unit in a <target>.wants directory of a unit
+// directory, as systemctl enable makes.
+func unitEnabled(sc *scanCtx, unit, target string) bool {
+	return slices.ContainsFunc(unitDirs, func(dir string) bool { return sc.exists(dir + "/" + target + ".wants/" + unit) })
+}
+
 // unitAlias: the unit file is a link to a unit of another name, as
 // systemctl's "alias" state.
 func unitAlias(sc *scanCtx, unit string) bool {

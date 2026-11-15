@@ -32,8 +32,33 @@ type Settings struct {
 	TLS                *bool
 	TLSVerify          *bool
 	FirewallBackend    *string // iptables, nftables
-	DefaultBindIP      *string // --ip: where -p binds without an address
+	DefaultBindIP      *string // --ip: where -p binds without an address, on the default bridge
 	UsernsRemap        *string // user[:group] or "default"
+
+	// default-network-opts of the bridge driver: what every bridge network
+	// created without its own options gets (compose networks included).
+	BridgeHostBindingIPv4 *string // com.docker.network.bridge.host_binding_ipv4
+	BridgeGatewayModeIPv4 *string // com.docker.network.bridge.gateway_mode_ipv4: nat, nat-unprotected, routed, isolated
+	BridgeGatewayModeIPv6 *string
+}
+
+// Bridge driver options tracked in default-network-opts.
+const (
+	bridgeHostBindingIPv4 = "com.docker.network.bridge.host_binding_ipv4"
+	bridgeGatewayModeIPv4 = "com.docker.network.bridge.gateway_mode_ipv4"
+	bridgeGatewayModeIPv6 = "com.docker.network.bridge.gateway_mode_ipv6"
+)
+
+// setBridgeOption sets a tracked option of the bridge driver.
+func (s *Settings) setBridgeOption(key, v string) {
+	switch key {
+	case bridgeHostBindingIPv4:
+		s.BridgeHostBindingIPv4 = &v
+	case bridgeGatewayModeIPv4:
+		s.BridgeGatewayModeIPv4 = &v
+	case bridgeGatewayModeIPv6:
+		s.BridgeGatewayModeIPv6 = &v
+	}
 }
 
 // setBool sets a boolean option by its flag name (= daemon.json key); false
@@ -78,6 +103,11 @@ func (s *Settings) setString(name, v string) {
 		s.ConfigFile = v
 	case "host", "H":
 		s.Hosts = append(s.Hosts, v)
+	case "default-network-opt": // bridge=com.docker.network.bridge.host_binding_ipv4=127.0.0.1
+		if driver, opt, ok := strings.Cut(v, "="); ok && driver == "bridge" {
+			key, value, _ := strings.Cut(opt, "=")
+			s.setBridgeOption(key, value)
+		}
 	}
 }
 
@@ -145,7 +175,7 @@ func ParseConfig(b []byte) (Settings, error) {
 		s   Settings
 		raw map[string]json.RawMessage
 	)
-	if err := json.Unmarshal(b, &raw); err != nil {
+	if err := json.Unmarshal(bytes.TrimPrefix(b, []byte("\xef\xbb\xbf")), &raw); err != nil { // dockerd skips a UTF-8 BOM
 		return s, err
 	}
 	var bad error
@@ -154,6 +184,13 @@ func ParseConfig(b []byte) (Settings, error) {
 		switch key {
 		case "hosts":
 			err = strictUnmarshal(v, &s.Hosts)
+		case "default-network-opts":
+			var opts map[string]map[string]string
+			if err = strictUnmarshal(v, &opts); err == nil {
+				for key, value := range opts["bridge"] {
+					s.setBridgeOption(key, value)
+				}
+			}
 		case "firewall-backend", "ip", "userns-remap":
 			var str string
 			if err = strictUnmarshal(v, &str); err == nil {
@@ -200,5 +237,9 @@ func Merge(flags, file Settings) Settings {
 		FirewallBackend:    cmp.Or(flags.FirewallBackend, file.FirewallBackend),
 		DefaultBindIP:      cmp.Or(flags.DefaultBindIP, file.DefaultBindIP),
 		UsernsRemap:        cmp.Or(flags.UsernsRemap, file.UsernsRemap),
+
+		BridgeHostBindingIPv4: cmp.Or(flags.BridgeHostBindingIPv4, file.BridgeHostBindingIPv4),
+		BridgeGatewayModeIPv4: cmp.Or(flags.BridgeGatewayModeIPv4, file.BridgeGatewayModeIPv4),
+		BridgeGatewayModeIPv6: cmp.Or(flags.BridgeGatewayModeIPv6, file.BridgeGatewayModeIPv6),
 	}
 }

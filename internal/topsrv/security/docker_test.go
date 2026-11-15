@@ -305,3 +305,96 @@ func TestDockerAPIValues(t *testing.T) {
 	assert.True(t, d.PublishedTruncated)
 	assert.NotContains(t, strings.ToUpper(toJSON(t, d)), "SENTINEL")
 }
+
+func TestDockerSnap(t *testing.T) {
+	// snap-confine runs dockerd in a mount namespace of its own; its
+	// daemon.json is read through /proc/PID/root.
+	sc := fixture(t, merge(dockerFixture(), map[string]string{
+		"proc/300/exe":                 "-> /snap/docker/2932/bin/dockerd",
+		"snap/docker/2932/bin/dockerd": "",
+		"proc/300/ns/mnt":              "-> mnt:[4026532611]",
+		"proc/300/cmdline":             "dockerd\x00--config-file=/var/snap/docker/2932/config/daemon.json\x00",
+		"proc/300/root/var/snap/docker/2932/config/daemon.json": `{"iptables": false}`,
+	}))
+	sec, d := dockerOf(t, sc)
+	require.True(t, d.DaemonRunning, "found in the host network namespace: %+v", sec)
+	require.NotNil(t, d.Config.File)
+	assert.Equal(t, "/var/snap/docker/2932/config/daemon.json", d.Config.File.Path, "as dockerd sees it")
+	assert.False(t, *d.Config.IPTables, "read in dockerd's root")
+	assert.Equal(t, []Gap{{Path: "/var/run/docker.sock", Reason: ReasonNotFound}}, sec.Gaps, "its socket looked for in its root too")
+
+	t.Run("with fd://: systemd's socket is the host's", func(t *testing.T) {
+		sc := fixture(t, merge(dockerFixture(), map[string]string{
+			"proc/300/exe":                 "-> /snap/docker/2932/bin/dockerd",
+			"snap/docker/2932/bin/dockerd": "",
+			"proc/300/ns/mnt":              "-> mnt:[4026532611]",
+		}))
+		serveDocker(t, sc, engineHandler(t, "29"))
+		sec, d := dockerOf(t, sc)
+		require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+		assert.Equal(t, "29.9.3", *d.Version)
+	})
+}
+
+func TestDockerSocketOnly(t *testing.T) {
+	files := dockerFixture()
+	delete(files, "proc/300/exe")
+	files["etc/systemd/system/sockets.target.wants/docker.socket"] = "-> /lib/systemd/system/docker.socket"
+	files["etc/systemd/system/docker.socket.d/tcp.conf"] = "[Socket]\nListenStream=127.0.0.1:2375\n"
+	sc := fixture(t, files)
+	serveDocker(t, sc, http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Error("socket-activated: never connect") }))
+	sec, d := dockerOf(t, sc)
+	require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+	assert.False(t, d.DaemonRunning, "systemd holds the socket; a connection starts dockerd")
+	assert.Equal(t, []dockerHost{
+		{"unix", "/run/docker.sock", dockerapi.SourceSocketUnit},
+		{"tcp", "127.0.0.1:2375", dockerapi.SourceSocketUnit},
+	}, d.Hosts)
+	require.NotNil(t, d.Socket)
+	assert.True(t, *d.Config.IPTables, "daemon.json the first start reads")
+	assert.Nil(t, d.Version)
+	assert.Nil(t, d.Published)
+}
+
+func TestDockerPostureFromAPI(t *testing.T) {
+	ports := []string{`{"IP": "0.0.0.0", "PrivatePort": 5432, "PublicPort": 5432, "Type": "tcp"}`}
+	for p := 49152; p <= 65535; p++ { // one -p range, listed port by port, twice with ::
+		ports = append(ports, fmt.Sprintf(`{"IP": "0.0.0.0", "PrivatePort": %d, "PublicPort": %d, "Type": "udp"}`, p, p),
+			fmt.Sprintf(`{"IP": "::", "PrivatePort": %d, "PublicPort": %d, "Type": "udp"}`, p, p))
+	}
+	containers := `[{"Names": ["/coturn"], "Ports": [` + strings.Join(ports[1:], ",") + `]},
+		{"Names": ["/postgres"], "Ports": [` + ports[0] + `]},
+		{"Names": ["/agent"], "HostConfig": {"NetworkMode": "host"}, "Mounts": [{"Type": "bind", "Source": "/var/run/"}]},
+		{"Names": ["/web"], "HostConfig": {"NetworkMode": "bridge"}, "Mounts": [{"Type": "volume", "Source": "/var/lib/docker/volumes/x"}]}]`
+	info := `{"ServerVersion": "28.5.2", "SecurityOptions": ["name=seccomp,profile=/etc/SENTINEL.json", "name=userns"],
+		"Swarm": {"LocalNodeState": "active", "ControlAvailable": true}, "Plugins": {"Authorization": ["SENTINEL-authz"]},
+		"Warnings": ["[DEPRECATION NOTICE]: API is accessible on http://0.0.0.0:2375 without encryption."]}`
+	sc := fixture(t, dockerFixture())
+	serveDocker(t, sc, apiHandler(t, "1.51", info, containers))
+	sec, d := dockerOf(t, sc)
+	require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+
+	assert.Equal(t, []dockerPort{
+		{Container: "coturn", IP: "0.0.0.0", PublicPort: 49152, PrivatePort: 49152, Type: "udp", PublicPortEnd: 65535, PrivatePortEnd: 65535},
+		{Container: "coturn", IP: "::", PublicPort: 49152, PrivatePort: 49152, Type: "udp", PublicPortEnd: 65535, PrivatePortEnd: 65535},
+		{Container: "postgres", IP: "0.0.0.0", PublicPort: 5432, PrivatePort: 5432, Type: "tcp"},
+	}, d.Published, "a range is one entry: postgres is not pushed out")
+	assert.False(t, d.PublishedTruncated)
+	assert.Equal(t, []dockerContainer{{Name: "agent", HostNetwork: true, DockerSocket: true}}, d.Containers)
+	assert.Equal(t, "custom", *d.SeccompProfile, "the path is not sent")
+	assert.Equal(t, &dockerSwarm{State: "active", Manager: true}, d.Swarm)
+	assert.True(t, *d.AuthorizationPlugin)
+	assert.Equal(t, []dockerExposure{{Addr: "0.0.0.0:2375", NoTLS: true}}, d.APIExposed)
+	assert.NotContains(t, strings.ToUpper(toJSON(t, d)), "SENTINEL")
+}
+
+func TestDockerBridgeOptions(t *testing.T) {
+	sc := fixture(t, merge(dockerFixture(), map[string]string{
+		"etc/docker/daemon.json": `{"default-network-opts": {"bridge": {"com.docker.network.bridge.host_binding_ipv4": "127.0.0.1",
+			"com.docker.network.bridge.gateway_mode_ipv4": "nat-unprotected", "com.docker.network.bridge.gateway_mode_ipv6": "SENTINEL"}}}`,
+	}))
+	_, d := dockerOf(t, sc)
+	assert.Equal(t, "127.0.0.1", *d.Config.BridgeHostBindingIP)
+	assert.Equal(t, "nat-unprotected", *d.Config.BridgeGatewayModeIPv4, "unpublished ports routable")
+	assert.Equal(t, valueInvalid, *d.Config.BridgeGatewayModeIPv6)
+}

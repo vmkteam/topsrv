@@ -28,6 +28,9 @@ func TestParseArgs(t *testing.T) {
 			Settings{ICC: new(false)}},
 		{"a bool dockerd refuses", "dockerd --iptables=maybe", Settings{}},
 		{"after --", "dockerd -- -H fd://", Settings{}},
+		{"--default-network-opt", "dockerd --default-network-opt bridge=com.docker.network.bridge.host_binding_ipv4=127.0.0.1 " +
+			"--default-network-opt=bridge=com.docker.network.bridge.gateway_mode_ipv6=routed --default-network-opt overlay=x=y",
+			Settings{BridgeHostBindingIPv4: new("127.0.0.1"), BridgeGatewayModeIPv6: new("routed")}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -57,6 +60,18 @@ func TestParseConfig(t *testing.T) {
 		s, err := ParseConfig([]byte(`{"iptables": "false", "icc": null, "live-restore": true}`))
 		require.ErrorIs(t, err, errConfigType, "dockerd refuses the file")
 		assert.Equal(t, Settings{LiveRestore: new(true)}, s, "the rest is read")
+	})
+	t.Run("a UTF-8 BOM, as dockerd takes", func(t *testing.T) {
+		s, err := ParseConfig([]byte("\xef\xbb\xbf" + `{"iptables": false}`))
+		require.NoError(t, err)
+		assert.False(t, *s.IPTables)
+	})
+	t.Run("bridge default-network-opts", func(t *testing.T) {
+		s, err := ParseConfig([]byte(`{"default-network-opts": {"bridge": {"com.docker.network.bridge.host_binding_ipv4": "127.0.0.1",
+			"com.docker.network.bridge.gateway_mode_ipv4": "nat-unprotected", "com.docker.network.driver.mtu": "1400"},
+			"overlay": {"com.docker.network.bridge.gateway_mode_ipv6": "routed"}}}`))
+		require.NoError(t, err)
+		assert.Equal(t, Settings{BridgeHostBindingIPv4: new("127.0.0.1"), BridgeGatewayModeIPv4: new("nat-unprotected")}, s)
 	})
 	t.Run("not JSON", func(t *testing.T) {
 		_, err := ParseConfig([]byte(`{"iptables": false,}`))

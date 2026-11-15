@@ -19,12 +19,14 @@ import (
 
 // Limits of the docker section.
 const (
-	dockerEngine      = "docker"
-	dockerSocketUnit  = "docker.socket"
-	dockerCmdlineMax  = 64 << 10
-	dockerConfigLimit = 1 << 20
-	dockerAPIBudget   = 5 * time.Second // the whole conversation with dockerd
-	maxPublished      = 1000
+	dockerEngine         = "docker"
+	dockerSocketUnit     = "docker.socket"
+	dockerCmdlineMax     = 64 << 10
+	dockerConfigLimit    = 1 << 20
+	dockerAPIBudget      = 5 * time.Second // the whole conversation with dockerd
+	maxPublished         = 1000            // port ranges merged first
+	maxFlaggedContainers = 200
+	maxExposed           = 16
 )
 
 // Forms of what dockerd answers and of daemon.json values: anything else is
@@ -35,30 +37,46 @@ var (
 	dockerNameRe      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]{0,254}$`) // container names dockerd takes
 	dockerBackendRe   = regexp.MustCompile(`^(iptables|nftables)$`)
 	dockerProtocolsRe = regexp.MustCompile(`^(tcp|udp|sctp)$`)
+	dockerGatewayRe   = regexp.MustCompile(`^(nat|nat-unprotected|routed|isolated)$`)
+	dockerSwarmRe     = regexp.MustCompile(`^(inactive|pending|active|error|locked)$`)
 )
+
+// dockerSocketMounts are host paths whose bind mount gives a container the
+// Docker socket: the socket itself or a directory holding it.
+var dockerSocketMounts = []string{"/", "/run", "/var/run", "/run/docker.sock", "/var/run/docker.sock"}
 
 // dockerData is the docker section: the rootful dockerd of the host.
 type dockerData struct {
 	Engine string `json:"engine"`
+	// DaemonRunning: dockerd runs. false — only docker.socket listens: the
+	// first connection starts the daemon; the API is not read.
+	DaemonRunning bool `json:"daemonRunning"`
 	// DaemonStartedAt: dockerd reads daemon.json at start (and on SIGHUP for
 	// a few keys); a file newer than this may not be in force.
 	DaemonStartedAt *time.Time `json:"daemonStartedAt"`
 	// From the API; null when it did not answer (see gaps).
-	Version           *string  `json:"version"`
-	APIVersion        *string  `json:"apiVersion"`
-	FirewallBackend   *string  `json:"firewallBackend"` // API 1.49+; null before: iptables
-	SecurityOptions   []string `json:"securityOptions"`
-	ContainersRunning *int     `json:"containersRunning"`
+	Version             *string          `json:"version"`
+	APIVersion          *string          `json:"apiVersion"`
+	FirewallBackend     *string          `json:"firewallBackend"` // API 1.49+; null before: iptables
+	SecurityOptions     []string         `json:"securityOptions"`
+	SeccompProfile      *string          `json:"seccompProfile"` // builtin, unconfined, custom; null without seccomp
+	ContainersRunning   *int             `json:"containersRunning"`
+	Swarm               *dockerSwarm     `json:"swarm"`
+	AuthorizationPlugin *bool            `json:"authorizationPlugin"`
+	APIExposed          []dockerExposure `json:"apiExposed"`
 
 	Config dockerConfig `json:"config"`
 	Hosts  []dockerHost `json:"hosts"`
-	// Socket is the unix socket the API was read from; null when there is
-	// none to read.
+	// Socket is the unix socket of the API; null when there is none.
 	Socket *fileMeta `json:"socket"`
 	// Published are the ports of running containers bound on the host;
 	// null when the API did not answer.
 	Published          []dockerPort `json:"published"`
 	PublishedTruncated bool         `json:"publishedTruncated,omitempty"`
+	// Containers are the running containers with host networking or the
+	// Docker socket mounted; null when the API did not answer.
+	Containers          []dockerContainer `json:"containers"`
+	ContainersTruncated bool              `json:"containersTruncated,omitempty"`
 }
 
 // dockerConfig is what flags and daemon.json set; a null field is set by
@@ -77,6 +95,11 @@ type dockerConfig struct {
 	TLSVerify          *bool             `json:"tlsVerify"`
 	DefaultBindIP      *string           `json:"defaultBindIp"`
 	UsernsRemap        bool              `json:"usernsRemap"`
+	// default-network-opts of the bridge driver: networks created without
+	// options of their own, compose networks among them.
+	BridgeHostBindingIP   *string `json:"bridgeHostBindingIp"`
+	BridgeGatewayModeIPv4 *string `json:"bridgeGatewayModeIpv4"`
+	BridgeGatewayModeIPv6 *string `json:"bridgeGatewayModeIpv6"`
 }
 
 type dockerConfigFile struct {
@@ -100,48 +123,93 @@ type dockerPort struct {
 	PublicPort  int    `json:"publicPort"`
 	PrivatePort int    `json:"privatePort"`
 	Type        string `json:"type"`
+	// The last ports of a range (-p 49152-65535:49152-65535), which the API
+	// lists one by one; absent for a single port.
+	PublicPortEnd  int `json:"publicPortEnd,omitempty"`
+	PrivatePortEnd int `json:"privatePortEnd,omitempty"`
+}
+
+type dockerSwarm struct {
+	State   string `json:"state"`
+	Manager bool   `json:"manager"`
+}
+
+type dockerExposure struct {
+	Addr  string `json:"addr"`
+	NoTLS bool   `json:"noTls"` // without encryption; else TLS without client verification
+}
+
+type dockerContainer struct {
+	Name         string `json:"name"`
+	HostNetwork  bool   `json:"hostNetwork"`
+	DockerSocket bool   `json:"dockerSocket"` // the socket, or a directory holding it, bind-mounted
 }
 
 func collectDocker(ctx context.Context, sc *scanCtx) Section {
 	var gaps gapList
-	p, err := dockerDaemon(sc)
-	if p == nil {
+	p, ownMnt, err := dockerDaemon(sc)
+	switch {
+	case p == nil && err != nil:
 		gaps.add("/proc", err)
-		return absent(gaps) // no dockerd: the socket is not touched, it may be socket-activated
+		return absent(gaps) // absence is not known
+	case p == nil:
+		return dockerSocketOnly(sc)
 	}
-	d := dockerData{Engine: dockerEngine, DaemonStartedAt: processStart(sc, p.pid)}
+	droot := "" // dockerd's root: a dockerd in its own mount namespace (the snap) sees its paths there
+	if ownMnt {
+		droot = "/proc/" + p.pid + "/root"
+	}
+	d := dockerData{Engine: dockerEngine, DaemonRunning: true, DaemonStartedAt: processStart(sc, p.pid)}
 	head, err := sc.readHead("/proc/"+p.pid+"/cmdline", dockerCmdlineMax)
 	gaps.add("/proc/"+p.pid+"/cmdline", err)
 	flags := dockerapi.ParseArgs(strings.Split(strings.TrimRight(string(head), "\x00"), "\x00"))
 
 	configFile := path.Join("/", cmp.Or(flags.ConfigFile, dockerapi.DefaultConfigFile)) // relative to dockerd's cwd, /
-	file, fileSettings := readDockerConfig(sc, configFile, &gaps)
+	file, fileSettings := readDockerConfig(sc, droot, configFile, &gaps)
 	d.Config = dockerConfigOf(dockerapi.Merge(flags, fileSettings), file)
 	hosts := dockerapi.ResolveHosts(flags, fileSettings, unitValues(sc, dockerSocketUnit, "ListenStream"))
 	d.Hosts = dockerHostsOf(hosts)
-	socket := dockerapi.Socket(hosts)
-	if socket == "" {
+	socket, ok := dockerapi.Socket(hosts)
+	if !ok {
 		return collected(gaps, d) // TCP only, or an abstract socket: not talked to
 	}
-	fi, err := sc.lstat(socket)
-	if err == nil && fi.Mode()&fs.ModeSocket == 0 {
-		err = errNotRegular
+	sroot := droot
+	if socket.Systemd {
+		sroot = "" // systemd made it, in the host's mount namespace
 	}
-	if err != nil {
-		gaps.add(socket, err)
+	if d.Socket = dockerSocketMeta(sc, sroot, socket.Addr, &gaps); d.Socket == nil {
 		return collected(gaps, d)
 	}
-	m := metaOf(socket, fi)
-	d.Socket = &m
-	gaps.add(socket, dockerErr(d.readAPI(ctx, sc.newDockerClient(sc.root+socket))))
+	gaps.add(socket.Addr, dockerErr(d.readAPI(ctx, sc.newDockerClient(sc.root+sroot+socket.Addr), socket.Addr)))
+	return collected(gaps, d)
+}
+
+// dockerSocketOnly is the section without a dockerd: na, unless
+// docker.socket is enabled — then systemd holds the sockets, and the first
+// connection starts a root daemon. They are listed and stat'ed, never
+// connected to; daemon.json is what that start will read.
+func dockerSocketOnly(sc *scanCtx) Section {
+	if !unitEnabled(sc, dockerSocketUnit, "sockets.target") {
+		return Section{Status: StatusNA}
+	}
+	var gaps gapList
+	d := dockerData{Engine: dockerEngine}
+	file, fileSettings := readDockerConfig(sc, "", dockerapi.DefaultConfigFile, &gaps)
+	d.Config = dockerConfigOf(fileSettings, file)
+	hosts := dockerapi.SocketUnitHosts(unitValues(sc, dockerSocketUnit, "ListenStream"))
+	d.Hosts = dockerHostsOf(hosts)
+	if socket, ok := dockerapi.Socket(hosts); ok {
+		d.Socket = dockerSocketMeta(sc, "", socket.Addr, &gaps)
+	}
 	return collected(gaps, d)
 }
 
 // dockerDaemon finds the rootful dockerd of the host: trusted (root, a
-// binary only root can change) and in the mount and network namespaces of
-// PID 1. A dockerd in a container (docker-in-docker) or a rootless one
-// does not publish ports on the host's firewall and is not this section's.
-func dockerDaemon(sc *scanCtx) (*process, error) {
+// binary only root can change) and in the network namespace of PID 1,
+// where its ports and firewall rules are. ownMnt: it runs in a mount
+// namespace of its own (the snap). A dockerd in a container
+// (docker-in-docker) or a rootless one is not this section's.
+func dockerDaemon(sc *scanCtx) (*process, bool, error) {
 	procs, err := sc.processes()
 	hostMnt, _ := sc.readlink("/proc/1/ns/mnt")
 	hostNet, _ := sc.readlink("/proc/1/ns/net")
@@ -153,26 +221,24 @@ func dockerDaemon(sc *scanCtx) (*process, error) {
 			err = fs.ErrPermission
 			continue
 		}
-		if !trustedProcess(sc, p) {
-			continue
-		}
-		if sameNamespace(sc, p.pid, "mnt", hostMnt) && sameNamespace(sc, p.pid, "net", hostNet) {
-			return &p, nil
+		if trustedProcess(sc, p) && sameNamespace(sc, p.pid, "net", hostNet) {
+			return &p, !sameNamespace(sc, p.pid, "mnt", hostMnt), nil
 		}
 	}
-	return nil, err
+	return nil, false, err
 }
 
-// readDockerConfig reads daemon.json: nil without the file.
-func readDockerConfig(sc *scanCtx, path string, gaps *gapList) (*dockerConfigFile, dockerapi.Settings) {
-	b, err := sc.read(path, dockerConfigLimit)
+// readDockerConfig reads daemon.json under droot, dockerd's root; nil
+// without the file. Paths are reported as dockerd sees them.
+func readDockerConfig(sc *scanCtx, droot, path string, gaps *gapList) (*dockerConfigFile, dockerapi.Settings) {
+	b, err := sc.read(droot+path, dockerConfigLimit)
 	if err != nil {
 		gaps.optional(path, err)
 		return nil, dockerapi.Settings{}
 	}
 	s, err := dockerapi.ParseConfig(b)
 	file := &dockerConfigFile{Valid: err == nil}
-	if fi, err := sc.stat(path); err == nil {
+	if fi, err := sc.stat(droot + path); err == nil {
 		file.fileMeta, file.MTime = metaOf(path, fi), fi.ModTime().UTC()
 	} else {
 		file.Path = path
@@ -180,21 +246,39 @@ func readDockerConfig(sc *scanCtx, path string, gaps *gapList) (*dockerConfigFil
 	return file, s
 }
 
+// dockerSocketMeta stats the socket under root without following it, and
+// without connecting: nil, with a gap, when it is missing or not a socket.
+func dockerSocketMeta(sc *scanCtx, root, socket string, gaps *gapList) *fileMeta {
+	fi, err := sc.lstat(root + socket)
+	if err == nil && fi.Mode()&fs.ModeSocket == 0 {
+		err = errNotRegular
+	}
+	if err != nil {
+		gaps.add(socket, err)
+		return nil
+	}
+	m := metaOf(socket, fi)
+	return &m
+}
+
 func dockerConfigOf(s dockerapi.Settings, file *dockerConfigFile) dockerConfig {
 	return dockerConfig{
-		File:               file,
-		UserlandProxy:      s.UserlandProxy,
-		IPTables:           s.IPTables,
-		IP6Tables:          s.IP6Tables,
-		FirewallBackend:    checked(s.FirewallBackend, dockerBackendRe.MatchString),
-		AllowDirectRouting: s.AllowDirectRouting,
-		ICC:                s.ICC,
-		NoNewPrivileges:    s.NoNewPrivileges,
-		LiveRestore:        s.LiveRestore,
-		TLS:                s.TLS,
-		TLSVerify:          s.TLSVerify,
-		DefaultBindIP:      checked(s.DefaultBindIP, isIPAddr),
-		UsernsRemap:        s.UsernsRemap != nil && *s.UsernsRemap != "",
+		File:                  file,
+		UserlandProxy:         s.UserlandProxy,
+		IPTables:              s.IPTables,
+		IP6Tables:             s.IP6Tables,
+		FirewallBackend:       checked(s.FirewallBackend, dockerBackendRe.MatchString),
+		AllowDirectRouting:    s.AllowDirectRouting,
+		ICC:                   s.ICC,
+		NoNewPrivileges:       s.NoNewPrivileges,
+		LiveRestore:           s.LiveRestore,
+		TLS:                   s.TLS,
+		TLSVerify:             s.TLSVerify,
+		DefaultBindIP:         checked(s.DefaultBindIP, isIPAddr),
+		UsernsRemap:           s.UsernsRemap != nil && *s.UsernsRemap != "",
+		BridgeHostBindingIP:   checked(s.BridgeHostBindingIPv4, isIPAddr),
+		BridgeGatewayModeIPv4: checked(s.BridgeGatewayModeIPv4, dockerGatewayRe.MatchString),
+		BridgeGatewayModeIPv6: checked(s.BridgeGatewayModeIPv6, dockerGatewayRe.MatchString),
 	}
 }
 
@@ -218,10 +302,11 @@ func dockerHostsOf(hosts []dockerapi.ResolvedHost) []dockerHost {
 // read; the ports listed are not all of them.
 var errSkipped = fmt.Errorf("docker: containers skipped: %w", errParse)
 
-// readAPI reads the version, the firewall backend and the published ports
-// from dockerd, within dockerAPIBudget. The error is of the request that
-// failed; what came before it is kept.
-func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client) error {
+// readAPI reads the version, the posture and the published ports from
+// dockerd, within dockerAPIBudget. The error is of the request that
+// failed; what came before it is kept. socket is the path containers may
+// mount.
+func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client, socket string) error {
 	ctx, cancel := context.WithTimeout(ctx, dockerAPIBudget)
 	defer cancel()
 	api, err := c.Ping(ctx)
@@ -233,6 +318,20 @@ func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client) error {
 	if err != nil {
 		return err
 	}
+	d.setInfo(info)
+	list, skipped, err := c.Containers(ctx)
+	if err != nil {
+		return err
+	}
+	d.Published, d.PublishedTruncated = publishedPorts(list)
+	d.Containers, d.ContainersTruncated = flaggedContainers(list, socket)
+	if skipped > 0 {
+		return errSkipped
+	}
+	return nil
+}
+
+func (d *dockerData) setInfo(info dockerapi.Info) {
 	d.Version = checked(nonEmpty(info.ServerVersion), dockerVersionRe.MatchString)
 	d.FirewallBackend = checked(nonEmpty(info.FirewallBackend), dockerWordRe.MatchString)
 	d.SecurityOptions = make([]string, 0, len(info.SecurityOptions))
@@ -242,17 +341,48 @@ func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client) error {
 		}
 		d.SecurityOptions = append(d.SecurityOptions, o)
 	}
+	d.SeccompProfile = seccompProfile(info)
 	d.ContainersRunning = info.ContainersRunning
-	list, skipped, err := c.Containers(ctx)
-	if err != nil {
-		return err
+	if info.SwarmState != "" {
+		state := info.SwarmState
+		if !dockerSwarmRe.MatchString(state) {
+			state = valueInvalid
+		}
+		d.Swarm = &dockerSwarm{State: state, Manager: info.SwarmManager}
 	}
-	d.Published, d.PublishedTruncated = publishedPorts(list)
-	if skipped > 0 {
-		return errSkipped
+	authz := info.AuthorizationPlugins > 0
+	d.AuthorizationPlugin = &authz
+	d.APIExposed = []dockerExposure{}
+	for _, e := range info.Exposed[:min(len(info.Exposed), maxExposed)] {
+		addr := e.Addr
+		if _, _, err := net.SplitHostPort(addr); err != nil {
+			addr = valueInvalid
+		}
+		d.APIExposed = append(d.APIExposed, dockerExposure{Addr: addr, NoTLS: e.NoTLS})
 	}
-	return nil
 }
+
+// seccompProfile is the daemon's seccomp profile by kind, never its path:
+// builtin ("default" before Docker 20.10), unconfined, custom.
+func seccompProfile(info dockerapi.Info) *string {
+	if !slices.Contains(info.SecurityOptions, "seccomp") {
+		return nil
+	}
+	kind := "custom"
+	switch info.SeccompProfile {
+	case seccompBuiltin, seccompBuiltinOld:
+		kind = seccompBuiltin
+	case "unconfined":
+		kind = "unconfined"
+	}
+	return &kind
+}
+
+// Names of dockerd's own seccomp profile in SecurityOptions.
+const (
+	seccompBuiltin    = "builtin"
+	seccompBuiltinOld = "default" // before Docker 20.10
+)
 
 // newDockerClient is dockerapi.New, or the test's.
 func (sc *scanCtx) newDockerClient(path string) *dockerapi.Client {
@@ -289,18 +419,13 @@ func dockerErr(err error) error {
 	return err
 }
 
-// publishedPorts lists the ports bound on the host, sorted, at most
-// maxPublished.
+// publishedPorts lists the ports bound on the host, consecutive ports
+// merged into ranges, sorted, at most maxPublished: one large range must
+// not push the other containers out.
 func publishedPorts(list []dockerapi.Container) ([]dockerPort, bool) {
-	out := []dockerPort{}
+	var ports []dockerPort
 	for _, c := range list {
-		name := ""
-		if len(c.Names) > 0 {
-			name = strings.TrimPrefix(c.Names[0], "/")
-		}
-		if !dockerNameRe.MatchString(name) {
-			name = valueInvalid
-		}
+		name := containerName(c)
 		for _, p := range c.Ports {
 			if p.PublicPort < 1 || p.PublicPort > 65535 {
 				continue // exposed, not published
@@ -308,9 +433,21 @@ func publishedPorts(list []dockerapi.Container) ([]dockerPort, bool) {
 			if !dockerProtocolsRe.MatchString(p.Type) {
 				p.Type = valueInvalid
 			}
-			out = append(out, dockerPort{Container: name, IP: portIP(p.IP), PublicPort: p.PublicPort,
+			ports = append(ports, dockerPort{Container: name, IP: portIP(p.IP), PublicPort: p.PublicPort,
 				PrivatePort: p.PrivatePort, Type: p.Type})
 		}
+	}
+	slices.SortFunc(ports, func(a, b dockerPort) int {
+		return cmp.Or(cmp.Compare(a.Container, b.Container), cmp.Compare(a.Type, b.Type), cmp.Compare(a.IP, b.IP),
+			cmp.Compare(a.PublicPort, b.PublicPort))
+	})
+	out := []dockerPort{}
+	for _, p := range ports {
+		if n := len(out); n > 0 && extendsRange(out[n-1], p) {
+			out[n-1].PublicPortEnd, out[n-1].PrivatePortEnd = p.PublicPort, p.PrivatePort
+			continue
+		}
+		out = append(out, p)
 	}
 	slices.SortFunc(out, func(a, b dockerPort) int {
 		return cmp.Or(cmp.Compare(a.Container, b.Container), cmp.Compare(a.PublicPort, b.PublicPort),
@@ -320,6 +457,45 @@ func publishedPorts(list []dockerapi.Container) ([]dockerPort, bool) {
 		return out[:maxPublished], true
 	}
 	return out, false
+}
+
+// extendsRange: p is the next port of the range, or single port, r.
+func extendsRange(r, p dockerPort) bool {
+	return r.Container == p.Container && r.IP == p.IP && r.Type == p.Type &&
+		cmp.Or(r.PublicPortEnd, r.PublicPort)+1 == p.PublicPort && cmp.Or(r.PrivatePortEnd, r.PrivatePort)+1 == p.PrivatePort
+}
+
+// flaggedContainers are the containers with host networking or the Docker
+// socket bind-mounted, from the list (no request per container), sorted.
+func flaggedContainers(list []dockerapi.Container, socket string) ([]dockerContainer, bool) {
+	out := []dockerContainer{}
+	for _, c := range list {
+		f := dockerContainer{Name: containerName(c), HostNetwork: c.HostConfig.NetworkMode == "host"}
+		for _, m := range c.Mounts {
+			src := path.Clean(m.Source)
+			f.DockerSocket = f.DockerSocket || m.Type == "bind" && (src == socket || slices.Contains(dockerSocketMounts, src))
+		}
+		if f.HostNetwork || f.DockerSocket {
+			out = append(out, f)
+		}
+	}
+	slices.SortFunc(out, func(a, b dockerContainer) int { return cmp.Compare(a.Name, b.Name) })
+	if len(out) > maxFlaggedContainers {
+		return out[:maxFlaggedContainers], true
+	}
+	return out, false
+}
+
+// containerName is the first name without "/", or "invalid".
+func containerName(c dockerapi.Container) string {
+	name := ""
+	if len(c.Names) > 0 {
+		name = strings.TrimPrefix(c.Names[0], "/")
+	}
+	if !dockerNameRe.MatchString(name) {
+		return valueInvalid
+	}
+	return name
 }
 
 // portIP is the address a port is bound to, canonical, or "invalid".

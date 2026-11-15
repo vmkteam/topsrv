@@ -92,7 +92,10 @@ func TestResolveHosts(t *testing.T) {
 		{`"hosts": [] is the default`, Settings{}, Settings{Hosts: []string{}}, nil, []rh{{"unix:///var/run/docker.sock", SourceDefault}}},
 		{"blank -H is dropped", Settings{Hosts: []string{" "}}, Settings{}, nil, []rh{{"unix:///var/run/docker.sock", SourceDefault}}},
 		{"--tls alone", Settings{TLS: new(true)}, Settings{}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
-		{"tlsverify of daemon.json", Settings{}, Settings{TLSVerify: new(true)}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
+		{"--tlsverify=false still means TLS", Settings{TLSVerify: new(false)}, Settings{}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
+		{`"tls": true of daemon.json`, Settings{}, Settings{TLS: new(true)}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
+		{`"tlsverify" of daemon.json alone does not`, Settings{}, Settings{TLSVerify: new(true)}, nil,
+			[]rh{{"unix:///var/run/docker.sock", SourceDefault}}},
 		{"in input order", Settings{Hosts: []string{"tcp://ok:1", "ssh://x"}}, Settings{}, nil,
 			[]rh{{"tcp://ok:1", SourceCmdline}, {"invalid", SourceCmdline}}},
 		{"fd:// with the socket unit", Settings{Hosts: []string{"fd://"}}, Settings{}, []string{"/run/docker.sock", "2375"},
@@ -109,6 +112,14 @@ func TestResolveHosts(t *testing.T) {
 
 func TestSocket(t *testing.T) {
 	hosts := ResolveHosts(Settings{Hosts: []string{"tcp://0.0.0.0:2375", "unix://@abstract", "fd://"}}, Settings{}, []string{"/run/docker.sock"})
-	assert.Equal(t, "/run/docker.sock", Socket(hosts), "the first unix socket with a path")
-	assert.Empty(t, Socket(ResolveHosts(Settings{Hosts: []string{"tcp://0.0.0.0:2375"}}, Settings{}, nil)))
+	h, ok := Socket(hosts)
+	require.True(t, ok)
+	assert.Equal(t, "/run/docker.sock", h.Addr, "the first unix socket with a path")
+	assert.True(t, h.Systemd, "created by systemd, in the host's mount namespace")
+
+	h, ok = Socket(ResolveHosts(Settings{Hosts: []string{"unix:///var/run/docker.sock"}}, Settings{}, nil))
+	require.True(t, ok)
+	assert.False(t, h.Systemd, "dockerd's own")
+	_, ok = Socket(ResolveHosts(Settings{Hosts: []string{"tcp://0.0.0.0:2375"}}, Settings{}, nil))
+	assert.False(t, ok)
 }

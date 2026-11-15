@@ -79,13 +79,33 @@ type Info struct {
 	ServerVersion     string
 	FirewallBackend   string   // FirewallBackend.Driver, API 1.49+; "" before
 	SecurityOptions   []string // names: apparmor, seccomp, selinux, userns, rootless, cgroupns, no-new-privileges
+	SeccompProfile    string   // profile= of seccomp: builtin (default before 20.10), unconfined, or a path
 	ContainersRunning *int
+	SwarmState        string // Swarm.LocalNodeState: inactive, pending, active, error, locked
+	SwarmManager      bool   // Swarm.ControlAvailable
+	// AuthorizationPlugins counts Plugins.Authorization: with one, the
+	// socket's group is not root by itself, and 401/403 are its answers.
+	AuthorizationPlugins int
+	// Exposed are dockerd's own warnings about the TCP hosts it listens
+	// on (daemon/info.go fillAPIInfo).
+	Exposed []Exposure
 }
+
+// Exposure is a TCP address of the API dockerd warns about.
+type Exposure struct {
+	Addr  string // host:port
+	NoTLS bool   // without encryption; else TLS without client verification
+}
+
+// exposedRe is the warning fillAPIInfo writes per unprotected TCP host.
+var exposedRe = regexp.MustCompile(`API is accessible on https?://(\S+) without (encryption|TLS client verification)`)
 
 // Info reads /info. A field of an unexpected type is left empty: one odd
 // field does not cost the rest.
 func (c *Client) Info(ctx context.Context) (Info, error) {
-	var raw struct{ ServerVersion, FirewallBackend, SecurityOptions, ContainersRunning json.RawMessage }
+	var raw struct {
+		ServerVersion, FirewallBackend, SecurityOptions, ContainersRunning, Swarm, Plugins, Warnings json.RawMessage
+	}
 	if err := c.get(ctx, c.versioned("/info"), func(r io.Reader) error { return json.NewDecoder(r).Decode(&raw) }); err != nil {
 		return Info{}, err
 	}
@@ -95,6 +115,12 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 		fb      struct{ Driver string }
 		opts    []string
 		running int
+		swarm   struct {
+			LocalNodeState   string
+			ControlAvailable bool
+		}
+		plugins  struct{ Authorization []string }
+		warnings []string
 	)
 	if json.Unmarshal(raw.ServerVersion, &version) == nil {
 		info.ServerVersion = version
@@ -104,23 +130,50 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 	}
 	if json.Unmarshal(raw.SecurityOptions, &opts) == nil {
 		for _, o := range opts {
+			fields := map[string]string{}
 			for kv := range strings.SplitSeq(o, ",") { // "name=seccomp,profile=builtin"
-				if name, ok := strings.CutPrefix(kv, "name="); ok {
-					info.SecurityOptions = append(info.SecurityOptions, name)
-				}
+				k, v, _ := strings.Cut(kv, "=")
+				fields[k] = v
+			}
+			if name, ok := fields["name"]; ok {
+				info.SecurityOptions = append(info.SecurityOptions, name)
+			}
+			if fields["name"] == "seccomp" {
+				info.SeccompProfile = fields["profile"]
 			}
 		}
 	}
 	if json.Unmarshal(raw.ContainersRunning, &running) == nil {
 		info.ContainersRunning = &running
 	}
+	if json.Unmarshal(raw.Swarm, &swarm) == nil {
+		info.SwarmState, info.SwarmManager = swarm.LocalNodeState, swarm.ControlAvailable
+	}
+	if json.Unmarshal(raw.Plugins, &plugins) == nil {
+		info.AuthorizationPlugins = len(plugins.Authorization)
+	}
+	if json.Unmarshal(raw.Warnings, &warnings) == nil {
+		for _, w := range warnings {
+			if m := exposedRe.FindStringSubmatch(w); m != nil {
+				info.Exposed = append(info.Exposed, Exposure{Addr: m[1], NoTLS: m[2] == "encryption"})
+			}
+		}
+	}
 	return info, nil
 }
 
 // Container is the part of a /containers/json entry read.
 type Container struct {
-	Names []string
-	Ports []Port
+	Names      []string
+	Ports      []Port
+	HostConfig struct{ NetworkMode string } // "host": the host's network namespace
+	Mounts     []Mount
+}
+
+// Mount is a mount of a container, as listed.
+type Mount struct {
+	Type   string // bind, volume, tmpfs
+	Source string // the host path of a bind mount
 }
 
 // Port is a port of a container; PublicPort > 0 when published on the host.

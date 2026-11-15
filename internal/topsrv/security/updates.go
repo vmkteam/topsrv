@@ -352,7 +352,7 @@ func collectTimers(sc *scanCtx, names []string, gaps *gapList) []timerState {
 		if !installed && !t.Masked {
 			continue
 		}
-		t.Enabled = slices.ContainsFunc(unitDirs, func(dir string) bool { return sc.exists(dir + "/timers.target.wants/" + name) })
+		t.Enabled = unitEnabled(sc, name, "timers.target")
 		t.LastTriggerAt = mtimeOf(sc, pathTimerStamps+"/stamp-"+name, gaps)
 		out = append(out, t)
 	}
