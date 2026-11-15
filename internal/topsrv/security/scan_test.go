@@ -265,15 +265,17 @@ func TestRun(t *testing.T) {
 func TestDryRun(t *testing.T) {
 	stateDir := t.TempDir()
 
-	out, err := DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, []string{SectionSysctl})
+	out, err := DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionSysctl})
 	require.NoError(t, err)
 
 	var p struct {
-		Kind string `json:"kind"`
-		Data Data   `json:"data"`
+		Kind         string `json:"kind"`
+		AgentVersion string `json:"agentVersion"`
+		Data         Data   `json:"data"`
 	}
 	require.NoError(t, json.Unmarshal(out, &p))
 	assert.Equal(t, Kind, p.Kind)
+	assert.Equal(t, "1.2.3", p.AgentVersion, "the version the pusher would stamp")
 	assert.Equal(t, "dry-run", p.Data.Trigger)
 	assert.Equal(t, ephemeralKeyID, p.Data.Agent.KeyID)
 	assert.Equal(t, []string{SectionSysctl}, slices.Collect(maps.Keys(p.Data.Sections)))
@@ -282,10 +284,10 @@ func TestDryRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "dry-run writes nothing")
 
-	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, []string{SectionSSHD})
+	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionSSHD})
 	require.ErrorContains(t, err, `"sshd" is not collected by this version`)
 
-	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{DisabledSections: []string{SectionSysctl}}, stateDir, []string{SectionSysctl})
+	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{DisabledSections: []string{SectionSysctl}}, stateDir, "1.2.3", []string{SectionSysctl})
 	require.ErrorContains(t, err, `"sysctl" is disabled`)
 }
 

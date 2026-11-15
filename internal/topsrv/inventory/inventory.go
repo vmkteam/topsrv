@@ -17,8 +17,12 @@ const (
 type Payload struct {
 	Kind      string    `json:"kind"`
 	ScannedAt time.Time `json:"scannedAt"`
-	Host      HostMeta  `json:"host"`
-	Data      any       `json:"data"`
+	// AgentVersion is the agent build that collected the snapshot. The pusher
+	// sets it before the body is sent or spooled, so a snapshot resent after
+	// an update still names the version that built it.
+	AgentVersion string   `json:"agentVersion,omitempty"`
+	Host         HostMeta `json:"host"`
+	Data         any      `json:"data"`
 }
 
 // HostMeta — required upstream by Vulners audit (osId+osVersionId+kernelRelease).

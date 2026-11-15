@@ -17,6 +17,7 @@ The same envelope as the packages snapshot.
 |-------|------|-------------|
 | `kind` | string | Always `security` |
 | `scannedAt` | RFC 3339 time | Start of the pass. The backend orders snapshots by it, so a snapshot resent late from the spool never replaces a newer one |
+| `agentVersion` | string | The agent build that collected the snapshot, set on every `/v1/inventory` kind, and in dry-run. A snapshot resent from the spool after an update still names the old build. Absent in 0.2.0-rc.1 and earlier |
 | `host` | object | OS and kernel facts (`osId`, `osVersionId`, `kernelRelease`, `kernelArch`, `packageManager`, …) — the same `HostMeta` as `kind="packages"` |
 | `data` | object | The snapshot, below |
 
@@ -199,6 +200,7 @@ Trimmed; an Ubuntu host:
 {
   "kind": "security",
   "scannedAt": "2026-11-14T10:03:12Z",
+  "agentVersion": "0.2.0",
   "host": { "osId": "ubuntu", "osVersionId": "24.04", "kernelRelease": "6.8.0-90-generic", "kernelArch": "amd64", "packageManager": "dpkg" },
   "data": {
     "schemaVersion": 1,

@@ -284,6 +284,27 @@ func TestPusherInventory(t *testing.T) {
 		assert.Equal(t, []string{"security"}, src.acked, "only the live send is acknowledged")
 	})
 
+	t.Run("the version that built a snapshot survives the spool", func(t *testing.T) {
+		b := newInventoryBackend(t, http.StatusServiceUnavailable)
+		dir := t.TempDir()
+		p, src := newInventoryPusher(t, b, dir) // version "test"
+		src.pending = []inventory.Payload{testPayload("security", t0)}
+		p.push(t.Context())
+
+		b.status.Store(http.StatusOK)
+		updated := NewPusher(embedlog.Logger{}, "topsrv", "updated", PushConfig{
+			Endpoint: b.URL + "/v1/write", Interval: "1s", SpoolDir: dir,
+		}, prometheus.NewRegistry())
+		updated.AddInventoryProvider(&fakeInventory{pending: []inventory.Payload{testPayload("security", t0.Add(time.Minute))}})
+		updated.push(t.Context())
+
+		got := b.got()
+		require.Len(t, got, 3)
+		assert.Equal(t, []string{"test", "test", "updated"},
+			[]string{got[0].AgentVersion, got[1].AgentVersion, got[2].AgentVersion},
+			"503, resend by the updated agent, its own fresh snapshot")
+	})
+
 	t.Run("401 is spooled until the token is fixed", func(t *testing.T) {
 		b := newInventoryBackend(t, http.StatusUnauthorized)
 		dir := t.TempDir()

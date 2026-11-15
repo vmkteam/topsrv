@@ -764,7 +764,7 @@ func (a *App) registerSecurity(ctx context.Context) {
 // SecurityDryRun returns what the security collector would send, without
 // sending or writing anything. sections limits the pass; empty means all
 // enabled sections. Logs go to logger.
-func SecurityDryRun(ctx context.Context, logger embedlog.Logger, cfg Config, sections []string) ([]byte, error) {
+func SecurityDryRun(ctx context.Context, logger embedlog.Logger, cfg Config, version string, sections []string) ([]byte, error) {
 	sc := cfg.Security
 	if sc == nil {
 		sc = &security.Config{}
@@ -772,7 +772,7 @@ func SecurityDryRun(ctx context.Context, logger embedlog.Logger, cfg Config, sec
 	if err := sc.Validate(); err != nil {
 		return nil, err
 	}
-	return security.DryRun(ctx, logger, *sc, topsrv.StateDir(cfg.Push.SpoolDir), sections)
+	return security.DryRun(ctx, logger, *sc, topsrv.StateDir(cfg.Push.SpoolDir), version, sections)
 }
 
 func (a *App) registerNginx(ctx context.Context, services []topsrv.Service) {

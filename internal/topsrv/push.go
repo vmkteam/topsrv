@@ -51,6 +51,7 @@ type Pusher struct {
 	embedlog.Logger
 
 	cfg                PushConfig
+	version            string // agent version, stamped on inventory snapshots
 	registry           *prometheus.Registry
 	client             *http.Client
 	interval           time.Duration
@@ -81,6 +82,7 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, 
 	p := &Pusher{
 		Logger:            logger,
 		cfg:               cfg,
+		version:           version,
 		registry:          registry,
 		client:            appkit.NewHTTPClient(appName, version, pushTimeout),
 		interval:          interval,
@@ -351,6 +353,9 @@ func (p *Pusher) sendInventory(ctx context.Context) {
 }
 
 func (p *Pusher) sendOneInventory(ctx context.Context, ip InventoryProvider, payload inventory.Payload) {
+	if payload.AgentVersion == "" {
+		payload.AgentVersion = p.version
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		p.Error(ctx, "inventory: marshal failed", "kind", payload.Kind, "error", err)
