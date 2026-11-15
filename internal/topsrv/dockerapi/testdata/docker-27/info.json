@@ -72,7 +72,7 @@
   "CgroupDriver": "systemd",
   "CgroupVersion": "2",
   "NEventsListener": 0,
-  "KernelVersion": "7.2.12-orbstack-00394-gbecdd6130068",
+  "KernelVersion": "6.12.0-test",
   "OperatingSystem": "Debian GNU/Linux 12 (bookworm)",
   "OSVersion": "12",
   "OSType": "linux",
