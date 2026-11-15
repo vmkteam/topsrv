@@ -35,6 +35,7 @@ func hostFixture() map[string]string {
 		"var/lib/dpkg/status":        "",
 		"lib64/ld-linux-x86-64.so.2": "",
 		"run/systemd/system/":        "",
+		"proc/self/mountinfo":        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n",
 	})
 }
 

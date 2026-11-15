@@ -89,7 +89,7 @@ Where the agent runs. Without it every other section could give a false pass: in
 | `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd`, `authorizedKeys` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -209,6 +209,22 @@ The command line is taken from the running listener in the host mount namespace 
 
 Keywords in `effective`: `PermitRootLogin` (`without-password` comes as `prohibit-password`), `PasswordAuthentication`, `KbdInteractiveAuthentication` (`ChallengeResponseAuthentication` sets it too), `PermitEmptyPasswords`, `PubkeyAuthentication`, `AuthenticationMethods`, `UsePAM`, `MaxAuthTries`, `LoginGraceTime`, `Port`, `ListenAddress`, `AddressFamily`, `AllowUsers`, `DenyUsers`, `AllowGroups`, `DenyGroups`, `AuthorizedKeysFile`, `AuthorizedKeysCommand`, `AuthorizedKeysCommandUser`, `TrustedUserCAKeys`, `StrictModes`, `PermitUserEnvironment`, `HostbasedAuthentication`, `IgnoreRhosts`, `GSSAPIAuthentication`, `X11Forwarding`, `AllowTcpForwarding`, `AllowAgentForwarding`, `PermitTunnel`, `GatewayPorts`, `Ciphers`, `MACs`, `KexAlgorithms`, `HostKeyAlgorithms`, `PubkeyAcceptedAlgorithms`, `LogLevel`, `ClientAliveInterval`, `ClientAliveCountMax`, `MaxSessions`, `MaxStartups`, `Banner`.
 
+## `authorizedKeys`
+
+The keys sshd would accept for each user: the users come from `accounts`, the paths from `sshd` (`AuthorizedKeysFile` with its `Match User` overrides, `%%`, `%h`, `%u`, `%U`, relative to home, a glob since OpenSSH 10). `nologin` users are walked too: `ssh -N` works for them. Without the sshd configuration (`unknown`) sshd's default paths are walked and `configKnown` is `false`; `na` when sshd is not installed; `unknown` when `accounts` gave no users or the mount table is unreadable — then no home directory is touched.
+
+Each path is checked against `/proc/self/mountinfo` before any syscall, and so is every step of a symlink, which sshd follows: a link into autofs would mount it. Only a regular file is read, up to 1 MiB and 2000 keys.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `users[]` | object | `{name, files[]}` for users with at least one of the files. A user not listed has none |
+| `files[]` | object | `{path, status, keys[], truncated}`. `status`: `ok`; `unreadable` (permission denied — NFS with root_squash — never "no keys"); `skipped_remote_fs`; `ignored_by_sshd` (not a regular file, or StrictModes: the file or a directory up to home is owned by another user or writable by group or others — the keys are still listed, they work once fixed); `too_large`. `missing` files are not listed |
+| `keys[]` | object | `{fp, type, bits, typeMismatch, options, rejected}`: `fp` is `SHA256:` and the unpadded base64 of the key blob's sha256, as `ssh-keygen -l`; `bits` from the blob (RSA modulus, DSA p, ECDSA curve, 256 for Ed25519); `typeMismatch` when the blob is of another type than the line says; `rejected` when an option sshd does not know makes it drop the line |
+| `keys[].options` | object | Which options are there, never their values: `restrict`, `from`, `command`, `noPortForwarding`, `noPty`, `permitopen`, `certAuthority`, `expiry`, `environment` |
+| `configKnown` | bool | The paths come from the sshd configuration |
+| `keysExternal` | bool | `AuthorizedKeysCommand` is set: more keys may come from it |
+| `trustedUserCA` | bool | `TrustedUserCAKeys` is set: certificates signed by the CA are accepted too |
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -237,6 +253,7 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | `/etc/passwd` | Name, uid, gid, shell; GECOS is not read, home directories are not sent |
 | sshd configuration | The listed keywords with `file:line`; `AuthorizedKeysCommand`, `TrustedUserCAKeys`, `Banner` only as set or not |
 | Command line of the sshd listener | Only `-f`, `-o`, `-p`, to parse the configuration as sshd does |
+| `authorized_keys` | Fingerprint, type, size and which options a key has; never the comment or the values of `from=`, `command=`, `environment=` |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |

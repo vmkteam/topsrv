@@ -7,12 +7,14 @@ import (
 	"io/fs"
 	"maps"
 	"os"
+	"path"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
@@ -125,6 +127,50 @@ func (sc *scanCtx) lstatUser(path string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return os.Lstat(sc.root + path)
+}
+
+// maxSymlinks bounds symlink resolution, as the kernel's 40.
+const maxSymlinks = 40
+
+// resolveUser resolves the symlinks of a user path, as realpath(3) does,
+// but checks every path against the mount table before it touches it: an
+// lstat behind a link into autofs would mount it. Targets are host paths,
+// read under the scan root.
+func (sc *scanCtx) resolveUser(p string) (string, error) {
+	resolved, links := "/", 0
+	rest := strings.Split(strings.Trim(path.Clean(p), "/"), "/")
+	for len(rest) > 0 {
+		comp := rest[0]
+		rest = rest[1:]
+		switch comp {
+		case "", ".":
+			continue
+		case "..":
+			resolved = path.Dir(resolved)
+			continue
+		}
+		next := path.Join(resolved, comp)
+		fi, err := sc.lstatUser(next)
+		if err != nil {
+			return "", err
+		}
+		if fi.Mode()&fs.ModeSymlink == 0 {
+			resolved = next
+			continue
+		}
+		if links++; links > maxSymlinks {
+			return "", &fs.PathError{Op: opOpen, Path: p, Err: syscall.ELOOP}
+		}
+		target, err := os.Readlink(sc.root + next)
+		if err != nil {
+			return "", err
+		}
+		if path.IsAbs(target) {
+			resolved = "/"
+		}
+		rest = append(strings.Split(strings.Trim(target, "/"), "/"), rest...)
+	}
+	return resolved, nil
 }
 
 // local refuses a path on a remote filesystem. An unreadable mount table
@@ -282,6 +328,7 @@ var allSections = []sectionDef{
 	{name: SectionSysctl, budget: 2 * time.Second, host: true, run: noResult(collectSysctl)},
 	{name: SectionAccounts, budget: 2 * time.Second, host: true, run: collectAccounts},
 	{name: SectionSSHD, budget: 3 * time.Second, host: true, run: collectSSHD},
+	{name: SectionAuthorizedKeys, budget: 10 * time.Second, host: true, run: noResult(collectAuthorizedKeys)},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
 

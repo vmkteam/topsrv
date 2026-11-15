@@ -173,7 +173,8 @@ func TestSSHDStatus(t *testing.T) {
 	t.Run("not installed: na", func(t *testing.T) {
 		sec, _, res := sshdOf(t, hostProc())
 		assert.Equal(t, StatusNA, sec.Status)
-		assert.Nil(t, res)
+		require.NotNil(t, res)
+		assert.True(t, res.notInstalled, "authorizedKeys is na too")
 	})
 
 	t.Run("an unreadable main config (RHEL, 0600, no root): unknown, not defaults", func(t *testing.T) {

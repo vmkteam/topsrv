@@ -108,6 +108,7 @@ type sshdListener struct {
 
 // sshdResult is what authorizedKeys builds on.
 type sshdResult struct {
+	notInstalled        bool
 	authorizedKeysFiles []string            // global, with the default when unset
 	userKeysFiles       map[string][]string // AuthorizedKeysFile of "Match User x" blocks, by user
 	strictModes         bool
@@ -123,7 +124,7 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 	flags, listener := sshdFlags(sc, &gaps)
 	socket := sshdSocketActivated(sc)
 	if !listener.Found && !socket && !sc.exists(flags.ConfigFile) && !sc.exists("/usr/sbin/sshd") {
-		return Section{Status: StatusNA}, nil
+		return Section{Status: StatusNA}, &sshdResult{notInstalled: true}
 	}
 
 	hashes := map[string]string{}
