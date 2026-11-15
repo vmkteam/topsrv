@@ -19,3 +19,12 @@ func privateFile(os.FileInfo) bool { return true }
 
 // fileOwner has no owner to report off unix.
 func fileOwner(os.FileInfo) (uid, gid int64) { return -1, -1 }
+
+// openNoSymlinks off unix: the collector reports unsupported_platform, this
+// only keeps the package building.
+func openNoSymlinks(root, rel string, dir bool) (*os.File, error) {
+	if dir {
+		return os.Open(root + rel)
+	}
+	return openFile(root+rel, true)
+}

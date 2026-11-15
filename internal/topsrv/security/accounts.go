@@ -174,6 +174,7 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 		d.Users, d.Truncated = all[:maxUsers], true
 	}
 	d.Anomalies = accountAnomaliesOf(users, shadow)
+	d.Malformed = d.Malformed[:min(len(d.Malformed), maxLineRefs)]
 	if groups != nil {
 		d.PrivilegedGroups = privilegedMembers(users, groups)
 	}
@@ -433,7 +434,7 @@ func accountAnomaliesOf(users []passwdEntry, shadow map[string]shadowEntry) acco
 	}
 	for name := range shadow {
 		if byName[name] == 0 {
-			a.PasswdShadowMismatch = append(a.PasswdShadowMismatch, name)
+			a.PasswdShadowMismatch = append(a.PasswdShadowMismatch, strings.Clone(name)) // not a slice of the shadow file
 		}
 	}
 	slices.Sort(a.PasswdShadowMismatch)

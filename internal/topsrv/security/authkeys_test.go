@@ -304,3 +304,30 @@ func FuzzAuthKeyLine(f *testing.F) {
 		}
 	})
 }
+
+func TestParseAuthKeyLineReview(t *testing.T) {
+	rsa := b64(rsaBlob(2048))
+	cases := []struct {
+		name     string
+		line     string
+		rejected bool
+		mismatch bool
+	}{
+		{"rsa-sha2-512 names an RSA key", "rsa-sha2-512 " + rsa, false, false},
+		{"rsa-sha2-256", "rsa-sha2-256 " + rsa, false, false},
+		{"a blob of another type is rejected", "ssh-rsa " + b64(ed25519Blob(1)), true, true},
+		{"command without a value", "command ssh-rsa " + rsa, true, false},
+		{"an unquoted value", "from=10.0.0.1 ssh-rsa " + rsa, true, false},
+		{"a flag with a value", "no-pty=yes ssh-rsa " + rsa, true, false},
+		{"touch-required and no-verify-required are known", "touch-required,no-verify-required ssh-rsa " + rsa, false, false},
+		{"upper case option names", `NO-PTY,COMMAND="x" ssh-rsa ` + rsa, false, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k, ok := parseAuthKeyLine(tc.line)
+			require.True(t, ok)
+			assert.Equal(t, tc.rejected, k.Rejected)
+			assert.Equal(t, tc.mismatch, k.TypeMismatch)
+		})
+	}
+}

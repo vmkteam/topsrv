@@ -328,3 +328,58 @@ func FuzzSplitLine(f *testing.F) {
 		}
 	})
 }
+
+func TestParseReviewCases(t *testing.T) {
+	t.Run("an unlistable Include directory is a read error, not an empty one", func(t *testing.T) {
+		files := memFiles(map[string]string{DefaultConfig: "Include /etc/ssh/sshd_config.d/*.conf\nPasswordAuthentication no\n"})
+		files.ReadDir = func(string) ([]string, error) { return nil, fs.ErrPermission } // RHEL: 0700 without root
+
+		cfg := Parse(Flags{ConfigFile: DefaultConfig}, files)
+
+		assert.False(t, cfg.Valid())
+		require.Len(t, cfg.ReadErrors, 1)
+		assert.Equal(t, "/etc/ssh/sshd_config.d", cfg.ReadErrors[0].Path)
+	})
+
+	t.Run("a missing Include directory is fine", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "Include /etc/ssh/nothere/*.conf\n"}, Flags{})
+		assert.True(t, cfg.Valid())
+	})
+
+	t.Run("PubkeyAuthOptions takes several flags", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "PubkeyAuthOptions touch-required verify-required\n"}, Flags{})
+		assert.Empty(t, cfg.Errors)
+		assert.Equal(t, []string{"touch-required", "verify-required"}, cfg.Global["PubkeyAuthOptions"].Values)
+	})
+
+	t.Run("Match needs criterion-value pairs, All stands alone", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "Match User alice Address\nMatch All User bob\n"}, Flags{})
+		assert.Equal(t, []Ref{{File: DefaultConfig, Line: 1, Code: CodeBadMatch}, {File: DefaultConfig, Line: 2, Code: CodeBadMatch}}, cfg.Errors)
+	})
+
+	t.Run("only CamelCase words are sent as unknown keywords", func(t *testing.T) {
+		for kw, want := range map[string]string{
+			"DebianBanner": "DebianBanner", "GSSAPIKeyExchange": "GSSAPIKeyExchange",
+			"AKIAIOSFODNN7EXAMPLE": "invalid", "HUNTER": "invalid", "hunter2": "invalid", "secret": "invalid",
+		} {
+			assert.Equal(t, want, keywordCode(kw), kw)
+		}
+	})
+}
+
+func TestGlobErrors(t *testing.T) {
+	readDir := func(dir string) ([]string, error) {
+		switch dir {
+		case "/a":
+			return []string{"x", "y"}, nil
+		case "/a/x":
+			return nil, fs.ErrPermission
+		}
+		return nil, fs.ErrNotExist
+	}
+
+	matches, errs := Glob("/a/*/k*", readDir)
+
+	assert.Empty(t, matches)
+	assert.Equal(t, []ReadError{{Path: "/a/x", Err: fs.ErrPermission}}, errs, "/a/y is missing: no error")
+}

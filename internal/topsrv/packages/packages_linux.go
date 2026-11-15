@@ -80,7 +80,7 @@ func (c *Collector) scanManager(ctx context.Context, m managerFunc, host invento
 	}
 	snap.RebootRequired = markKernelPackages(m.name, snap.Packages, host.KernelRelease)
 	if m.name == inventory.ManagerDpkg {
-		pending, pkgs := debianRebootRequired("")
+		pending, pkgs := debianRebootRequired(rebootFilesRoot)
 		snap.RebootRequired = snap.RebootRequired || pending
 		snap.RebootRequiredPackages = pkgs
 	}

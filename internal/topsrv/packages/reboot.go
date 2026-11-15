@@ -1,3 +1,5 @@
+//go:build linux
+
 package packages
 
 import (
@@ -21,6 +23,10 @@ const (
 	maxRebootPkgs      = 64
 	maxRebootPkgName   = 64
 )
+
+// rebootFilesRoot is where /var/run is read from: "" in production, a
+// fixture in tests.
+var rebootFilesRoot = ""
 
 // debianPkgName is the shape of a Debian package name; anything else in the
 // file is not sent.
@@ -53,9 +59,10 @@ func parseRebootPkgs(b []byte) []string {
 
 var errNotRegular = errors.New("not a regular file")
 
-// readRegular reads a regular file of at most limit bytes. It is opened
-// non-blocking, so a FIFO in its place cannot hang the open, and checked to
-// be a regular file again after the open.
+// readRegular reads up to limit bytes of a regular file. It is opened
+// non-blocking and without becoming a controlling terminal, so a FIFO in its
+// place cannot hang the open, and checked to be a regular file again after
+// the open. (A copy of security's safefile, to be shared.)
 func readRegular(path string, limit int64) ([]byte, error) {
 	fi, err := os.Stat(path)
 	if err != nil {
@@ -64,20 +71,15 @@ func readRegular(path string, limit int64) ([]byte, error) {
 	if !fi.Mode().IsRegular() {
 		return nil, errNotRegular
 	}
-	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK, 0)
+	f, err := os.OpenFile(path, os.O_RDONLY|syscall.O_NONBLOCK|syscall.O_NOCTTY, 0)
 	if err != nil {
 		return nil, err
 	}
 	defer f.Close()
-	if after, statErr := f.Stat(); statErr != nil || !os.SameFile(fi, after) {
+	// The same inode may go to a FIFO put in place of a removed file: the type
+	// is checked again on what was opened.
+	if after, statErr := f.Stat(); statErr != nil || !os.SameFile(fi, after) || !after.Mode().IsRegular() {
 		return nil, errNotRegular
 	}
-	b, err := io.ReadAll(io.LimitReader(f, limit+1))
-	if err != nil {
-		return nil, err
-	}
-	if int64(len(b)) > limit {
-		return nil, errors.New("file exceeds the size limit")
-	}
-	return b, nil
+	return io.ReadAll(io.LimitReader(f, limit)) // a longer file: its first names
 }

@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -272,6 +273,7 @@ func (p *Pusher) post(ctx context.Context, url, contentType, contentEncoding str
 	if p.hostname != "" {
 		req.Header.Set("X-Hostname", p.hostname)
 	}
+	req = req.WithContext(httptrace.WithClientTrace(req.Context(), p.source.trace()))
 
 	resp, err := p.client.Do(req)
 	if err != nil {

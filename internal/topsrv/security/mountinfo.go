@@ -14,6 +14,10 @@ import (
 // touched.
 var errRemoteFS = errors.New("on a remote or automount filesystem")
 
+// errPseudoFS: a user path leads into proc, sysfs or the like, where a read
+// may block or consume what others need (/proc/kmsg, trace_pipe).
+var errPseudoFS = errors.New("on a pseudo filesystem")
+
 // mountinfoLimit caps /proc/self/mountinfo; a k8s node has a few thousand
 // lines of about 200 bytes.
 const mountinfoLimit = 4 << 20
@@ -93,9 +97,12 @@ func unescapeOctal(s string) (string, error) {
 
 // isRemote reports whether path lies on a network or automount filesystem:
 // touching such a path may hang or mount it, so the caller must skip it
-// before any syscall on the path. The longest mount point that contains the
-// path wins.
-func (m mounts) isRemote(path string) bool {
+// before any syscall on the path.
+func (m mounts) isRemote(path string) bool { return isRemoteFS(m.fsTypeOf(path)) }
+
+// fsTypeOf is the filesystem type of the longest mount point that contains
+// path; "" when no mount of the table does.
+func (m mounts) fsTypeOf(path string) string {
 	path = filepath.Clean(path)
 	best, fsType := -1, ""
 	for _, mt := range m {
@@ -104,26 +111,38 @@ func (m mounts) isRemote(path string) bool {
 		}
 		best, fsType = len(mt.point), mt.fsType
 	}
-	return isRemoteFS(fsType)
+	return fsType
 }
 
-// remoteOnly keeps what isRemote needs: the remote mounts and the mounts
-// under them, which may bring a path back to a local filesystem. On a host
-// without remote mounts — most of them — it is empty, and a check is free.
-func (m mounts) remoteOnly() mounts {
-	var remote []string
+// riskyOnly keeps what the checks need: remote and pseudo mounts and the
+// mounts under them, which may bring a path back to a local filesystem. A
+// host has a few pseudo mounts and rarely a remote one, so a check is cheap.
+func (m mounts) riskyOnly() mounts {
+	var risky []string
 	for _, mt := range m {
-		if isRemoteFS(mt.fsType) {
-			remote = append(remote, mt.point)
+		if isRemoteFS(mt.fsType) || isPseudoFS(mt.fsType) {
+			risky = append(risky, mt.point)
 		}
 	}
 	var out mounts
 	for _, mt := range m {
-		if slices.ContainsFunc(remote, func(point string) bool { return underMount(mt.point, point) }) {
+		if slices.ContainsFunc(risky, func(point string) bool { return underMount(mt.point, point) }) {
 			out = append(out, mt)
 		}
 	}
 	return out
+}
+
+// isPseudoFS: kernel filesystems whose files are not data — reading one may
+// block, consume events or act (/proc/kmsg, tracefs trace_pipe). System
+// paths are read there on purpose; a user path never leads there.
+func isPseudoFS(fsType string) bool {
+	switch fsType {
+	case "proc", "sysfs", "debugfs", "tracefs", "securityfs", "configfs", "devtmpfs", "devpts", "cgroup", "cgroup2",
+		"pstore", "bpf", "efivarfs", "fusectl", "mqueue", "hugetlbfs", "binfmt_misc", "rpc_pipefs", "nsfs", "selinuxfs", "nfsd":
+		return true
+	}
+	return false
 }
 
 func underMount(path, point string) bool {

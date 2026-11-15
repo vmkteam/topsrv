@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"debug/elf"
 	"encoding/hex"
+	"errors"
+	"io/fs"
 	"os"
 	"slices"
 	"strconv"
@@ -173,7 +175,7 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 	gaps.add("/proc", err)
 	hostMnt, _ := sc.readlink("/proc/1/ns/mnt")
 	for _, p := range procs {
-		if p.name != "sshd" {
+		if p.name != "sshd" || !trustedListener(sc, p) {
 			continue
 		}
 		if mnt, err := sc.readlink("/proc/" + p.pid + "/ns/mnt"); err == nil && hostMnt != "" && mnt != hostMnt {
@@ -191,6 +193,25 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 		return sshdconf.ParseFlags(args), l
 	}
 	return sshdconf.ParseFlags(sshdUnitArgs(sc)), sshdListener{}
+}
+
+// trustedListener: a process named sshd that runs as root from a binary
+// only root can change. Any user can start ~/bin/sshd -f ~/evil, whose -f
+// and Include would otherwise make the agent read files of its choosing.
+func trustedListener(sc *scanCtx, p process) bool {
+	proc, err := sc.stat("/proc/" + p.pid)
+	if err != nil {
+		return false
+	}
+	if uid, _ := fileOwner(proc); uid != sc.trustedUID || p.exe == "" {
+		return false
+	}
+	exe, err := sc.stat(p.exe)
+	if err != nil {
+		return false
+	}
+	uid, _ := fileOwner(exe)
+	return uid == sc.trustedUID && exe.Mode().Perm()&0o022 == 0
 }
 
 // sshdUnitArgs reads the sshd arguments from the service unit (with its
@@ -240,11 +261,13 @@ func unitLines(sc *scanCtx, unit string) []string {
 	if out == nil {
 		return nil
 	}
-	dropins, _ := sc.readDir("/etc/systemd/system/" + unit + ".d")
-	for _, e := range dropins {
-		if strings.HasSuffix(e.Name(), ".conf") {
-			if b, err := sc.read("/etc/systemd/system/"+unit+".d/"+e.Name(), smallFileLimit); err == nil {
-				out = append(out, strings.Split(string(b), "\n")...)
+	for _, dir := range slices.Backward(unitDirs) { // the lowest precedence first: /etc is read last and wins
+		dropins, _ := sc.readDir(dir + "/" + unit + ".d")
+		for _, e := range dropins {
+			if strings.HasSuffix(e.Name(), ".conf") {
+				if b, err := sc.read(dir+"/"+unit+".d/"+e.Name(), smallFileLimit); err == nil {
+					out = append(out, strings.Split(string(b), "\n")...)
+				}
 			}
 		}
 	}
@@ -315,21 +338,26 @@ func processStart(sc *scanCtx, pid string) *time.Time {
 // import (ELF DT_NEEDED): Alpine ships openssh-server without PAM, the -pam
 // variant with it. Only the dynamic section is read, not the binary.
 func sshdPAMCompiled(sc *scanCtx) *bool {
-	var found, read bool
+	var read, unreadable bool
 	for _, bin := range sshdBinaries {
 		libs, err := importedLibraries(sc, bin)
-		if err != nil {
+		switch {
+		case errors.Is(err, fs.ErrNotExist):
+			continue
+		case err != nil:
+			unreadable = true // PAM may be just there: not "no"
 			continue
 		}
 		read = true
 		if slices.ContainsFunc(libs, func(l string) bool { return strings.HasPrefix(l, "libpam.so") }) {
-			found = true
-			break
+			found := true
+			return &found
 		}
 	}
-	if !read {
+	if !read || unreadable {
 		return nil
 	}
+	found := false
 	return &found
 }
 
@@ -394,9 +422,13 @@ func sshdMatches(blocks []*sshdconf.MatchBlock) []sshdMatch {
 	return out
 }
 
+// maxLineRefs caps a list of refused or unknown lines: a large file of junk
+// would otherwise fill the snapshot past what the receiving side accepts.
+const maxLineRefs = 100
+
 func lineRefs(refs []sshdconf.Ref) []lineRef {
-	out := make([]lineRef, 0, len(refs))
-	for _, r := range refs {
+	out := make([]lineRef, 0, min(len(refs), maxLineRefs))
+	for _, r := range refs[:min(len(refs), maxLineRefs)] {
 		out = append(out, lineRef(r))
 	}
 	return out

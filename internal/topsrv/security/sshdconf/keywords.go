@@ -62,8 +62,9 @@ func buildKeywords() map[string]keyword {
 		"ClientAliveCountMax", "AuthorizedKeysCommandUser", "AuthorizedPrincipalsCommandUser",
 		"AuthorizedPrincipalsFile", "TrustedUserCAKeys", "RevokedKeys", "ChrootDirectory",
 		"X11DisplayOffset", "StreamLocalBindMask", "PubkeyAcceptedAlgorithms",
-		"HostbasedAcceptedAlgorithms", "CASignatureAlgorithms", "PubkeyAuthOptions", "RDomain",
+		"HostbasedAcceptedAlgorithms", "CASignatureAlgorithms", "RDomain",
 		"RequiredRSASize", "UnusedConnectionTimeout")
+	add(firstLine, no, no, "PubkeyAuthOptions") // several flags: touch-required verify-required
 	// other scalars, global only
 	add(scalar, no, yes, "PermitUserEnvironment", "LoginGraceTime", "MaxStartups", "PerSourceMaxStartups",
 		"PerSourceNetBlockSize", "PerSourcePenaltyExemptList", "Ciphers", "MACs", "KexAlgorithms",

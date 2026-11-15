@@ -21,8 +21,10 @@ type nssConfig struct {
 	ExternalIdentities bool `json:"externalIdentities"`
 }
 
-// externalNSS are the sources that serve identities from a directory.
-var externalNSS = []string{"sss", "ldap", "winbind", "nis", "nisplus", "hesiod"}
+// externalNSS are the sources that serve identities the agent does not read:
+// directories, and files other than /etc ones (altfiles: /usr/lib/passwd on
+// Fedora CoreOS; extrausers: /var/lib/extrausers on Ubuntu Core).
+var externalNSS = []string{"sss", "ldap", "winbind", "nis", "nisplus", "hesiod", "altfiles", "extrausers"}
 
 // nssSource is the shape of a service name; anything else is sent as
 // "invalid".

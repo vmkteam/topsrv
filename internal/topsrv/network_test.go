@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"fmt"
+	"net/netip"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -91,13 +92,28 @@ func TestIfaceAddresses(t *testing.T) {
 		{Addr: "203.0.113.7/32"},
 		{Addr: "169.254.10.1/16"},
 		{Addr: "2001:db8::5/64"},
-	})
-	assert.Equal(t, []string{"10.0.0.5/24", "203.0.113.7/32", "2001:db8::5/64"}, got, "every address, link-local left out")
-	assert.Equal(t, []string{""}, ifaceAddresses(nil), "no addresses: one series with an empty address")
+		{Addr: "2001:db8::abcd:1/64"}, // a privacy address
+	}, map[netip.Addr]bool{netip.MustParseAddr("2001:db8::abcd:1"): true})
+	assert.Equal(t, []string{"10.0.0.5/24", "203.0.113.7/32", "2001:db8::5/64"}, got, "every address, link-local and temporary left out")
+	assert.Equal(t, []string{""}, ifaceAddresses(nil, nil), "no addresses: one series with an empty address")
 
 	ipvs := make([]net.InterfaceAddr, 0, 500) // kube-ipvs0: a ClusterIP per Service
 	for i := range 500 {
 		ipvs = append(ipvs, net.InterfaceAddr{Addr: fmt.Sprintf("10.96.%d.%d/32", i/256, i%256)})
 	}
-	assert.Len(t, ifaceAddresses(ipvs), maxIfaceAddrs)
+	assert.Len(t, ifaceAddresses(ipvs, nil), maxIfaceAddrs)
+}
+
+func TestParseIfInet6(t *testing.T) {
+	got := parseIfInet6([]byte(`20010db8000000000000000000000005 02 40 00 80     eth0
+20010db800000000000000000000abcd 02 40 00 01     eth0
+20010db800000000000000000000beef 02 40 00 20     eth0
+fe800000000000000000000000000001 02 40 20 80     eth0
+garbage
+`))
+
+	assert.Equal(t, map[netip.Addr]bool{
+		netip.MustParseAddr("2001:db8::abcd"): true, // temporary
+		netip.MustParseAddr("2001:db8::beef"): true, // deprecated
+	}, got)
 }

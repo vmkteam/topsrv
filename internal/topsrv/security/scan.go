@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"io/fs"
 	"os"
 	"path"
@@ -31,9 +32,12 @@ type scanCtx struct {
 	timeSync func() (*timeSync, error)
 	key      tokenKey  // for tokens of secrets, see hmac.go
 	now      time.Time // start of the pass; zero in tests means the clock
+	// trustedUID owns what only root may own (the sshd listener and its
+	// binary): 0; a fixture sets the test user.
+	trustedUID int64
 
 	mountsOnce sync.Once
-	mounts     mounts // remote mounts only, see remoteOnly
+	mounts     mounts // remote and pseudo mounts only, see riskyOnly
 	mountsErr  error
 
 	procsOnce sync.Once
@@ -76,7 +80,7 @@ func (sc *scanCtx) readDir(path string) ([]os.DirEntry, error) {
 	if err := sc.local(path); err != nil {
 		return nil, err
 	}
-	return readDir(sc.root+path, false)
+	return readDir(sc.root + path)
 }
 
 func (sc *scanCtx) readlink(path string) (string, error) {
@@ -112,25 +116,57 @@ func (sc *scanCtx) glob(pattern string) bool {
 }
 
 // The user accessors are for paths other users control (home directories):
-// a symlink at the last component is refused, and without a readable mount
-// table nothing is touched.
+// no symlink is followed, a path on a pseudo filesystem is refused like a
+// remote one, and without a readable mount table nothing is touched.
 
-func (sc *scanCtx) readUser(path string, limit int64) ([]byte, error) {
-	if err := sc.localStrict(path); err != nil {
-		return nil, err
+// readUser reads a regular file at a path without symlinks (resolveUser's),
+// opened component by component so that a directory swapped for a link in
+// the meantime fails the open; never more than its size, so a file that
+// streams (a pseudo file reports 0) cannot hang the read.
+func (sc *scanCtx) readUser(path string, limit int64) ([]byte, fs.FileInfo, error) {
+	if err := sc.localStrict(path, false); err != nil {
+		return nil, nil, err
 	}
-	return readFileNoFollow(sc.root+path, limit)
+	f, err := openNoSymlinks(sc.root, path, false)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return nil, nil, err
+	}
+	if fi.Size() > limit {
+		return nil, nil, &fs.PathError{Op: "read", Path: path, Err: errTooLarge}
+	}
+	b, err := io.ReadAll(io.LimitReader(f, fi.Size()))
+	return b, fi, err
 }
 
-func (sc *scanCtx) readDirUser(path string) ([]os.DirEntry, error) {
-	if err := sc.localStrict(path); err != nil {
+// readDirUser lists a user directory: resolved first, then opened without
+// following a link, so a glob in a home cannot be led into autofs.
+func (sc *scanCtx) readDirUser(dir string) ([]os.DirEntry, error) {
+	resolved, err := sc.resolveUser(dir)
+	if err != nil {
 		return nil, err
 	}
-	return readDir(sc.root+path, true)
+	if err = sc.localStrict(resolved, false); err != nil {
+		return nil, err
+	}
+	f, err := openNoSymlinks(sc.root, resolved, true)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
 }
 
+// lstatUser may look at a pseudo filesystem: an lstat neither blocks nor
+// consumes (/dev is the home of "sys"); reading there is what is refused.
 func (sc *scanCtx) lstatUser(path string) (os.FileInfo, error) {
-	if err := sc.localStrict(path); err != nil {
+	if err := sc.localStrict(path, true); err != nil {
 		return nil, err
 	}
 	return os.Lstat(sc.root + path)
@@ -190,19 +226,27 @@ func (sc *scanCtx) local(path string) error {
 	return nil
 }
 
-// localStrict is local for user paths: without the mount table a home
-// directory may be on autofs, so it is not touched.
-func (sc *scanCtx) localStrict(path string) error {
-	if _, err := sc.mountTable(); err != nil {
+// localStrict is local for user paths: a pseudo filesystem is refused too,
+// unless only stat is allowed, and without the mount table a home directory
+// may be on autofs, so it is not touched.
+func (sc *scanCtx) localStrict(path string, statOnly bool) error {
+	m, err := sc.mountTable()
+	if err != nil {
 		return err
 	}
-	return sc.local(path)
+	switch t := m.fsTypeOf(path); {
+	case isRemoteFS(t):
+		return &fs.PathError{Op: opOpen, Path: path, Err: errRemoteFS}
+	case isPseudoFS(t) && !statOnly:
+		return &fs.PathError{Op: opOpen, Path: path, Err: errPseudoFS}
+	}
+	return nil
 }
 
 func (sc *scanCtx) mountTable() (mounts, error) {
 	sc.mountsOnce.Do(func() {
 		m, err := loadMounts(sc.root)
-		sc.mounts, sc.mountsErr = m.remoteOnly(), err
+		sc.mounts, sc.mountsErr = m.riskyOnly(), err
 	})
 	return sc.mounts, sc.mountsErr
 }

@@ -7,6 +7,7 @@ package sudoers
 import (
 	"errors"
 	"io/fs"
+	"maps"
 	"path"
 	"regexp"
 	"slices"
@@ -18,6 +19,7 @@ import (
 const (
 	maxDepth = 128 // sudo's own include depth
 	maxFiles = 512
+	maxRules = 500 // the receiving side caps a snapshot at 1 MB
 )
 
 // Codes of Ref.Code.
@@ -38,10 +40,12 @@ type Files struct {
 // Policy is the parsed policy.
 type Policy struct {
 	// Rules in file order: sudo applies the last match, so order matters.
-	Rules    []Rule
-	Defaults Defaults
-	Scoped   []ScopedDefault
-	Files    []string
+	Rules []Rule
+	// Truncated: more than maxRules rules; the ones after are not listed.
+	Truncated bool
+	Defaults  Defaults
+	Scoped    []ScopedDefault
+	Files     []string
 	// Ignored are includedir entries sudo skips: names with a "." or
 	// ending in "~" (sudoers.d/admin.conf is never read).
 	Ignored    []string
@@ -85,8 +89,10 @@ type Defaults struct {
 // ScopedDefault is a Defaults line bound to users, hosts, commands or runas
 // users that sets a tracked flag.
 type ScopedDefault struct {
-	Source         string
-	Binding        string // user, host, command, runas
+	Source  string
+	Binding string // user, host, command, runas
+	// List is the binding, aliases expanded; nil for a command binding:
+	// commands are never sent.
 	List           []string
 	NoAuthenticate bool
 	RootPW         bool
@@ -125,6 +131,9 @@ var aliasName = regexp.MustCompile(`^[A-Z][A-Z0-9_]*$`)
 // lists are told apart by whitespace.
 var commaSpace = regexp.MustCompile(`\s*,\s*`)
 
+// defaultsBinding is the blank sudo allows after the binding character.
+var defaultsBinding = regexp.MustCompile(`^(Defaults[:@!>])\s+`)
+
 // cutSpace cuts s at its first space or tab.
 func cutSpace(s string) (before, after string) {
 	if i := strings.IndexAny(s, " \t"); i >= 0 {
@@ -133,11 +142,20 @@ func cutSpace(s string) (before, after string) {
 	return s, ""
 }
 
+// Alias kinds, and the Defaults bindings that share their names.
+const (
+	kindUser    = "user"
+	kindHost    = "host"
+	kindRunas   = "runas"
+	kindCmnd    = "cmnd"
+	bindCommand = "command"
+)
+
 // aliasKinds by keyword.
-var aliasKinds = map[string]string{"User_Alias": "user", "Runas_Alias": "runas", "Host_Alias": "host", "Cmnd_Alias": "cmnd", "Cmd_Alias": "cmnd"}
+var aliasKinds = map[string]string{"User_Alias": kindUser, "Runas_Alias": kindRunas, "Host_Alias": kindHost, "Cmnd_Alias": kindCmnd, "Cmd_Alias": kindCmnd}
 
 type rawRule struct {
-	source       string
+	ref          Ref
 	users, hosts []string
 	cmnds        string
 }
@@ -148,6 +166,8 @@ type parser struct {
 	policy   *Policy
 	aliases  map[string]map[string][]string // kind → name → members
 	expanded map[string][]string            // kind + name → members, aliases expanded
+	scoped   []ScopedDefault                // aliases expanded at the end
+	envLD    map[string]bool                // the LD_* names the global env_keep keeps
 	raw      []rawRule
 	stack    []string
 }
@@ -158,7 +178,20 @@ func Parse(main, hostname string, files Files) *Policy {
 	p := &parser{files: files, hostname: hostname, policy: &Policy{}, aliases: map[string]map[string][]string{}, expanded: map[string][]string{}}
 	p.parseFile(main, 0, false)
 	for _, r := range p.raw {
+		if len(p.policy.Rules) == maxRules {
+			p.policy.Truncated = true
+			break
+		}
 		p.policy.Rules = append(p.policy.Rules, p.expand(r))
+	}
+	bindingKinds := map[string]string{kindUser: kindUser, kindHost: kindHost, kindRunas: kindRunas}
+	for _, sd := range p.scoped {
+		if kind, ok := bindingKinds[sd.Binding]; ok {
+			sd.List = p.resolve(kind, sd.List, 0)
+		} else {
+			sd.List = nil // a command binding: commands are never sent
+		}
+		p.policy.Scoped = append(p.policy.Scoped, sd)
 	}
 	return p.policy
 }
@@ -205,6 +238,9 @@ func logicalLines(b []byte) []line {
 	)
 	for i, l := range strings.Split(string(b), "\n") {
 		l = strings.TrimRight(l, "\r")
+		if _, _, isDirective := directive(strings.TrimSpace(l)); !isDirective {
+			l = strings.TrimRight(stripComment(l), " \t") // a comment ends at the newline, a "\\" in it continues nothing
+		}
 		if cur.Len() == 0 {
 			start = i + 1
 		}
@@ -271,7 +307,10 @@ func (p *parser) include(file, dir, arg string, depth int, ref Ref) {
 	}
 	names, err := p.files.ReadDir(target)
 	if err != nil {
-		return // a missing includedir is not an error
+		if !errors.Is(err, fs.ErrNotExist) { // a missing includedir is not an error, an unreadable one is
+			p.policy.ReadErrors = append(p.policy.ReadErrors, ReadError{Path: target, Err: err})
+		}
+		return
 	}
 	slices.Sort(names)
 	for _, n := range names {
@@ -379,22 +418,47 @@ func (p *parser) userSpec(s string, ref Ref) {
 		return
 	}
 	left, cmnds, _ := strings.Cut(specs[0], "=")
-	fields := strings.Fields(commaSpace.ReplaceAllString(strings.TrimSpace(left), ","))
+	fields := splitFields(commaSpace.ReplaceAllString(strings.TrimSpace(left), ","))
 	if len(fields) != 2 {
 		p.syntaxError(ref)
 		return
 	}
-	users := list(fields[0])
-	source := ref.Source()
-	p.raw = append(p.raw, rawRule{source: source, users: users, hosts: list(fields[1]), cmnds: cmnds})
+	users := names(list(fields[0]))
+	p.raw = append(p.raw, rawRule{ref: ref, users: users, hosts: names(list(fields[1])), cmnds: cmnds})
 	for _, spec := range specs[1:] {
 		hosts, cmnds, ok := strings.Cut(spec, "=")
 		if !ok {
 			p.syntaxError(ref)
 			continue
 		}
-		p.raw = append(p.raw, rawRule{source: source, users: users, hosts: list(hosts), cmnds: cmnds})
+		p.raw = append(p.raw, rawRule{ref: ref, users: users, hosts: names(list(hosts)), cmnds: cmnds})
 	}
+}
+
+// splitFields splits at whitespace outside quotes and not escaped:
+// "%domain\\ admins ALL" has two fields.
+func splitFields(s string) []string {
+	var out []string
+	for _, f := range splitTop(s, func(i int) bool { return s[i] == ' ' || s[i] == '\t' }) {
+		if f != "" {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// names unquotes and unescapes user and host names: "%domain admins",
+// %domain\\ admins.
+func names(items []string) []string {
+	for i, it := range items {
+		if len(it) >= 2 && it[0] == '"' && it[len(it)-1] == '"' {
+			it = it[1 : len(it)-1]
+		} else if strings.HasPrefix(it, "!\"") && strings.HasSuffix(it, "\"") && len(it) >= 3 {
+			it = "!" + it[2:len(it)-1]
+		}
+		items[i] = strings.NewReplacer(`\ `, " ", `\,`, ",", `\:`, ":", `\=`, "=", `\\`, `\`).Replace(it)
+	}
+	return items
 }
 
 // hostSpecs splits a user spec at the ":" that start another host list: not
@@ -407,6 +471,7 @@ func hostSpecs(s string) []string {
 }
 
 func tagOrDigestBefore(s string) bool {
+	s = strings.TrimRight(s, " \t") // sudo allows "NOPASSWD :"
 	i := len(s)
 	for i > 0 && (s[i-1] >= 'A' && s[i-1] <= 'Z' || s[i-1] >= 'a' && s[i-1] <= 'z' || s[i-1] >= '0' && s[i-1] <= '9' || s[i-1] == '_') {
 		i--
@@ -416,10 +481,12 @@ func tagOrDigestBefore(s string) bool {
 }
 
 func (p *parser) defaults(s string, ref Ref) {
+	s = defaultsBinding.ReplaceAllString(s, "$1") // "Defaults: alice" is "Defaults:alice"
+	s = commaSpace.ReplaceAllString(s, ",")       // "Defaults:alice, bob"
 	head, rest := cutSpace(s)
 	binding, bound := "", []string(nil)
 	if len(head) > len("Defaults") {
-		binding = map[byte]string{':': "user", '@': "host", '!': "command", '>': "runas"}[head[len("Defaults")]]
+		binding = map[byte]string{':': kindUser, '@': kindHost, '!': bindCommand, '>': kindRunas}[head[len("Defaults")]]
 		if binding == "" {
 			p.syntaxError(ref)
 			return
@@ -432,7 +499,7 @@ func (p *parser) defaults(s string, ref Ref) {
 		tracked = p.defaultParam(&sd, param) || tracked
 	}
 	if binding != "" && tracked {
-		p.policy.Scoped = append(p.policy.Scoped, sd)
+		p.scoped = append(p.scoped, sd)
 	}
 }
 
@@ -465,18 +532,28 @@ func (p *parser) defaultParam(sd *ScopedDefault, param string) bool {
 			p.policy.Defaults.UsePTY = &on
 		}
 	case "env_keep":
-		ld := strings.Contains(strings.Trim(strings.TrimSpace(value), `"`), "LD_")
-		switch {
-		case op == "-" && ld:
-			ld = false
-		case op == "+" && !ld:
-			ld = p.policy.Defaults.EnvKeepLD
+		set := maps.Clone(p.envLD) // a bound line applies on top of the global list
+		if op == "" {
+			set = map[string]bool{}
 		}
-		sd.EnvKeepLD = ld
+		for name := range strings.FieldsSeq(strings.Trim(strings.TrimSpace(value), `"`)) {
+			if !strings.HasPrefix(name, "LD_") {
+				continue
+			}
+			if op == "-" {
+				delete(set, name)
+			} else {
+				if set == nil {
+					set = map[string]bool{}
+				}
+				set[name] = true
+			}
+		}
+		sd.EnvKeepLD = len(set) > 0
 		if global {
-			p.policy.Defaults.EnvKeepLD = ld
+			p.envLD, p.policy.Defaults.EnvKeepLD = set, len(set) > 0
 		}
-		return ld
+		return len(set) > 0
 	}
 	return false
 }
@@ -489,20 +566,24 @@ func (p *parser) syntaxError(ref Ref) {
 // expand resolves the aliases of a rule and reads its command list for
 // flags. Tags and runas carry over to the following commands, as in sudo.
 func (p *parser) expand(r rawRule) Rule {
-	rule := Rule{Source: r.source, Principals: p.resolve("user", r.users, 0)}
-	rule.HostsAll = slices.Contains(p.resolve("host", r.hosts, 0), "ALL")
-	nopass, setenv := false, false
+	rule := Rule{Source: r.ref.Source(), Principals: p.resolve(kindUser, r.users, 0)}
+	rule.HostsAll = slices.Contains(p.resolve(kindHost, r.hosts, 0), "ALL")
+	nopass := false
+	setenv := 0 // the SETENV tag: 1 set, -1 NOSETENV, 0 neither
 	commands, nopassCount := 0, 0
+	defaultRunas := false // a command before any runas spec runs as runas_default
 	for _, item := range list(r.cmnds) {
 		s := strings.TrimSpace(item)
 		if strings.HasPrefix(s, "(") {
 			end := strings.IndexByte(s, ')')
 			if end < 0 {
+				p.syntaxError(r.ref)
 				break
 			}
 			rule.Runas = p.runas(rule.Runas, s[1:end])
 			s = strings.TrimSpace(s[end+1:])
 		}
+		defaultRunas = defaultRunas || rule.Runas == nil
 		for loc := commandOption.FindStringIndex(s); loc != nil; loc = commandOption.FindStringIndex(s) {
 			s = s[loc[1]:]
 		}
@@ -517,9 +598,9 @@ func (p *parser) expand(r rawRule) Rule {
 			case "PASSWD":
 				nopass = false
 			case "SETENV":
-				setenv = true
+				setenv = 1
 			case "NOSETENV":
-				setenv = false
+				setenv = -1
 			}
 			s = strings.TrimSpace(rest)
 		}
@@ -531,29 +612,39 @@ func (p *parser) expand(r rawRule) Rule {
 		if d, _, ok := strings.Cut(name, ":"); ok && slices.Contains(digests, d) && len(f) > 1 {
 			name = f[1] // "sha256:… /bin/ls"
 		}
-		all := slices.Contains(p.resolve("cmnd", []string{name}, 0), "ALL")
+		all := slices.Contains(p.resolve(kindCmnd, []string{name}, 0), "ALL")
 		commands++
 		if nopass {
 			nopassCount++
 		}
 		rule.CommandsAll = rule.CommandsAll || all
-		rule.Setenv = rule.Setenv || setenv || all
+		rule.Setenv = rule.Setenv || setenv == 1 || all && setenv == 0 // ALL implies SETENV unless NOSETENV says no
 	}
 	rule.NopasswdAny = nopassCount > 0
 	rule.NopasswdAll = commands > 0 && nopassCount == commands
+	if rule.Runas != nil && defaultRunas && !slices.Contains(rule.Runas.Users, "root") {
+		rule.Runas.Users = append(rule.Runas.Users, "root") // "ALL, (postgres) psql": ALL runs as root
+		slices.Sort(rule.Runas.Users)
+	}
 	return rule
 }
 
 func (p *parser) runas(prev *Runas, spec string) *Runas {
 	users, groups, _ := strings.Cut(spec, ":")
-	r := &Runas{Users: p.resolve("runas", list(users), 0), Groups: append([]string{}, list(groups)...)}
+	r := &Runas{Users: p.resolve(kindRunas, list(users), 0), Groups: p.resolve(kindRunas, list(groups), 0)}
 	for _, x := range slices.Concat(r.Users, r.Groups) {
 		r.HasNegation = r.HasNegation || strings.HasPrefix(x, "!")
 	}
 	if prev != nil {
-		r.Users = slices.Compact(slices.Sorted(slices.Values(append(prev.Users, r.Users...))))
-		r.Groups = slices.Compact(slices.Sorted(slices.Values(append(prev.Groups, r.Groups...))))
+		r.Users = append(slices.Compact(slices.Sorted(slices.Values(append(prev.Users, r.Users...)))), []string{}...)
+		r.Groups = append(slices.Compact(slices.Sorted(slices.Values(append(prev.Groups, r.Groups...)))), []string{}...)
 		r.HasNegation = r.HasNegation || prev.HasNegation
+	}
+	if r.Users == nil {
+		r.Users = []string{}
+	}
+	if r.Groups == nil {
+		r.Groups = []string{}
 	}
 	return r
 }

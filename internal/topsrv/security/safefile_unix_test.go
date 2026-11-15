@@ -102,7 +102,7 @@ func TestReadDirSpecialFiles(t *testing.T) {
 
 		done := make(chan error, 1)
 		go func() {
-			_, err := readDir(fifo, false)
+			_, err := readDir(fifo)
 			done <- err
 		}()
 		select {
@@ -114,19 +114,18 @@ func TestReadDirSpecialFiles(t *testing.T) {
 		}
 	})
 
-	t.Run("a symlink to a directory: followed by default, refused with noFollow", func(t *testing.T) {
+	t.Run("a symlink to a directory: followed by readDir, refused by openNoSymlinks", func(t *testing.T) {
 		dir := t.TempDir()
 		target := filepath.Join(dir, "target")
 		require.NoError(t, os.Mkdir(target, 0o700))
 		require.NoError(t, os.WriteFile(filepath.Join(target, "f"), nil, 0o600))
-		link := filepath.Join(dir, "link")
-		require.NoError(t, os.Symlink(target, link))
+		require.NoError(t, os.Symlink(target, filepath.Join(dir, "link")))
 
-		entries, err := readDir(link, false)
+		entries, err := readDir(filepath.Join(dir, "link"))
 		require.NoError(t, err)
 		require.Len(t, entries, 1)
 
-		_, err = readDir(link, true)
+		_, err = openNoSymlinks(dir, "/link", true)
 		require.Error(t, err)
 		assert.Equal(t, ReasonNotRegular, reasonOf(err))
 	})

@@ -1,9 +1,12 @@
 package sshdconf
 
 import (
+	"errors"
+	"io/fs"
 	"path"
 	"slices"
 	"strings"
+	"syscall"
 )
 
 // Match reports whether name matches a glob(3) pattern: "*" any run, "?"
@@ -105,9 +108,10 @@ func HasMeta(s string) bool { return strings.ContainsAny(s, `*?[\`) }
 // Glob expands an absolute pattern component by component, listing with
 // readDir only the directories a pattern component needs. The result is
 // sorted bytewise, as glob(3) sorts; a literal pattern comes back as it is,
-// and whether it exists is up to the reader.
-func Glob(pattern string, readDir func(dir string) ([]string, error)) []string {
-	matches := []string{"/"}
+// and whether it exists is up to the reader. A directory that exists but
+// cannot be listed is returned in errs: its matches are unknown, not none.
+func Glob(pattern string, readDir func(dir string) ([]string, error)) (matches []string, errs []ReadError) {
+	matches = []string{"/"}
 	for comp := range strings.SplitSeq(strings.Trim(path.Clean(pattern), "/"), "/") {
 		var next []string
 		for _, dir := range matches {
@@ -117,6 +121,9 @@ func Glob(pattern string, readDir func(dir string) ([]string, error)) []string {
 			}
 			names, err := readDir(dir)
 			if err != nil {
+				if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, syscall.ENOTDIR) {
+					errs = append(errs, ReadError{Path: dir, Err: err})
+				}
 				continue
 			}
 			for _, name := range names {
@@ -128,5 +135,5 @@ func Glob(pattern string, readDir func(dir string) ([]string, error)) []string {
 		matches = next
 	}
 	slices.Sort(matches)
-	return matches
+	return matches, errs
 }

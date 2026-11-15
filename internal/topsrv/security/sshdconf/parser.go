@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io/fs"
 	"path"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -180,7 +181,9 @@ func (p *parser) include(args []string, depth int, cur *MatchBlock, ref Ref) {
 			arg = path.Join(sshDir, arg)
 		}
 		literal := !HasMeta(arg)
-		for _, name := range Glob(arg, p.files.ReadDir) {
+		names, errs := Glob(arg, p.files.ReadDir)
+		p.cfg.ReadErrors = append(p.cfg.ReadErrors, errs...) // drop-ins unknown: RHEL keeps sshd_config.d at 0700
+		for _, name := range names {
 			p.parseFile(name, depth+1, cur, literal)
 		}
 	}
@@ -194,6 +197,10 @@ func (p *parser) match(args []string, cur *MatchBlock, ref Ref) *MatchBlock {
 	}
 	if len(args) == 1 && strings.EqualFold(args[0], "all") {
 		return nil
+	}
+	if len(args)%2 == 1 || slices.ContainsFunc(args, func(a string) bool { return strings.EqualFold(a, "all") }) {
+		p.fail(ref, CodeBadMatch) // sshd wants criterion-value pairs; All stands alone
+		return cur
 	}
 	b := &MatchBlock{Criteria: args, Source: ref.Source(), Keys: map[string]Value{}}
 	p.cfg.MatchBlocks = append(p.cfg.MatchBlocks, b)
@@ -260,15 +267,16 @@ func normalizeEnum(name, v string) string {
 	return v
 }
 
-// keywordCode is an unknown keyword as it may be sent: only what looks like a
-// keyword, anything else could be text that does not belong in a report.
+// keywordCode is an unknown keyword as it may be sent: only what looks like
+// a distribution keyword — CamelCase letters, DebianBanner, GSSAPIKeyExchange.
+// Anything else, digits included, could be the first word of a file that was
+// never a config (a key, a token) and is sent as "invalid".
 func keywordCode(kw string) string {
-	if len(kw) == 0 || len(kw) > 40 {
+	if len(kw) == 0 || len(kw) > 40 || kw[0] < 'A' || kw[0] > 'Z' || strings.ToUpper(kw) == kw {
 		return "invalid"
 	}
-	for i, c := range kw {
-		letter := c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z'
-		if !letter && (i == 0 || c < '0' || c > '9') {
+	for _, c := range kw {
+		if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') {
 			return "invalid"
 		}
 	}

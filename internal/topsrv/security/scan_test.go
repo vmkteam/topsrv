@@ -423,7 +423,7 @@ func TestScanCtxRemoteFS(t *testing.T) {
 
 		_, err := sc.read("/home/alice/key", 64)
 		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
-		_, err = sc.readUser("/home/alice/key", 64)
+		_, _, err = sc.readUser("/home/alice/key", 64)
 		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
 		_, err = sc.readDirUser("/home/alice/.ssh/dir")
 		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
@@ -435,7 +435,7 @@ func TestScanCtxRemoteFS(t *testing.T) {
 	t.Run("a local mount under autofs is read", func(t *testing.T) {
 		sc := fixture(t, files)
 
-		b, err := sc.readUser("/home/local/bob/key", 64)
+		b, _, err := sc.readUser("/home/local/bob/key", 64)
 		require.NoError(t, err)
 		assert.Equal(t, "ok", string(b))
 	})
@@ -447,21 +447,21 @@ func TestScanCtxRemoteFS(t *testing.T) {
 
 		_, err := sc.read("/etc/ssh/sshd_config", 64)
 		require.NoError(t, err)
-		_, err = sc.readUser("/home/local/bob/key", 64)
+		_, _, err = sc.readUser("/home/local/bob/key", 64)
 		assert.Equal(t, ReasonNotFound, reasonOf(err), "the missing mount table is the reason")
 	})
 
 	t.Run("readUser keeps the size limit", func(t *testing.T) {
 		sc := fixture(t, files)
 
-		_, err := sc.readUser("/home/local/bob/key", 1)
+		_, _, err := sc.readUser("/home/local/bob/key", 1)
 		assert.Equal(t, ReasonBudgetExceeded, reasonOf(err))
 	})
 
 	t.Run("readUser refuses a symlink", func(t *testing.T) {
 		sc := fixture(t, merge(files, map[string]string{"etc/link": "-> ssh/sshd_config"}))
 
-		_, err := sc.readUser("/etc/link", 64)
+		_, _, err := sc.readUser("/etc/link", 64)
 		assert.Equal(t, ReasonNotRegular, reasonOf(err))
 	})
 }

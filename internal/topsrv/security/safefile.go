@@ -65,14 +65,9 @@ func openFile(path string, noFollow bool) (*os.File, error) {
 
 // readDir lists a directory sorted by name, as os.ReadDir, without hanging
 // on what is not one: a plain open of a FIFO put in place of the directory
-// blocks until a writer comes. With noFollow a symlink at the last path
-// component is refused.
-func readDir(path string, noFollow bool) ([]os.DirEntry, error) {
-	flags := os.O_RDONLY | dirFlags
-	if noFollow {
-		flags |= oNoFollow
-	}
-	f, err := os.OpenFile(path, flags, 0)
+// blocks until a writer comes. (User directories go through openNoSymlinks.)
+func readDir(path string) ([]os.DirEntry, error) {
+	f, err := os.OpenFile(path, os.O_RDONLY|dirFlags, 0)
 	if err != nil {
 		return nil, err
 	}

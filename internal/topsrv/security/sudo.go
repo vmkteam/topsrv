@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"slices"
 	"strings"
 
@@ -23,7 +24,9 @@ const (
 type sudoData struct {
 	SudoPresent bool `json:"sudoPresent"`
 	// Rules in file order: sudo applies the last match.
-	Rules          []sudoRule   `json:"rules"`
+	Rules []sudoRule `json:"rules"`
+	// Truncated: more rules than listed (500).
+	Truncated      bool         `json:"truncated,omitempty"`
 	Defaults       sudoDefaults `json:"defaults"`
 	ScopedDefaults []sudoScoped `json:"scopedDefaults"`
 	Files          []fileMeta   `json:"files"`
@@ -84,7 +87,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	var gaps gapList
 	files := sudoers.Files{
 		ReadFile: func(p string) ([]byte, error) { return sc.read(p, sudoFileLimit) },
-		ReadDir:  sc.readDirNames,
+		ReadDir:  func(dir string) ([]string, error) { return fileNames(sc.readDir(dir)) }, // sudo skips subdirectories
 	}
 	pol := sudoers.Parse(pathSudoers, shortHostname(sc), files)
 	d := sudoData{SudoPresent: true}
@@ -102,7 +105,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	if !d.SudoPresent && doas == nil {
 		return absent(gaps) // doas.conf unreadable is not "no doas"
 	}
-	d.Rules = sudoRules(pol.Rules)
+	d.Rules, d.Truncated = sudoRules(pol.Rules), pol.Truncated
 	d.Defaults = sudoDefaults(pol.Defaults)
 	d.ScopedDefaults = sudoScopedOf(pol.Scoped)
 	d.IgnoredFiles = append([]string{}, pol.Ignored...)
@@ -145,6 +148,17 @@ func readDoas(sc *scanCtx, gaps *gapList) (rules []doasRule, files []string, err
 		errs = append(errs, sudoRefs(refs)...)
 	}
 	return rules, files, errs
+}
+
+// fileNames lists the entries of a directory that are not directories.
+func fileNames(entries []os.DirEntry, err error) ([]string, error) {
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		if !e.IsDir() {
+			names = append(names, e.Name())
+		}
+	}
+	return names, err
 }
 
 // shortHostname is the host name up to the first dot, for %h in include

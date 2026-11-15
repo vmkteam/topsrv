@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"context"
+	"encoding/hex"
 	"net/netip"
 	"os"
 	"path/filepath"
@@ -86,16 +87,54 @@ func (c *NetworkCollector) collectInterfaces(ch chan<- prometheus.Metric) {
 		c.Print(context.Background(), "network: Interfaces failed", "error", err)
 		return
 	}
+	transient := transientIPv6()
 	for _, iface := range ifaces {
 		operstate := "down"
 		if slices.Contains(iface.Flags, "up") {
 			operstate = "up"
 		}
-		for _, addr := range ifaceAddresses(iface.Addrs) {
+		for _, addr := range ifaceAddresses(iface.Addrs, transient) {
 			ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,
 				iface.Name, iface.HardwareAddr, addr, strconv.Itoa(iface.MTU), operstate)
 		}
 	}
+}
+
+// IPv6 address flags of /proc/net/if_inet6 (linux/if_addr.h): a privacy
+// address changes daily, a deprecated one lingers for days — a new series
+// each time.
+const (
+	ifaFTemporary  = 0x01
+	ifaFDeprecated = 0x20
+)
+
+// transientIPv6 lists the temporary and deprecated IPv6 addresses; nil off
+// Linux.
+func transientIPv6() map[netip.Addr]bool {
+	b, err := os.ReadFile("/proc/net/if_inet6")
+	if err != nil {
+		return nil
+	}
+	return parseIfInet6(b)
+}
+
+// parseIfInet6 reads "address ifindex prefixlen scope flags name" lines,
+// the address as 32 hex digits.
+func parseIfInet6(b []byte) map[netip.Addr]bool {
+	out := map[netip.Addr]bool{}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		f := strings.Fields(line)
+		if len(f) < 5 || len(f[0]) != 32 {
+			continue
+		}
+		flags, err := strconv.ParseUint(f[4], 16, 32)
+		raw, herr := hex.DecodeString(f[0])
+		if err != nil || herr != nil || flags&(ifaFTemporary|ifaFDeprecated) == 0 {
+			continue
+		}
+		out[netip.AddrFrom16([16]byte(raw))] = true
+	}
+	return out
 }
 
 // maxIfaceAddrs caps the addresses reported per interface: kube-ipvs0 of an
@@ -107,13 +146,13 @@ const maxIfaceAddrs = 16
 // address, since the first address is often a floating IP and not where
 // traffic goes from. An interface without addresses gets one series with an
 // empty address.
-func ifaceAddresses(addrs []net.InterfaceAddr) []string {
+func ifaceAddresses(addrs []net.InterfaceAddr, transient map[netip.Addr]bool) []string {
 	var out []string
 	for _, a := range addrs {
 		if len(out) == maxIfaceAddrs {
 			break
 		}
-		if p, err := netip.ParsePrefix(a.Addr); err == nil && !p.Addr().IsLinkLocalUnicast() {
+		if p, err := netip.ParsePrefix(a.Addr); err == nil && !p.Addr().IsLinkLocalUnicast() && !transient[p.Addr()] {
 			out = append(out, a.Addr)
 		}
 	}

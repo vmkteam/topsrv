@@ -42,8 +42,8 @@ For example PromQL queries and alert recipes, see [promql-recipes.md](promql-rec
 | `topsrv_network_errors_total` | counter | interface, direction | Errors (rx/tx) |
 | `topsrv_network_drops_total` | counter | interface, direction | Drops (rx/tx) |
 | `topsrv_network_speed_bytes` | gauge | interface | Link speed in bytes/sec (from `/sys/class/net/*/speed`) |
-| `topsrv_network_info` | gauge | interface, mac, address, mtu, operstate | Interface metadata: a series per address (`10.0.0.5/24`, IPv4 and IPv6, link-local left out, at most 16 per interface — kube-ipvs0 holds every ClusterIP); an interface without addresses has one series with an empty `address` |
-| `topsrv_push_source_info` | gauge | address, interface | The local address and interface the host reaches the push endpoint from, as the kernel routes it (a UDP socket, no packet sent). Looked up every 5 minutes and after a failed send, which also logs it as `src`: the first address of an interface is often a floating IP, not the source |
+| `topsrv_network_info` | gauge | interface, mac, address, mtu, operstate | Interface metadata: a series per address (`10.0.0.5/24`, IPv4 and IPv6, link-local, temporary and deprecated IPv6 left out — they change daily — at most 16 per interface, kube-ipvs0 holds every ClusterIP); an interface without addresses has one series with an empty `address` |
+| `topsrv_push_source_info` | gauge | address, interface | The local address (no prefix) and interface the host reaches the push endpoint from, as the kernel routes it towards the IP the HTTP transport connected to or tried (a UDP socket, no packet sent, no DNS). Looked up every 5 minutes and after a retryable failed send, which also logs it as `src`: the first address of an interface is often a floating IP, not the source. Only with `[Push]` set |
 
 ## Netstat (`topsrv_netstat_*`)
 

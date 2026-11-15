@@ -75,7 +75,10 @@ options:
 	}
 	r.Principal, i = f[i], i+1
 	r.AsRoot = true
-	if i+1 < len(f) && f[i] == "as" {
+	if i < len(f) && f[i] == "as" {
+		if i+1 == len(f) {
+			return r, false // "as" without a target
+		}
 		r.AsRoot, i = f[i+1] == "root", i+2
 	}
 	r.Cmd = i < len(f) && f[i] == "cmd"

@@ -87,9 +87,21 @@ func TestPusherSourceAfterFailedSend(t *testing.T) {
 	t.Cleanup(srv.Close)
 	reg := prometheus.NewRegistry()
 	p := NewPusher(embedlog.Logger{}, "topsrv", "test", PushConfig{Endpoint: srv.URL + "/v1/write", Interval: "1s", SpoolDir: t.TempDir()}, reg)
+	var dialed []string
+	ip := "203.0.113.5"
+	p.source.dial = func(_, address string) (net.Conn, error) {
+		dialed = append(dialed, address)
+		return udpConn{local: &net.UDPAddr{IP: net.ParseIP(ip)}}, nil
+	}
+	p.source.ifaceOf = func(net.IP) string { return "eth0" }
+	assert.Equal(t, "203.0.113.5", p.source.current(false), "primed")
 
+	ip = "198.51.100.7" // the route changed; the cached address is not due for minutes
 	p.push(t.Context())
 
+	assert.Equal(t, "198.51.100.7", p.source.current(false), "a failed send looked it up again at once")
+	assert.Equal(t, strings.TrimPrefix(srv.URL, "http://"), dialed[len(dialed)-1],
+		"towards the address the transport connected to, not a fresh DNS answer")
 	mfs, err := reg.Gather()
 	require.NoError(t, err)
 	var labels []string
@@ -100,5 +112,5 @@ func TestPusherSourceAfterFailedSend(t *testing.T) {
 			}
 		}
 	}
-	assert.Contains(t, strings.Join(labels, ","), "address=127.0.0.1")
+	assert.Contains(t, strings.Join(labels, ","), "address=198.51.100.7")
 }

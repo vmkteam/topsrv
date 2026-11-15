@@ -241,3 +241,103 @@ func TestAliasFanOut(t *testing.T) {
 	require.Len(t, p.Rules, 1)
 	assert.Len(t, p.Rules[0].Principals, maxExpanded, "capped, and fast")
 }
+
+func TestParseReviewCases(t *testing.T) {
+	rules := func(t *testing.T, policy string) []Rule {
+		t.Helper()
+		p := parse(map[string]string{"/etc/sudoers": policy})
+		require.Empty(t, p.Errors)
+		return p.Rules
+	}
+
+	t.Run("commands before a runas spec run as root", func(t *testing.T) {
+		r := rules(t, "alice ALL = ALL, (postgres) /bin/psql\n")
+		require.NotNil(t, r[0].Runas)
+		assert.Equal(t, []string{"postgres", "root"}, r[0].Runas.Users, "ALL runs as root")
+	})
+
+	t.Run("escaped and quoted names (AD groups)", func(t *testing.T) {
+		r := rules(t, "%domain\\ admins ALL=(ALL) ALL\n\"%linux ops\" ALL=(ALL) ALL\n")
+		require.Len(t, r, 2)
+		assert.Equal(t, []string{"%domain admins"}, r[0].Principals)
+		assert.Equal(t, []string{"%linux ops"}, r[1].Principals)
+	})
+
+	t.Run("blanks in a Defaults binding", func(t *testing.T) {
+		p := parse(map[string]string{"/etc/sudoers": "Defaults:alice, bob !authenticate\nDefaults: carol !authenticate\n"})
+		require.Len(t, p.Scoped, 2)
+		assert.Equal(t, []string{"alice", "bob"}, p.Scoped[0].List)
+		assert.Equal(t, []string{"carol"}, p.Scoped[1].List)
+		assert.True(t, p.Scoped[1].NoAuthenticate)
+	})
+
+	t.Run("aliases in a Defaults binding are expanded; command lists are not sent", func(t *testing.T) {
+		p := parse(map[string]string{"/etc/sudoers": "Defaults:ADMINS !authenticate\nDefaults!/usr/bin/SENTINELCMD rootpw\nUser_Alias ADMINS = alice, bob\n"})
+		require.Len(t, p.Scoped, 2)
+		assert.Equal(t, []string{"alice", "bob"}, p.Scoped[0].List)
+		assert.Nil(t, p.Scoped[1].List)
+		assert.NotContains(t, fmt.Sprint(p), "SENTINELCMD")
+	})
+
+	t.Run("env_keep is a set of LD_ names", func(t *testing.T) {
+		for policy, want := range map[string]bool{
+			"Defaults env_keep += LD_PRELOAD\nDefaults env_keep -= HOME\n":                           true,
+			"Defaults env_keep += \"LD_PRELOAD LD_LIBRARY_PATH\"\nDefaults env_keep -= LD_PRELOAD\n": true,
+			"Defaults env_keep += LD_PRELOAD\nDefaults env_keep = HOME\n":                            false,
+		} {
+			assert.Equal(t, want, parse(map[string]string{"/etc/sudoers": policy}).Defaults.EnvKeepLD, policy)
+		}
+		p := parse(map[string]string{"/etc/sudoers": "Defaults:alice env_keep += HOME\n"})
+		assert.Empty(t, p.Scoped, "a bound += of no LD_ name keeps nothing")
+	})
+
+	t.Run("a comment ending in a backslash continues nothing", func(t *testing.T) {
+		r := rules(t, "# disabled for now \\\nalice ALL = NOPASSWD: ALL\n")
+		require.Len(t, r, 1)
+		rs, errs := ParseDoas("/etc/doas.conf", []byte("# old rule \\\npermit nopass alice\n"))
+		require.Empty(t, errs)
+		assert.Len(t, rs, 1)
+	})
+
+	t.Run("blanks before a tag colon", func(t *testing.T) {
+		r := rules(t, "alice ALL = NOPASSWD : /bin/ls\n")
+		require.Len(t, r, 1)
+		assert.True(t, r[0].NopasswdAll)
+	})
+
+	t.Run("NOSETENV overrides the SETENV of ALL", func(t *testing.T) {
+		assert.False(t, rules(t, "alice ALL = NOSETENV: ALL\n")[0].Setenv)
+		assert.True(t, rules(t, "alice ALL = ALL\n")[0].Setenv)
+	})
+
+	t.Run("runas groups are alias-expanded, carried over runas merged", func(t *testing.T) {
+		r := rules(t, "Runas_Alias DBG = %dba, %ops\nalice ALL = (root:DBG) /a, (postgres) /b\n")
+		assert.Equal(t, []string{"%dba", "%ops"}, r[0].Runas.Groups)
+		assert.Equal(t, []string{"postgres", "root"}, r[0].Runas.Users)
+	})
+
+	t.Run("an unclosed runas spec is an error", func(t *testing.T) {
+		p := parse(map[string]string{"/etc/sudoers": "alice ALL = (root /bin/a\n"})
+		require.Len(t, p.Errors, 1)
+		assert.Equal(t, CodeSyntax, p.Errors[0].Code)
+	})
+
+	t.Run("an unreadable includedir is a read error", func(t *testing.T) {
+		files := memFiles(map[string]string{"/etc/sudoers": "@includedir /etc/sudoers.d\n"})
+		files.ReadDir = func(string) ([]string, error) { return nil, fs.ErrPermission }
+		p := Parse("/etc/sudoers", "web1", files)
+		require.Len(t, p.ReadErrors, 1)
+		assert.Equal(t, "/etc/sudoers.d", p.ReadErrors[0].Path)
+	})
+
+	t.Run("at most maxRules rules", func(t *testing.T) {
+		p := parse(map[string]string{"/etc/sudoers": strings.Repeat("alice ALL = /bin/ls\n", maxRules+5)})
+		assert.Len(t, p.Rules, maxRules)
+		assert.True(t, p.Truncated)
+	})
+
+	t.Run("doas: as without a target", func(t *testing.T) {
+		_, errs := ParseDoas("/etc/doas.conf", []byte("permit alice as\n"))
+		assert.Len(t, errs, 1)
+	})
+}

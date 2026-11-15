@@ -2,10 +2,10 @@ package security
 
 import (
 	"bytes"
-	"io/fs"
 	"debug/elf"
 	"encoding/binary"
 	"encoding/json"
+	"io/fs"
 	"maps"
 	"os"
 	"path/filepath"
@@ -55,7 +55,7 @@ func fixture(t *testing.T, files map[string]string) *scanCtx {
 	t.Helper()
 	root := t.TempDir()
 	writeTree(t, root, files)
-	return &scanCtx{root: root}
+	return &scanCtx{root: root, trustedUID: int64(os.Geteuid())} // fixture files stand for root's
 }
 
 // unreadable makes a fixture file unreadable; root reads it anyway, so the

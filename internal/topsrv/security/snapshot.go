@@ -149,7 +149,7 @@ func reasonOf(err error) Reason {
 		return ReasonBudgetExceeded
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return ReasonTimeout
-	case errors.Is(err, errNotRegular),
+	case errors.Is(err, errNotRegular), errors.Is(err, errPseudoFS),
 		errors.Is(err, syscall.ENOTDIR), // O_DIRECTORY on a FIFO or a file
 		errors.Is(err, syscall.ELOOP):   // O_NOFOLLOW on a symlink
 		return ReasonNotRegular

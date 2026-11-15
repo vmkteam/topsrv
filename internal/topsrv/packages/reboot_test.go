@@ -1,4 +1,4 @@
-//go:build unix
+//go:build linux
 
 package packages
 
@@ -83,6 +83,14 @@ func TestDebianRebootRequired(t *testing.T) {
 			t.Fatal("reading a FIFO blocked")
 		}
 	})
+}
+
+func TestDebianRebootRequiredLargeFile(t *testing.T) {
+	big := "libc6\n" + strings.Repeat("x", rebootPkgsLimit) + "\nsystemd\n"
+	_, pkgs := debianRebootRequired(rebootRoot(t, true, big))
+	if !slices.Equal(pkgs, []string{"libc6"}) {
+		t.Errorf("got %q, want the names of the first %d bytes", pkgs, rebootPkgsLimit)
+	}
 }
 
 func TestParseRebootPkgs(t *testing.T) {

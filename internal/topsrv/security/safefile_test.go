@@ -69,7 +69,7 @@ func TestReadDir(t *testing.T) {
 	}
 
 	t.Run("sorted by name", func(t *testing.T) {
-		entries, err := readDir(dir, false)
+		entries, err := readDir(dir)
 		require.NoError(t, err)
 		names := make([]string, 0, len(entries))
 		for _, e := range entries {
@@ -79,13 +79,13 @@ func TestReadDir(t *testing.T) {
 	})
 
 	t.Run("a file is not a directory", func(t *testing.T) {
-		_, err := readDir(filepath.Join(dir, "a"), false)
+		_, err := readDir(filepath.Join(dir, "a"))
 		require.Error(t, err)
 		assert.Equal(t, ReasonNotRegular, reasonOf(err))
 	})
 
 	t.Run("missing", func(t *testing.T) {
-		_, err := readDir(filepath.Join(dir, "missing"), false)
+		_, err := readDir(filepath.Join(dir, "missing"))
 		assert.Equal(t, ReasonNotFound, reasonOf(err))
 	})
 }

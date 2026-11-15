@@ -9,9 +9,14 @@ import (
 	"strings"
 )
 
+// keyTypeRSA is the blob type of an RSA key.
+const keyTypeRSA = "ssh-rsa"
+
 // authKeyTypes sshd accepts as the key type of a line.
 var authKeyTypes = []string{
-	"ssh-ed25519", "ssh-rsa", "ssh-dss",
+	"ssh-ed25519", keyTypeRSA, "ssh-dss",
+	"rsa-sha2-256", "rsa-sha2-512", // signature names sshd also takes for an RSA key
+	"rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-512-cert-v01@openssh.com",
 	"ecdsa-sha2-nistp256", "ecdsa-sha2-nistp384", "ecdsa-sha2-nistp521",
 	"sk-ssh-ed25519@openssh.com", "sk-ecdsa-sha2-nistp256@openssh.com",
 	"ssh-ed25519-cert-v01@openssh.com", "ssh-rsa-cert-v01@openssh.com", "ssh-dss-cert-v01@openssh.com",
@@ -20,14 +25,16 @@ var authKeyTypes = []string{
 	"sk-ecdsa-sha2-nistp256-cert-v01@openssh.com",
 }
 
-// authKeyOptionNames sshd knows (auth-options.c); any other option makes it
-// drop the whole line.
-var authKeyOptionNames = []string{
-	"agent-forwarding", "cert-authority", "command", "environment", "expiry-time", "from",
-	"no-agent-forwarding", "no-port-forwarding", "no-pty", "no-user-rc", "no-x11-forwarding",
-	"no-touch-required", "permitlisten", "permitopen", "port-forwarding", "principals", "pty",
-	"restrict", "tunnel", "user-rc", "verify-required", "x11-forwarding",
-}
+// Options sshd knows (auth-options.c): value options need name="value",
+// flags take none. Anything else makes sshd drop the whole line.
+var (
+	authKeyValueOptions = []string{"command", "environment", "expiry-time", "from", "permitlisten", "permitopen", "principals", "tunnel"}
+	authKeyFlagOptions  = []string{
+		"agent-forwarding", "cert-authority", "no-agent-forwarding", "no-port-forwarding", "no-pty", "no-user-rc",
+		"no-x11-forwarding", "port-forwarding", "pty", "restrict", "user-rc", "x11-forwarding",
+		"no-touch-required", "touch-required", "verify-required", "no-verify-required",
+	}
+)
 
 // authKey is one key of an authorized_keys file. The comment is never
 // read into it, option values never leave the host: only whether an option
@@ -38,7 +45,8 @@ type authKey struct {
 	Bits         int            `json:"bits,omitempty"`
 	TypeMismatch bool           `json:"typeMismatch,omitempty"` // the blob says another type than the line
 	Options      authKeyOptions `json:"options"`
-	// Rejected: an option sshd does not know, so it ignores the line.
+	// Rejected: sshd drops the line — an option it does not know or one
+	// written wrong, or a blob of another type than the line says.
 	Rejected bool `json:"rejected,omitempty"`
 }
 
@@ -73,7 +81,9 @@ func parseAuthKeyLine(line string) (authKey, bool) {
 	if !ok {
 		return authKey{}, false
 	}
-	k.Options, k.Rejected = parseOptions(opts)
+	var badOption bool
+	k.Options, badOption = parseOptions(opts)
+	k.Rejected = k.Rejected || badOption
 	return k, true
 }
 
@@ -93,9 +103,22 @@ func parseKeyPart(s string) (authKey, bool) {
 	if !ok {
 		return authKey{}, false
 	}
-	k.TypeMismatch = string(blobType) != f[0]
+	k.TypeMismatch = string(blobType) != canonicalKeyType(f[0])
+	k.Rejected = k.TypeMismatch
 	k.Bits = keyBits(string(blobType), rest)
 	return k, true
+}
+
+// canonicalKeyType is the blob type of a line's key type: rsa-sha2-* are
+// names of RSA signatures, the key in the blob is ssh-rsa.
+func canonicalKeyType(t string) string {
+	switch t {
+	case "rsa-sha2-256", "rsa-sha2-512":
+		return keyTypeRSA
+	case "rsa-sha2-256-cert-v01@openssh.com", "rsa-sha2-512-cert-v01@openssh.com":
+		return "ssh-rsa-cert-v01@openssh.com"
+	}
+	return t
 }
 
 // splitOptions cuts the options field: up to the first whitespace outside
@@ -115,12 +138,17 @@ func splitOptions(s string) (opts, rest string, ok bool) {
 	return "", "", false
 }
 
-// parseOptions reads the option names; values are skipped unread.
+// parseOptions reads the option names; values are only checked to be
+// quoted, never kept.
 func parseOptions(s string) (o authKeyOptions, rejected bool) {
 	for _, opt := range splitOptionList(s) {
-		name, _, _ := strings.Cut(opt, "=")
+		name, value, hasValue := strings.Cut(opt, "=")
 		name = strings.ToLower(name)
-		if !slices.Contains(authKeyOptionNames, name) {
+		quoted := len(value) >= 2 && value[0] == '"' && value[len(value)-1] == '"'
+		switch {
+		case slices.Contains(authKeyValueOptions, name) && hasValue && quoted,
+			slices.Contains(authKeyFlagOptions, name) && !hasValue:
+		default:
 			rejected = true
 			continue
 		}
@@ -191,7 +219,7 @@ func keyBits(blobType string, rest []byte) int {
 		return 384
 	case strings.Contains(blobType, "nistp521"):
 		return 521
-	case blobType == "ssh-rsa":
+	case blobType == keyTypeRSA:
 		_, n, ok := sshString(rest) // e, then n
 		if !ok {
 			return 0

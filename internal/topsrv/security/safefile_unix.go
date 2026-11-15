@@ -3,8 +3,13 @@
 package security
 
 import (
+	"io/fs"
 	"os"
+	"path/filepath"
+	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -43,4 +48,64 @@ func fileOwner(fi os.FileInfo) (uid, gid int64) {
 		return -1, -1
 	}
 	return int64(st.Uid), int64(st.Gid)
+}
+
+// openNoSymlinks opens root/rel walking rel one component at a time with
+// O_NOFOLLOW: a component that is a symlink, even one swapped in after the
+// path was checked, fails the open (ELOOP) instead of being followed.
+// Directories are opened O_DIRECTORY, so a FIFO in their place fails
+// (ENOTDIR) without blocking. A file must be regular before and after the
+// open; it is put back to blocking reads. root is trusted and followed.
+func openNoSymlinks(root, rel string, dir bool) (*os.File, error) {
+	fail := func(err error) (*os.File, error) { return nil, &fs.PathError{Op: opOpen, Path: rel, Err: err} }
+	start := root
+	if start == "" {
+		start = "/"
+	}
+	fd, err := unix.Open(start, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		return fail(err)
+	}
+	comps := strings.Split(strings.Trim(filepath.Clean("/"+rel), "/"), "/")
+	for i, c := range comps {
+		if c == "" {
+			continue
+		}
+		flags := unix.O_RDONLY | unix.O_NOFOLLOW | unix.O_NONBLOCK | unix.O_CLOEXEC
+		last := i == len(comps)-1
+		if last && !dir {
+			var st unix.Stat_t
+			if statErr := unix.Fstatat(fd, c, &st, unix.AT_SYMLINK_NOFOLLOW); statErr != nil {
+				unix.Close(fd)
+				return fail(statErr)
+			}
+			if st.Mode&unix.S_IFMT != unix.S_IFREG {
+				unix.Close(fd)
+				return fail(errNotRegular) // never opened: a device acts on open
+			}
+			flags |= unix.O_NOCTTY
+		} else {
+			flags |= unix.O_DIRECTORY
+		}
+		next, openErr := unix.Openat(fd, c, flags, 0)
+		unix.Close(fd)
+		if openErr != nil {
+			return fail(openErr)
+		}
+		fd = next
+	}
+	f := os.NewFile(uintptr(fd), rel)
+	if dir {
+		return f, nil
+	}
+	fi, err := f.Stat()
+	if err != nil || !fi.Mode().IsRegular() {
+		f.Close()
+		return fail(errNotRegular)
+	}
+	if err := clearNonblock(f); err != nil {
+		f.Close()
+		return fail(err)
+	}
+	return f, nil
 }

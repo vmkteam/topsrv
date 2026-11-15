@@ -13,10 +13,12 @@ import (
 	"github.com/vmkteam/topsrv/internal/topsrv/security/sshdconf"
 )
 
-// Limits of one authorized_keys file.
+// Limits of one authorized_keys file, and of the section: the receiving
+// side caps a snapshot at 1 MB, a key is about 120 bytes of JSON.
 const (
 	authKeysFileLimit = 1 << 20
 	maxKeysPerFile    = 2000
+	maxKeysTotal      = 2000
 )
 
 // Values of authKeysFile.Status.
@@ -33,6 +35,9 @@ const (
 // the files sshd would read for them.
 type authKeysData struct {
 	Users []authKeysUser `json:"users"`
+	// Truncated: more than maxKeysTotal keys in all; the files past it are
+	// listed without keys.
+	Truncated bool `json:"truncated,omitempty"`
 	// ConfigKnown: the paths come from the sshd configuration; false — it
 	// was unreadable, and sshd's default paths were walked.
 	ConfigKnown bool `json:"configKnown"`
@@ -47,9 +52,10 @@ type authKeysUser struct {
 }
 
 type authKeysFile struct {
-	Path      string    `json:"path"`
-	Status    string    `json:"status"`
-	Keys      []authKey `json:"keys,omitempty"`
+	Path   string `json:"path"`
+	Status string `json:"status"`
+	// Keys is null when the file was not read, [] when it has none.
+	Keys      []authKey `json:"keys"`
 	Truncated bool      `json:"truncated,omitempty"` // more than maxKeysPerFile keys
 }
 
@@ -84,7 +90,24 @@ func collectAuthorizedKeys(ctx context.Context, sc *scanCtx) Section {
 			d.Users = append(d.Users, authKeysUser{Name: u.Name, Files: files})
 		}
 	}
+	d.Truncated = capKeys(d.Users, maxKeysTotal)
 	return collected(gaps, d)
+}
+
+// capKeys keeps at most limit keys in all, in order; it reports whether any
+// were dropped.
+func capKeys(users []authKeysUser, limit int) bool {
+	truncated := false
+	for i := range users {
+		for j := range users[i].Files {
+			f := &users[i].Files[j]
+			if len(f.Keys) > limit {
+				f.Keys, truncated = f.Keys[:limit], true
+			}
+			limit -= len(f.Keys)
+		}
+	}
+	return truncated
 }
 
 // userKeysFiles walks the files sshd would read for u, missing ones left out.
@@ -93,7 +116,11 @@ func collectAuthorizedKeys(ctx context.Context, sc *scanCtx) Section {
 func userKeysFiles(sc *scanCtx, sshd *sshdResult, u account, read map[string]keysFile, gaps *gapList) []authKeysFile {
 	var files []authKeysFile
 	for _, pattern := range sshd.filesFor(u.Name) {
-		for _, p := range expandKeysPath(sc, pattern, u) {
+		paths, errs := expandKeysPath(sc, pattern, u)
+		for _, e := range errs {
+			gaps.add(e.Path, e.Err)
+		}
+		for _, p := range paths {
 			kf, ok := read[p]
 			if !ok {
 				kf = readKeysFile(sc, p)
@@ -107,7 +134,7 @@ func userKeysFiles(sc *scanCtx, sshd *sshdResult, u account, read map[string]key
 				continue
 			}
 			f := kf.authKeysFile
-			if f.Status == keysOK && sshd.strictModes && !strictModesOK(sc, kf.resolved, kf.fi, u) {
+			if f.Status == keysOK && (!readableBy(kf.fi, u) || sshd.strictModes && !strictModesOK(sc, kf.resolved, kf.fi, u)) {
 				f.Status = keysIgnoredBySSHD
 			}
 			files = append(files, f)
@@ -126,10 +153,11 @@ func (r *sshdResult) filesFor(user string) []string {
 }
 
 // expandKeysPath expands the tokens of an AuthorizedKeysFile entry (%% %h
-// %u %U), makes it absolute from home, and expands a glob (OpenSSH 10).
-func expandKeysPath(sc *scanCtx, pattern string, u account) []string {
+// %u %U), makes it absolute from home, and expands a glob (OpenSSH 10);
+// directories the glob could not list come back as errors.
+func expandKeysPath(sc *scanCtx, pattern string, u account) ([]string, []sshdconf.ReadError) {
 	if strings.EqualFold(pattern, "none") {
-		return nil
+		return nil, nil
 	}
 	p := pattern
 	if strings.Contains(p, "%") {
@@ -137,13 +165,13 @@ func expandKeysPath(sc *scanCtx, pattern string, u account) []string {
 	}
 	if !path.IsAbs(p) {
 		if u.home == "" {
-			return nil
+			return nil, nil
 		}
 		p = path.Join(u.home, p)
 	}
 	p = path.Clean(p)
 	if !sshdconf.HasMeta(p) {
-		return []string{p}
+		return []string{p}, nil
 	}
 	return sshdconf.Glob(p, func(dir string) ([]string, error) { return entryNames(sc.readDirUser(dir)) })
 }
@@ -163,13 +191,12 @@ type keysFile struct {
 // its keys: they would work once fixed.
 func readKeysFile(sc *scanCtx, p string) keysFile {
 	f := keysFile{Path: p}
-	var err error
+	var (
+		b   []byte
+		err error
+	)
 	if f.resolved, err = sc.resolveUser(p); err == nil {
-		f.fi, err = sc.lstatUser(f.resolved)
-	}
-	var b []byte
-	if err == nil {
-		b, err = sc.readUser(f.resolved, authKeysFileLimit)
+		b, f.fi, err = sc.readUser(f.resolved, authKeysFileLimit) // fi of the file read, for StrictModes
 	}
 	if err != nil {
 		f.Status, f.err = keysStatusOf(err), err
@@ -210,6 +237,21 @@ func strictModesOK(sc *scanCtx, file string, fi fs.FileInfo, u account) bool {
 			return true
 		}
 	}
+}
+
+// readableBy: sshd opens the file as the user, not as root — a link to
+// /root/.ssh/authorized_keys gives the user nothing. Supplementary groups are
+// not known here, only the primary one.
+func readableBy(fi fs.FileInfo, u account) bool {
+	uid, gid := fileOwner(fi)
+	perm := fi.Mode().Perm()
+	switch {
+	case uid == u.UID:
+		return perm&0o400 != 0
+	case gid == u.GID:
+		return perm&0o040 != 0
+	}
+	return perm&0o004 != 0
 }
 
 func ownedSafely(fi fs.FileInfo, uid int64) bool {

@@ -1,7 +1,9 @@
 package topsrv
 
 import (
+	"cmp"
 	"net"
+	"net/http/httptrace"
 	"net/url"
 	"sync"
 	"time"
@@ -32,6 +34,9 @@ type pushSource struct {
 	address   string
 	iface     string
 	checkedAt time.Time
+	// observed is the ip:port the HTTP transport last connected to, or tried
+	// to: with happy eyeballs it may be IPv4 while DNS lists IPv6 first.
+	observed string
 }
 
 func newPushSource(endpoint string) *pushSource {
@@ -44,14 +49,37 @@ func newPushSource(endpoint string) *pushSource {
 	}
 	if u, err := url.Parse(endpoint); err == nil && u.Hostname() != "" {
 		port := u.Port()
-		if port == "" {
-			port = map[string]string{"http": "80", "https": "443"}[u.Scheme]
+		switch {
+		case port != "":
+		case u.Scheme == "http":
+			port = "80"
+		case u.Scheme == "https":
+			port = "443"
 		}
 		if port != "" {
 			s.target = net.JoinHostPort(u.Hostname(), port)
 		}
 	}
 	return s
+}
+
+// trace records where the pusher's connections go: the address it dials
+// (also when the dial fails — the case to diagnose) and the one it got.
+func (s *pushSource) trace() *httptrace.ClientTrace {
+	return &httptrace.ClientTrace{
+		ConnectStart: func(_, addr string) { s.observe(addr) },
+		GotConn: func(info httptrace.GotConnInfo) {
+			if info.Conn != nil {
+				s.observe(info.Conn.RemoteAddr().String())
+			}
+		},
+	}
+}
+
+func (s *pushSource) observe(addr string) {
+	s.mu.Lock()
+	s.observed = addr
+	s.mu.Unlock()
 }
 
 // current returns the source address, looked up again when older than
@@ -62,7 +90,8 @@ func newPushSource(endpoint string) *pushSource {
 func (s *pushSource) current(force bool) string {
 	s.mu.Lock()
 	address, iface := s.address, s.iface
-	due := s.target != "" && (force || s.now().Sub(s.checkedAt) >= pushSourceInterval)
+	target := cmp.Or(s.observed, s.target) // the transport's IP: no DNS, and the family it really uses
+	due := target != "" && (force || s.now().Sub(s.checkedAt) >= pushSourceInterval)
 	if due {
 		s.checkedAt = s.now()
 	}
@@ -70,7 +99,7 @@ func (s *pushSource) current(force bool) string {
 	if !due {
 		return address
 	}
-	ip := s.lookup()
+	ip := s.lookup(target)
 	switch {
 	case ip == nil:
 		address, iface = "", ""
@@ -83,8 +112,8 @@ func (s *pushSource) current(force bool) string {
 	return address
 }
 
-func (s *pushSource) lookup() net.IP {
-	conn, err := s.dial("udp", s.target)
+func (s *pushSource) lookup(target string) net.IP {
+	conn, err := s.dial("udp", target)
 	if err != nil {
 		return nil
 	}
