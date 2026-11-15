@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"os"
 	"slices"
 	"strings"
 
@@ -48,6 +47,8 @@ type sudoRule struct {
 	NopasswdAll bool       `json:"nopasswdAll"`
 	NopasswdAny bool       `json:"nopasswdAny"`
 	Setenv      bool       `json:"setenv"`
+	// CommandNegation: a command excluded with "!" — never a protection.
+	CommandNegation bool `json:"commandNegation,omitempty"`
 }
 
 type sudoRunas struct {
@@ -57,10 +58,14 @@ type sudoRunas struct {
 }
 
 type sudoDefaults struct {
-	Authenticate *bool `json:"authenticate"`
-	RootPW       *bool `json:"rootpw"`
-	UsePTY       *bool `json:"usePty"`
-	EnvKeepLD    bool  `json:"envKeepLD"`
+	Authenticate *bool   `json:"authenticate"`
+	RootPW       *bool   `json:"rootpw"`
+	UsePTY       *bool   `json:"usePty"`
+	EnvKeepLD    bool    `json:"envKeepLD"`
+	TargetPW     *bool   `json:"targetpw"`
+	RunasPW      *bool   `json:"runaspw"`
+	Timeout      *string `json:"timestampTimeout"`
+	Logfile      *bool   `json:"logfile"`
 }
 
 type sudoScoped struct {
@@ -70,6 +75,8 @@ type sudoScoped struct {
 	NoAuthenticate bool     `json:"noAuthenticate,omitempty"`
 	RootPW         bool     `json:"rootpw,omitempty"`
 	EnvKeepLD      bool     `json:"envKeepLD,omitempty"`
+	TargetPW       bool     `json:"targetpw,omitempty"`
+	RunasPW        bool     `json:"runaspw,omitempty"`
 }
 
 type doasRule struct {
@@ -87,7 +94,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	var gaps gapList
 	files := sudoers.Files{
 		ReadFile: func(p string) ([]byte, error) { return sc.read(p, sudoFileLimit) },
-		ReadDir:  func(dir string) ([]string, error) { return fileNames(sc.readDir(dir)) }, // sudo skips subdirectories
+		ReadDir:  func(dir string) ([]string, error) { return infoNames(sc.readDirFiles(dir)) }, // sudo reads regular files only
 	}
 	pol := sudoers.Parse(pathSudoers, shortHostname(sc), files)
 	d := sudoData{SudoPresent: true}
@@ -112,12 +119,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	d.ExternalSources = sudoExternalSources(sc)
 	d.ParseErrors = append(sudoRefs(pol.Errors), doasErrs...)
 	d.DoasRules = doas
-	d.Files = []fileMeta{}
-	for _, p := range slices.Concat(pol.Files, doasFiles) {
-		if m, err := statFile(sc, p); err == nil {
-			d.Files = append(d.Files, m)
-		}
-	}
+	d.Files = filesMeta(sc, slices.Concat(pol.Files, doasFiles))
 	return collected(gaps, d)
 }
 
@@ -150,17 +152,6 @@ func readDoas(sc *scanCtx, gaps *gapList) (rules []doasRule, files []string, err
 	return rules, files, errs
 }
 
-// fileNames lists the entries of a directory that are not directories.
-func fileNames(entries []os.DirEntry, err error) ([]string, error) {
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	return names, err
-}
-
 // shortHostname is the host name up to the first dot, for %h in include
 // paths.
 func shortHostname(sc *scanCtx) string {
@@ -189,7 +180,8 @@ func sudoRules(rules []sudoers.Rule) []sudoRule {
 	out := make([]sudoRule, 0, len(rules))
 	for i, r := range rules {
 		sr := sudoRule{Order: i + 1, Source: r.Source, Principals: r.Principals, HostsAll: r.HostsAll,
-			CommandsAll: r.CommandsAll, NopasswdAll: r.NopasswdAll, NopasswdAny: r.NopasswdAny, Setenv: r.Setenv}
+			CommandsAll: r.CommandsAll, NopasswdAll: r.NopasswdAll, NopasswdAny: r.NopasswdAny, Setenv: r.Setenv,
+			CommandNegation: r.CommandNegation}
 		sr.Runas = (*sudoRunas)(r.Runas)
 		out = append(out, sr)
 	}

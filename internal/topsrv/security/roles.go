@@ -129,7 +129,7 @@ func roleProcessesRunning(sc *scanCtx) ([]string, error) {
 		if !isRoleProcess(p.name) {
 			continue
 		}
-		if ns, nsErr := sc.readlink("/proc/" + p.pid + "/ns/net"); nsErr == nil && hostNet != "" && ns != hostNet {
+		if !sameNamespace(sc, p.pid, "net", hostNet) {
 			continue
 		}
 		found[p.name] = true

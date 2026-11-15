@@ -2,6 +2,8 @@ package security
 
 import (
 	"bufio"
+	"context"
+	"fmt"
 	"io/fs"
 	"os"
 	"path"
@@ -61,8 +63,8 @@ func testdataTree(t *testing.T, dir string) map[string]string {
 func TestAPTConfigOracle(t *testing.T) {
 	for _, distro := range []string{"debian-12", "ubuntu-24.04"} {
 		t.Run(distro, func(t *testing.T) {
-			cfg := readAPTConfig(memAPT(testdataTree(t, "apt/"+distro)))
-			require.Nil(t, cfg.err)
+			cfg := readAPTConfig(t.Context(), memAPT(testdataTree(t, "apt/"+distro)))
+			require.Empty(t, cfg.errs)
 
 			f, err := os.Open(filepath.Join("testdata", "apt", distro, "apt-config-dump.txt"))
 			require.NoError(t, err)
@@ -114,8 +116,8 @@ func TestAPTConfigSyntax(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			cfg := readAPTConfig(memAPT(map[string]string{aptConfMain: tc.text}))
-			require.Nil(t, cfg.err)
+			cfg := readAPTConfig(t.Context(), memAPT(map[string]string{aptConfMain: tc.text}))
+			require.Empty(t, cfg.errs)
 			got := cfg.value(tc.key)
 			if tc.want == "" {
 				assert.Nil(t, got)
@@ -128,13 +130,13 @@ func TestAPTConfigSyntax(t *testing.T) {
 }
 
 func TestAPTConfigLists(t *testing.T) {
-	cfg := readAPTConfig(memAPT(map[string]string{
+	cfg := readAPTConfig(t.Context(), memAPT(map[string]string{
 		aptConfDir + "/10a": "U::Origins-Pattern { \"a\"; \"b\"; };\n",
 		aptConfDir + "/20b": "U::Origins-Pattern:: \"c\";\n",
 		aptConfDir + "/30c": "#clear U::Allowed;\nU::Allowed { \"x\"; };\nDPkg::Pre-Install-Pkgs {\"/usr/sbin/dpkg-preconfigure --apt || true\";};\n",
 		aptConfMain:         "U::Allowed:: \"y\";\n",
 	}))
-	require.Nil(t, cfg.err)
+	require.Empty(t, cfg.errs)
 	assert.Equal(t, []string{"a", "b", "c"}, cfg.list("U::Origins-Pattern"), "items append across files")
 	assert.Equal(t, []string{"x", "y"}, cfg.list("U::Allowed"), "apt.conf after the parts")
 	assert.Equal(t, []string{"/usr/sbin/dpkg-preconfigure --apt || true"}, cfg.list("DPkg::Pre-Install-Pkgs"))
@@ -159,32 +161,106 @@ func TestAPTConfigErrors(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.text, func(t *testing.T) {
-			cfg := readAPTConfig(memAPT(map[string]string{aptConfMain: tc.text}))
-			require.NotNil(t, cfg.err)
-			assert.Equal(t, lineRef{File: aptConfMain, Line: tc.line, Code: tc.code}, *cfg.err)
+			cfg := readAPTConfig(t.Context(), memAPT(map[string]string{aptConfMain: tc.text}))
+			assert.Equal(t, []lineRef{{File: aptConfMain, Line: tc.line, Code: tc.code}}, cfg.errs)
 		})
 	}
 
-	t.Run("apt stops at the first error", func(t *testing.T) {
-		cfg := readAPTConfig(memAPT(map[string]string{
+	t.Run("apt goes on with the next file", func(t *testing.T) {
+		cfg := readAPTConfig(t.Context(), memAPT(map[string]string{
 			aptConfDir + "/10a": "A::B \"1\";\nA::C x y;\nA::D \"1\";\n",
-			aptConfDir + "/20b": "A::E \"1\";\n",
+			aptConfDir + "/20b": "A::E \"1\";\n{\n",
+			aptConfDir + "/30c": "A::F \"1\";\n",
+			aptConfMain:         "A::G \"1\";\n",
 		}))
-		require.NotNil(t, cfg.err)
-		assert.Equal(t, 2, cfg.err.Line)
+		assert.Equal(t, []lineRef{
+			{File: aptConfDir + "/10a", Line: 2, Code: aptCodeExtraJunk},
+			{File: aptConfDir + "/20b", Line: 2, Code: aptCodeBlockNoName},
+		}, cfg.errs, "one per file: apt stops reading a file at its error")
 		assert.NotNil(t, cfg.value("A::B"))
-		assert.Nil(t, cfg.value("A::D"))
-		assert.Nil(t, cfg.value("A::E"))
+		assert.Nil(t, cfg.value("A::D"), "after the error in its file")
+		for _, key := range []string{"A::E", "A::F", "A::G"} {
+			assert.NotNil(t, cfg.value(key), key)
+		}
+		assert.False(t, cfg.valid())
+	})
+	t.Run("an include that fails stops the file including it", func(t *testing.T) {
+		cfg := readAPTConfig(t.Context(), memAPT(map[string]string{
+			aptConfDir + "/10a": "#include /etc/apt/bad.conf;\nA::B \"1\";\n",
+			"/etc/apt/bad.conf": "A::C x y;\n",
+			aptConfDir + "/20b": "A::D \"1\";\n",
+		}))
+		assert.Equal(t, []lineRef{{File: "/etc/apt/bad.conf", Line: 1, Code: aptCodeExtraJunk}}, cfg.errs)
+		assert.Nil(t, cfg.value("A::B"))
+		assert.NotNil(t, cfg.value("A::D"))
+	})
+}
+
+// TestAPTConfigLimits: a limit of the agent is a gap, not a line apt refuses.
+func TestAPTConfigLimits(t *testing.T) {
+	t.Run("too many files", func(t *testing.T) {
+		files := map[string]string{}
+		for i := range aptMaxFiles + 2 {
+			files[fmt.Sprintf("%s/%03d", aptConfDir, i)] = "A::B \"1\";\n"
+		}
+		cfg := readAPTConfig(t.Context(), memAPT(files))
+		assert.Empty(t, cfg.errs)
+		assert.Equal(t, gapList{{Path: aptConfDir + "/128", Reason: ReasonBudgetExceeded}}, cfg.gaps)
+		assert.Len(t, cfg.files, aptMaxFiles)
+		assert.False(t, cfg.valid(), "not every file was read")
+	})
+	t.Run("too many nodes", func(t *testing.T) {
+		cfg := readAPTConfig(t.Context(), memAPT(map[string]string{
+			aptConfDir + "/10a": "L {" + strings.Repeat("\"x\";", aptMaxNodes) + "};\n",
+			aptConfDir + "/20b": "A::B \"1\";\n",
+		}))
+		assert.Empty(t, cfg.errs)
+		assert.Equal(t, gapList{{Path: aptConfDir + "/10a", Reason: ReasonBudgetExceeded}}, cfg.gaps)
+		assert.Nil(t, cfg.value("A::B"), "nothing is read past the limit")
+	})
+	t.Run("the budget runs out", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		cancel()
+		cfg := readAPTConfig(ctx, memAPT(map[string]string{aptConfDir + "/10a": "A::B \"1\";\n"}))
+		assert.Equal(t, gapList{{Path: aptConfDir + "/10a", Reason: ReasonTimeout}}, cfg.gaps)
+	})
+	t.Run("the budget runs out inside a file", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(t.Context())
+		files := memAPT(map[string]string{aptConfMain: strings.Repeat("A::B \"1\";\n", 2*aptCtxCheckLines) + "A::C \"1\";\n"})
+		read := files.readFile
+		files.readFile = func(p string) ([]byte, error) { cancel(); return read(p) } // the deadline passes during the read
+		cfg := readAPTConfig(ctx, files)
+		assert.Equal(t, gapList{{Path: aptConfMain, Reason: ReasonTimeout}}, cfg.gaps)
+		assert.Empty(t, cfg.errs)
+		assert.Nil(t, cfg.value("A::C"), "the rest of the file is not parsed")
+	})
+	t.Run("includes as deep as apt takes", func(t *testing.T) {
+		// apt.conf (depth 0) → inc1 → … → inc11: apt refuses an include in a
+		// file deeper than 10, so inc11 is read and may not include more.
+		chain := func(last string) map[string]string {
+			files := map[string]string{aptConfMain: "#include /etc/apt/inc1;\n"}
+			for d := 1; d <= aptMaxIncludeDepth; d++ {
+				files[fmt.Sprintf("/etc/apt/inc%d", d)] = fmt.Sprintf("#include /etc/apt/inc%d;\n", d+1)
+			}
+			files[fmt.Sprintf("/etc/apt/inc%d", aptMaxIncludeDepth+1)] = last
+			return files
+		}
+		cfg := readAPTConfig(t.Context(), memAPT(chain("A::B \"1\";\n")))
+		assert.Empty(t, cfg.errs)
+		assert.NotNil(t, cfg.value("A::B"))
+
+		cfg = readAPTConfig(t.Context(), memAPT(chain("#include /etc/apt/inc12;\n")))
+		assert.Equal(t, []lineRef{{File: "/etc/apt/inc11", Line: 1, Code: aptCodeIncludeDepth}}, cfg.errs)
 	})
 }
 
 func TestAPTConfigInclude(t *testing.T) {
-	cfg := readAPTConfig(memAPT(map[string]string{
+	cfg := readAPTConfig(t.Context(), memAPT(map[string]string{
 		aptConfMain:            "#include /etc/apt/extra.conf;\n#include /etc/apt/extra.d/;\n",
 		"/etc/apt/extra.conf":  "A::B \"1\";\n",
 		"/etc/apt/extra.d/10x": "A::C \"2\";\n",
 	}))
-	require.Nil(t, cfg.err)
+	require.Empty(t, cfg.errs)
 	assert.Equal(t, "1", *cfg.value("A::B"))
 	assert.Equal(t, "2", *cfg.value("A::C"))
 }
@@ -211,7 +287,7 @@ func FuzzAPTConfig(f *testing.F) {
 	}
 	f.Fuzz(func(t *testing.T, text string) {
 		files := map[string]string{aptConfMain: text}
-		cfg := readAPTConfig(memAPT(files))
+		cfg := readAPTConfig(t.Context(), memAPT(files))
 		if cfg.nodes > aptMaxNodes {
 			t.Fatalf("%d nodes", cfg.nodes)
 		}

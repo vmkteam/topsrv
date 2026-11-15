@@ -43,9 +43,12 @@ type Value struct {
 
 // MatchBlock is one Match block with what it sets.
 type MatchBlock struct {
-	Criteria []string
+	Criteria []string // criterion, pattern pairs; Invalid-User alone
 	Source   string
 	Keys     map[string]Value
+	// EqualsSyntax: a criterion was written criterion=pattern, which
+	// upstream sshd takes since OpenSSH 10.0 (RHEL 9's 9.9p1 too).
+	EqualsSyntax bool
 }
 
 // Ref points at a line, never at its text.
@@ -155,7 +158,7 @@ func (p *parser) parseFile(name string, depth int, block *MatchBlock, missingOK 
 		case include:
 			p.include(args, depth, cur, ref)
 		case match:
-			cur = p.match(args, cur, ref)
+			cur = p.match(args, ref)
 		case scalar, accumulate, firstLine:
 			if cur != nil && k.global {
 				p.fail(ref, CodeNotInMatch)
@@ -190,22 +193,40 @@ func (p *parser) include(args []string, depth int, cur *MatchBlock, ref Ref) {
 	}
 }
 
-// match starts a Match block; "Match All" returns to the global context.
-func (p *parser) match(args []string, cur *MatchBlock, ref Ref) *MatchBlock {
-	if len(args) == 0 {
-		p.fail(ref, CodeBadMatch)
-		return cur
-	}
+// match starts a Match block; "Match All" returns to the global context. A
+// Match sshd refuses opens a block that is kept nowhere: sshd exits on the
+// line, and what follows it must not land in the context before it.
+func (p *parser) match(args []string, ref Ref) *MatchBlock {
+	args, equals := splitCriteria(args)
 	if len(args) == 1 && strings.EqualFold(args[0], "all") {
 		return nil
 	}
-	if !p.validCriteria(args) {
-		p.fail(ref, CodeBadMatch) // sshd exits; the criteria are never stored, so never sent
-		return cur
+	if len(args) == 0 || !p.validCriteria(args) {
+		p.fail(ref, CodeBadMatch) // the criteria are never stored, so never sent
+		return &MatchBlock{Keys: map[string]Value{}}
 	}
-	b := &MatchBlock{Criteria: args, Source: ref.Source(), Keys: map[string]Value{}}
+	b := &MatchBlock{Criteria: args, Source: ref.Source(), Keys: map[string]Value{}, EqualsSyntax: equals}
 	p.cfg.MatchBlocks = append(p.cfg.MatchBlocks, b)
 	return b
+}
+
+// equalsCriteria may be written criterion=pattern since OpenSSH 10.0
+// (match_cfg_line in servconf.c).
+var equalsCriteria = []string{"user", "group", "host", "address", "localaddress", "localport", "rdomain", "version"}
+
+// splitCriteria turns "User=alice" into "User", "alice"; equals reports the
+// form was used.
+func splitCriteria(args []string) (out []string, equals bool) {
+	out = make([]string, 0, len(args))
+	for _, a := range args {
+		name, pattern, ok := strings.Cut(a, "=")
+		if ok && slices.Contains(equalsCriteria, strings.ToLower(name)) {
+			out, equals = append(out, name, pattern), true
+			continue
+		}
+		out = append(out, a)
+	}
+	return out, equals
 }
 
 // set stores a keyword's values in the global context (block nil) or in a

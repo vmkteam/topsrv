@@ -176,6 +176,25 @@ func TestParseMatch(t *testing.T) {
 	assert.Equal(t, []Ref{{File: DefaultConfig, Line: 7, Code: CodeNotInMatch}}, cfg.Errors, "Port is global only")
 }
 
+func TestParseMatchEquals(t *testing.T) {
+	cfg := parse(t, map[string]string{DefaultConfig: "Match User=backup Group adm\n  PasswordAuthentication yes\n"}, Flags{})
+	require.Len(t, cfg.MatchBlocks, 1)
+	assert.Equal(t, []string{"User", "backup", "Group", "adm"}, cfg.MatchBlocks[0].Criteria, "split into pairs")
+	assert.True(t, cfg.MatchBlocks[0].EqualsSyntax)
+	assert.NotContains(t, cfg.Global, "PasswordAuthentication")
+	assert.True(t, cfg.Valid())
+}
+
+func TestParseBadMatchBlock(t *testing.T) {
+	cfg := parse(t, map[string]string{DefaultConfig: "PasswordAuthentication no\n" +
+		"Match User alice\n  X11Forwarding yes\n" +
+		"Match Bogus x\n  PasswordAuthentication yes\n  X11Forwarding no\n"}, Flags{})
+	assert.Equal(t, []Ref{{File: DefaultConfig, Line: 4, Code: CodeBadMatch}}, cfg.Errors)
+	assert.Equal(t, []string{"no"}, cfg.Global["PasswordAuthentication"].Values, "the lines of a refused Match stay out of Global")
+	require.Len(t, cfg.MatchBlocks, 1)
+	assert.Equal(t, []string{"yes"}, cfg.MatchBlocks[0].Keys["X11Forwarding"].Values, "and out of the block before it")
+}
+
 func TestParseInclude(t *testing.T) {
 	t.Run("relative to /etc/ssh, a pattern without matches is fine", func(t *testing.T) {
 		cfg := parse(t, map[string]string{
@@ -412,6 +431,11 @@ func TestParseMatchCriteria(t *testing.T) {
 		{"Match SENTINELSECRET x", false},
 		{"Match User", false},
 		{"Match All User alice", false},
+		{"Match User=alice Address=192.0.2.0/24", true}, // OpenSSH 10.0
+		{"Match user=alice", true},
+		{"Match LocalPort=SENTINEL", false},
+		{"Match User=", false},
+		{"Match Bogus=alice", false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.line, func(t *testing.T) {
@@ -420,7 +444,7 @@ func TestParseMatchCriteria(t *testing.T) {
 			assert.Equal(t, tc.valid, cfg.Valid(), "errors: %v", cfg.Errors)
 			if tc.valid {
 				require.Len(t, cfg.MatchBlocks, 1)
-				assert.Equal(t, strings.Fields(tc.line)[1:], cfg.MatchBlocks[0].Criteria)
+				assert.Equal(t, strings.Fields(strings.ReplaceAll(tc.line, "=", " "))[1:], cfg.MatchBlocks[0].Criteria, "pairs")
 			} else {
 				assert.Equal(t, []Ref{{File: DefaultConfig, Line: 1, Code: CodeBadMatch}}, cfg.Errors)
 				assert.Empty(t, cfg.MatchBlocks, "refused criteria are never stored")

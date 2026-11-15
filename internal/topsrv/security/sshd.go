@@ -1,7 +1,6 @@
 package security
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"debug/elf"
@@ -10,7 +9,6 @@ import (
 	"io/fs"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -33,6 +31,10 @@ var sshdEffectiveKeys = []string{
 	"GSSAPIAuthentication", "X11Forwarding", "AllowTcpForwarding", "AllowAgentForwarding", "PermitTunnel",
 	"GatewayPorts", "Ciphers", "MACs", "KexAlgorithms", "HostKeyAlgorithms", "PubkeyAcceptedAlgorithms",
 	"LogLevel", "ClientAliveInterval", "ClientAliveCountMax", "MaxSessions", "MaxStartups", "Banner",
+	// CIS and STIG checks beyond the above
+	"DisableForwarding", "PermitTTY", "PermitUserRC", "AllowStreamLocalForwarding", "X11UseLocalhost",
+	"Compression", "KerberosAuthentication", "IgnoreUserKnownHosts", "PrintLastLog", "UseDNS",
+	"RequiredRSASize", "ForceCommand",
 }
 
 // sshdListKeys are sent as arrays, the rest as strings.
@@ -43,13 +45,14 @@ var sshdListKeys = []string{
 
 // sshdPresenceKeys are sent as true/false: a command line or a path, of
 // which only whether it is set matters ("none" is unset).
-var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "Banner"}
+var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "Banner", "ForceCommand"}
+
+// defaultHostKeys are the host keys sshd loads without a HostKey line
+// (fill_default_server_options), those that exist.
+var defaultHostKeys = []string{"/etc/ssh/ssh_host_rsa_key", "/etc/ssh/ssh_host_ecdsa_key", "/etc/ssh/ssh_host_ed25519_key"}
 
 // sshdUnits are the service units sshd runs as, Debian and RHEL names.
 var sshdUnits = []string{"ssh.service", "sshd.service"}
-
-// unitDirs in systemd's order of precedence.
-var unitDirs = []string{"/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"}
 
 // sshdBinaries may hold the PAM code: sshd-session since OpenSSH 9.8,
 // sshd-auth since 10.0.
@@ -74,6 +77,9 @@ type sshdData struct {
 	// PAMCompiled: the sshd binaries link libpam. Without it UsePAM does
 	// nothing and a "*" password is not a lock. null when unreadable.
 	PAMCompiled *bool `json:"pamCompiled"`
+	// HostKeys are the private host key files, by HostKey or the defaults:
+	// owner and mode only.
+	HostKeys []fileMeta `json:"hostKeys"`
 }
 
 // sshdValue is a keyword's value — a string, an array for list keywords,
@@ -91,6 +97,10 @@ type sshdMatch struct {
 	// with accounts; Address and Host depend on the connection.
 	Evaluable bool                 `json:"evaluable"`
 	Keys      map[string]sshdValue `json:"keys"`
+	// EqualsSyntax: written criterion=pattern (criteria come split into
+	// pairs either way): upstream OpenSSH takes it since 10.0, RHEL 9's
+	// 9.9p1 too; an older sshd exits on the line.
+	EqualsSyntax bool `json:"equalsSyntax,omitempty"`
 }
 
 type sshdFile struct {
@@ -111,11 +121,17 @@ type sshdListener struct {
 
 // sshdResult is what authorizedKeys builds on.
 type sshdResult struct {
-	authorizedKeysFiles []string            // global, with the default when unset
-	userKeysFiles       map[string][]string // AuthorizedKeysFile of "Match User x" blocks, by user
+	authorizedKeysFiles []string    // global, with the default when unset
+	keysBlocks          []keysBlock // Match blocks that set AuthorizedKeysFile, in order
 	strictModes         bool
 	keysCommand         bool
 	trustedCA           bool
+}
+
+// keysBlock is a Match block that sets AuthorizedKeysFile.
+type keysBlock struct {
+	criteria []string // pairs, Invalid-User alone
+	files    []string
 }
 
 // defaultAuthorizedKeysFiles is AuthorizedKeysFile when unset.
@@ -159,6 +175,7 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 		Listener:        listener,
 		SocketActivated: socket,
 		PAMCompiled:     sshdPAMCompiled(sc),
+		HostKeys:        filesMeta(sc, sshdHostKeys(cfg)),
 	}
 	for _, p := range cfg.Files {
 		if m, err := sshdFileMeta(sc, p, hashes[p]); err == nil {
@@ -168,6 +185,14 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 	return collected(gaps, d), sshdResultOf(cfg)
 }
 
+// sshdHostKeys are the HostKey files of the configuration, or the defaults.
+func sshdHostKeys(cfg *sshdconf.Config) []string {
+	if v, ok := cfg.Global["HostKey"]; ok {
+		return v.Values
+	}
+	return defaultHostKeys
+}
+
 // sshdFlags finds the -f, -o and -p in force: from the running listener in
 // the host mount namespace, or else from the service unit.
 func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
@@ -175,10 +200,10 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 	gaps.add("/proc", err)
 	hostMnt, _ := sc.readlink("/proc/1/ns/mnt")
 	for _, p := range procs {
-		if p.name != "sshd" || !trustedListener(sc, p) {
+		if p.name != "sshd" || !trustedProcess(sc, p) {
 			continue
 		}
-		if mnt, err := sc.readlink("/proc/" + p.pid + "/ns/mnt"); err == nil && hostMnt != "" && mnt != hostMnt {
+		if !sameNamespace(sc, p.pid, "mnt", hostMnt) {
 			continue // sshd in a container reads its own /etc/ssh
 		}
 		head, err := sc.readHead("/proc/"+p.pid+"/cmdline", argv0Limit)
@@ -193,25 +218,6 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 		return sshdconf.ParseFlags(args), l
 	}
 	return sshdconf.ParseFlags(sshdUnitArgs(sc)), sshdListener{}
-}
-
-// trustedListener: a process named sshd that runs as root from a binary
-// only root can change. Any user can start ~/bin/sshd -f ~/evil, whose -f
-// and Include would otherwise make the agent read files of its choosing.
-func trustedListener(sc *scanCtx, p process) bool {
-	proc, err := sc.stat("/proc/" + p.pid)
-	if err != nil {
-		return false
-	}
-	if uid, _ := fileOwner(proc); uid != sc.trustedUID || p.exe == "" {
-		return false
-	}
-	exe, err := sc.stat(p.exe)
-	if err != nil {
-		return false
-	}
-	uid, _ := fileOwner(exe)
-	return uid == sc.trustedUID && exe.Mode().Perm()&0o022 == 0
 }
 
 // sshdUnitArgs reads the sshd arguments from the service unit (with its
@@ -247,33 +253,6 @@ func sshdUnitArgs(sc *scanCtx) []string {
 	return args
 }
 
-// unitLines returns the lines of the first unit file found in unitDirs and
-// of its drop-ins in /etc/systemd/system/<unit>.d, in order; nil without a
-// unit file.
-func unitLines(sc *scanCtx, unit string) []string {
-	var out []string
-	for _, dir := range unitDirs {
-		if b, err := sc.read(dir+"/"+unit, smallFileLimit); err == nil {
-			out = strings.Split(string(b), "\n")
-			break
-		}
-	}
-	if out == nil {
-		return nil
-	}
-	for _, dir := range slices.Backward(unitDirs) { // the lowest precedence first: /etc is read last and wins
-		dropins, _ := sc.readDir(dir + "/" + unit + ".d")
-		for _, e := range dropins {
-			if strings.HasSuffix(e.Name(), ".conf") {
-				if b, err := sc.read(dir+"/"+unit+".d/"+e.Name(), smallFileLimit); err == nil {
-					out = append(out, strings.Split(string(b), "\n")...)
-				}
-			}
-		}
-	}
-	return out
-}
-
 // readEnvFile adds the KEY=value lines of an environment file to env.
 func readEnvFile(sc *scanCtx, file string, env map[string]string) {
 	b, err := sc.read(file, smallFileLimit)
@@ -299,39 +278,6 @@ func expandEnv(s string, env map[string]string) string {
 func sshdSocketActivated(sc *scanCtx) bool {
 	return sc.exists("/etc/systemd/system/sockets.target.wants/ssh.socket") ||
 		sc.exists("/etc/systemd/system/sockets.target.wants/sshd.socket")
-}
-
-// processStart is when a process started: field 22 of /proc/PID/stat, in
-// clock ticks since boot (USER_HZ, 100 on Linux), plus btime of /proc/stat.
-func processStart(sc *scanCtx, pid string) *time.Time {
-	stat, err := sc.read("/proc/"+pid+"/stat", smallFileLimit)
-	if err != nil {
-		return nil
-	}
-	_, after, ok := bytes.CutLast(stat, []byte(")")) // comm may hold spaces and parentheses
-	f := strings.Fields(string(after))
-	if !ok || len(f) < 20 {
-		return nil
-	}
-	ticks, err := strconv.ParseInt(f[19], 10, 64)
-	if err != nil {
-		return nil
-	}
-	b, err := sc.read("/proc/stat", procStatLimit)
-	if err != nil {
-		return nil
-	}
-	for line := range strings.SplitSeq(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "btime "); ok {
-			btime, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-			if err != nil {
-				return nil
-			}
-			t := time.Unix(btime+ticks/100, 0).UTC()
-			return &t
-		}
-	}
-	return nil
 }
 
 // sshdPAMCompiled looks for libpam among the libraries the sshd binaries
@@ -413,11 +359,12 @@ func sshdMatches(blocks []*sshdconf.MatchBlock) []sshdMatch {
 	for _, b := range blocks {
 		evaluable := len(b.Criteria)%2 == 0
 		for i := 0; i < len(b.Criteria); i += 2 {
-			if c := strings.ToLower(b.Criteria[i]); c != "user" && c != "group" {
+			if c := strings.ToLower(b.Criteria[i]); c != criterionUser && c != criterionGroup {
 				evaluable = false
 			}
 		}
-		out = append(out, sshdMatch{Criteria: b.Criteria, Source: b.Source, Evaluable: evaluable, Keys: sshdValues(b.Keys, false)})
+		out = append(out, sshdMatch{Criteria: b.Criteria, Source: b.Source, Evaluable: evaluable, Keys: sshdValues(b.Keys, false),
+			EqualsSyntax: b.EqualsSyntax})
 	}
 	return out
 }
@@ -435,7 +382,7 @@ func lineRefs(refs []sshdconf.Ref) []lineRef {
 }
 
 func sshdResultOf(cfg *sshdconf.Config) *sshdResult {
-	r := &sshdResult{authorizedKeysFiles: defaultAuthorizedKeysFiles, strictModes: true, userKeysFiles: map[string][]string{}}
+	r := &sshdResult{authorizedKeysFiles: defaultAuthorizedKeysFiles, strictModes: true}
 	g := cfg.Global
 	if v, ok := g["AuthorizedKeysFile"]; ok {
 		r.authorizedKeysFiles = v.Values
@@ -446,17 +393,97 @@ func sshdResultOf(cfg *sshdconf.Config) *sshdResult {
 	r.keysCommand = isSetNotNone(g, "AuthorizedKeysCommand")
 	r.trustedCA = isSetNotNone(g, "TrustedUserCAKeys")
 	for _, b := range cfg.MatchBlocks {
-		v, ok := b.Keys["AuthorizedKeysFile"]
-		if !ok || len(b.Criteria) != 2 || !strings.EqualFold(b.Criteria[0], "user") {
-			continue
-		}
-		for u := range strings.SplitSeq(b.Criteria[1], ",") {
-			if _, seen := r.userKeysFiles[u]; !seen && !strings.ContainsAny(u, "*?!") {
-				r.userKeysFiles[u] = v.Values
-			}
+		if v, ok := b.Keys["AuthorizedKeysFile"]; ok {
+			r.keysBlocks = append(r.keysBlocks, keysBlock{criteria: b.Criteria, files: v.Values})
 		}
 	}
 	return r
+}
+
+// Match criteria the backend and authorizedKeys can evaluate, lower case.
+const (
+	criterionUser  = "user"
+	criterionGroup = "group"
+)
+
+// Results of keysBlock.matches.
+const (
+	blockNo    = iota // never applies to the user
+	blockMaybe        // depends on the connection: Address, Host, LocalPort...
+	blockYes          // applies to every connection of the user
+)
+
+// matches evaluates the criteria of a block for a user and their groups
+// as match_cfg_line does: every criterion must match.
+func (b keysBlock) matches(user string, groups []string) int {
+	got := blockYes
+	for i := 0; i < len(b.criteria); i++ {
+		name := strings.ToLower(b.criteria[i])
+		if name == "invalid-user" {
+			return blockNo // a key login is for a user that exists
+		}
+		i++
+		if i == len(b.criteria) {
+			return blockNo
+		}
+		switch pattern := b.criteria[i]; name {
+		case criterionUser:
+			if sshdconf.PatternList(user, pattern) != sshdconf.ListMatch {
+				return blockNo
+			}
+		case criterionGroup:
+			if !groupsMatch(groups, pattern) {
+				return blockNo
+			}
+		default:
+			got = blockMaybe
+		}
+	}
+	return got
+}
+
+// groupsMatch is ga_match_pattern_list: some group matches, and none is
+// negated.
+func groupsMatch(groups []string, pattern string) bool {
+	found := false
+	for _, g := range groups {
+		switch sshdconf.PatternList(g, pattern) {
+		case sshdconf.ListNegated:
+			return false
+		case sshdconf.ListMatch:
+			found = true
+		}
+	}
+	return found
+}
+
+// filesFor is AuthorizedKeysFile for a user over every connection: the
+// first block that always applies, or the global value, plus the files of
+// the blocks before it that apply to some connections.
+func (r *sshdResult) filesFor(user string, groups []string) []string {
+	var out []string
+	for _, b := range r.keysBlocks {
+		switch b.matches(user, groups) {
+		case blockMaybe:
+			out = append(out, b.files...)
+		case blockYes:
+			return uniqueStrings(append(out, b.files...))
+		}
+	}
+	return uniqueStrings(append(out, r.authorizedKeysFiles...))
+}
+
+// uniqueStrings drops repeats, keeping the first.
+func uniqueStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func isSetNotNone(vals map[string]sshdconf.Value, k string) bool {

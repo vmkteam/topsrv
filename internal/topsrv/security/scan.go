@@ -1,6 +1,7 @@
 package security
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/dockerapi"
 	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 )
 
@@ -46,6 +48,11 @@ type scanCtx struct {
 
 	// deps returns what an earlier section gave; nil in tests that need none.
 	deps func(section string) (depResult, bool)
+
+	// dockerClient talks to the socket at a path; nil is dockerapi.New. A
+	// test serves a socket at a short path: the fixture's would pass the
+	// 104 bytes a socket address takes on macOS.
+	dockerClient func(path string) *dockerapi.Client
 }
 
 // depResult is how a section came out and the typed result later sections
@@ -95,6 +102,13 @@ func (sc *scanCtx) stat(path string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return os.Stat(sc.root + path)
+}
+
+func (sc *scanCtx) lstat(path string) (os.FileInfo, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
+	return os.Lstat(sc.root + path)
 }
 
 // exists is a presence probe; any error, permission included, means absent.
@@ -284,6 +298,42 @@ func entryNames(entries []os.DirEntry, err error) ([]string, error) {
 	return names, err
 }
 
+// readDirFiles lists the regular files of a drop-in directory, symlinks
+// followed, by name — what apt, sudo, dnf and run-parts read from one. A
+// subdirectory, FIFO, device or dangling link is skipped, as those tools skip
+// it. The FileInfo is the target's, under the name in the directory.
+func (sc *scanCtx) readDirFiles(dir string) ([]fs.FileInfo, error) {
+	entries, err := sc.readDir(dir)
+	out := make([]fs.FileInfo, 0, len(entries))
+	for _, e := range entries {
+		var (
+			fi   fs.FileInfo
+			ierr error
+		)
+		switch t := e.Type(); {
+		case t.IsRegular():
+			fi, ierr = e.Info()
+		case t&fs.ModeSymlink != 0:
+			fi, ierr = sc.stat(dir + "/" + e.Name())
+		default:
+			continue
+		}
+		if ierr == nil && fi.Mode().IsRegular() { // gone since the listing, or a link to anything else
+			out = append(out, fi)
+		}
+	}
+	return out, err
+}
+
+// infoNames are the names of readDirFiles, for the parsers that take names.
+func infoNames(infos []fs.FileInfo, err error) ([]string, error) {
+	names := make([]string, 0, len(infos))
+	for _, fi := range infos {
+		names = append(names, fi.Name())
+	}
+	return names, err
+}
+
 // process is one entry of the /proc walk, shared by the sections of a pass.
 type process struct {
 	pid  string
@@ -356,6 +406,66 @@ func readProcess(sc *scanCtx, pid string) (process, error) {
 	return p, nil
 }
 
+// trustedProcess: a process that runs as root from a binary only root can
+// change. Any user can start ~/bin/sshd -f ~/evil, whose -f and Include
+// would otherwise make the agent read files of its choosing — or
+// ~/bin/dockerd naming a socket and a daemon.json.
+func trustedProcess(sc *scanCtx, p process) bool {
+	proc, err := sc.stat("/proc/" + p.pid)
+	if err != nil {
+		return false
+	}
+	if uid, _ := fileOwner(proc); uid != sc.trustedUID || p.exe == "" {
+		return false
+	}
+	exe, err := sc.stat(p.exe)
+	if err != nil {
+		return false
+	}
+	uid, _ := fileOwner(exe)
+	return uid == sc.trustedUID && exe.Mode().Perm()&0o022 == 0
+}
+
+// sameNamespace: the process is in the namespace of PID 1, or that cannot
+// be told.
+func sameNamespace(sc *scanCtx, pid, kind, host string) bool {
+	ns, err := sc.readlink("/proc/" + pid + "/ns/" + kind)
+	return err != nil || host == "" || ns == host
+}
+
+// processStart is when a process started: field 22 of /proc/PID/stat, in
+// clock ticks since boot (USER_HZ, 100 on Linux), plus btime of /proc/stat.
+func processStart(sc *scanCtx, pid string) *time.Time {
+	stat, err := sc.read("/proc/"+pid+"/stat", smallFileLimit)
+	if err != nil {
+		return nil
+	}
+	_, after, ok := bytes.CutLast(stat, []byte(")")) // comm may hold spaces and parentheses
+	f := strings.Fields(string(after))
+	if !ok || len(f) < 20 {
+		return nil
+	}
+	ticks, err := strconv.ParseInt(f[19], 10, 64)
+	if err != nil {
+		return nil
+	}
+	b, err := sc.read("/proc/stat", procStatLimit)
+	if err != nil {
+		return nil
+	}
+	for line := range strings.SplitSeq(string(b), "\n") {
+		if v, ok := strings.CutPrefix(line, "btime "); ok {
+			btime, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+			if err != nil {
+				return nil
+			}
+			t := time.Unix(btime+ticks/100, 0).UTC()
+			return &t
+		}
+	}
+	return nil
+}
+
 // sameFile reports whether two paths, symlinks followed, are the same inode.
 func (sc *scanCtx) sameFile(a, b string) (bool, error) {
 	sa, err := sc.stat(a)
@@ -393,6 +503,7 @@ var allSections = []sectionDef{
 	{name: SectionAuthorizedKeys, budget: 10 * time.Second, host: true, run: noResult(collectAuthorizedKeys)},
 	{name: SectionSudoers, budget: 3 * time.Second, host: true, run: noResult(collectSudoers)},
 	{name: SectionUpdates, budget: 2 * time.Second, host: true, run: noResult(collectUpdates)},
+	{name: SectionDocker, budget: dockerAPIBudget + 3*time.Second, host: true, run: noResult(collectDocker)},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
 
@@ -411,7 +522,7 @@ type cachedSection struct {
 // rebuilds only its sections.
 func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep}
+	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep, trustedUID: c.trustedUID}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {

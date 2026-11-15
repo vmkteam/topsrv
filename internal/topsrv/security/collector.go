@@ -30,10 +30,13 @@ type Collector struct {
 	root      string       // "" in production, a fixture in tests
 	supported bool         // Linux; elsewhere every section is unsupported_platform
 	timeSync  func() (*timeSync, error)
-	now       func() time.Time
-	delay     time.Duration // before the first pass
-	wakeup    chan struct{} // Trigger → Run; the triggers themselves are in queued
-	key       tokenKey
+	// trustedUID owns the daemons and binaries trusted (sshd, dockerd):
+	// root; a test sets its own user, who owns the fixture.
+	trustedUID int64
+	now        func() time.Time
+	delay      time.Duration // before the first pass
+	wakeup     chan struct{} // Trigger → Run; the triggers themselves are in queued
+	key        tokenKey
 
 	scanDuration *prometheus.Desc
 	scanErrors   *prometheus.Desc

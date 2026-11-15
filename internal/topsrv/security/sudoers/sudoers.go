@@ -66,6 +66,9 @@ type Rule struct {
 	NopasswdAll bool // every command without a password
 	NopasswdAny bool // some command without a password
 	Setenv      bool // SETENV, which ALL implies
+	// CommandNegation: a command excluded with "!" (ALL, !/bin/su) — never
+	// a protection: a copy of the binary under another name runs.
+	CommandNegation bool
 }
 
 // Runas is a runas spec, aliases expanded.
@@ -83,7 +86,11 @@ type Defaults struct {
 	Authenticate *bool // !authenticate: no password for anyone
 	RootPW       *bool
 	UsePTY       *bool
-	EnvKeepLD    bool // LD_* kept in the environment of commands
+	EnvKeepLD    bool    // LD_* kept in the environment of commands
+	TargetPW     *bool   // the password of the target user, not the caller's
+	RunasPW      *bool   // the password of runas_default
+	Timeout      *string // timestamp_timeout as written, "invalid" when sudo would refuse it
+	Logfile      *bool   // a log file is set (its path is not kept)
 }
 
 // ScopedDefault is a Defaults line bound to users, hosts, commands or runas
@@ -97,6 +104,8 @@ type ScopedDefault struct {
 	NoAuthenticate bool
 	RootPW         bool
 	EnvKeepLD      bool
+	TargetPW       bool
+	RunasPW        bool
 }
 
 // Ref points at a line, never at its text.
@@ -503,59 +512,87 @@ func (p *parser) defaults(s string, ref Ref) {
 	}
 }
 
+// timeoutRe is a timeout sudo takes: minutes, maybe fractional or negative
+// (never expires), or a sum of days, hours, minutes and seconds.
+var timeoutRe = regexp.MustCompile(`^(-?[0-9]{1,9}(\.[0-9]{1,6})?|([0-9]{1,9}[dDhHmMsS]){1,4})$`)
+
+// timeoutValue is timestamp_timeout as written: "!timestamp_timeout" is 0,
+// a value sudo refuses is "invalid".
+func timeoutValue(on bool, value string) *string {
+	v := strings.Trim(strings.TrimSpace(value), `"`)
+	switch {
+	case !on:
+		v = "0"
+	case !timeoutRe.MatchString(v):
+		v = "invalid"
+	}
+	return &v
+}
+
 // defaultParam applies one Defaults parameter: to the global Defaults when
 // the line is not bound, and to sd. It reports whether a tracked flag of a
 // bound line is set.
 func (p *parser) defaultParam(sd *ScopedDefault, param string) bool {
-	global := sd.Binding == ""
 	on := !strings.HasPrefix(param, "!")
 	name, value, _ := strings.Cut(strings.TrimPrefix(param, "!"), "=")
 	op := ""
 	if strings.HasSuffix(name, "+") || strings.HasSuffix(name, "-") {
 		op, name = name[len(name)-1:], name[:len(name)-1]
 	}
+	d := &p.policy.Defaults
+	if sd.Binding != "" {
+		d = &Defaults{} // a bound line leaves the global Defaults alone
+	}
 	switch strings.TrimSpace(name) {
 	case "authenticate":
-		sd.NoAuthenticate = !on
-		if global {
-			p.policy.Defaults.Authenticate = &on
-		}
+		d.Authenticate, sd.NoAuthenticate = &on, !on
 		return !on
 	case "rootpw":
-		sd.RootPW = on
-		if global {
-			p.policy.Defaults.RootPW = &on
-		}
+		d.RootPW, sd.RootPW = &on, on
+		return on
+	case "targetpw":
+		d.TargetPW, sd.TargetPW = &on, on
+		return on
+	case "runaspw":
+		d.RunasPW, sd.RunasPW = &on, on
 		return on
 	case "use_pty":
-		if global {
-			p.policy.Defaults.UsePTY = &on
-		}
+		d.UsePTY = &on
+	case "logfile": // logfile=/path or !logfile; the path is not kept
+		d.Logfile = &on
+	case "timestamp_timeout":
+		d.Timeout = timeoutValue(on, value)
 	case "env_keep":
-		set := maps.Clone(p.envLD) // a bound line applies on top of the global list
-		if op == "" {
-			set = map[string]bool{}
-		}
-		for name := range strings.FieldsSeq(strings.Trim(strings.TrimSpace(value), `"`)) {
-			if !strings.HasPrefix(name, "LD_") {
-				continue
-			}
-			if op == "-" {
-				delete(set, name)
-			} else {
-				if set == nil {
-					set = map[string]bool{}
-				}
-				set[name] = true
-			}
-		}
-		sd.EnvKeepLD = len(set) > 0
-		if global {
-			p.envLD, p.policy.Defaults.EnvKeepLD = set, len(set) > 0
-		}
-		return len(set) > 0
+		return p.envKeep(sd, op, value)
 	}
 	return false
+}
+
+// envKeep applies an env_keep line: whether some LD_* name stays in the
+// environment of commands after it.
+func (p *parser) envKeep(sd *ScopedDefault, op, value string) bool {
+	set := maps.Clone(p.envLD) // a bound line applies on top of the global list
+	if op == "" {
+		set = map[string]bool{}
+	}
+	for name := range strings.FieldsSeq(strings.Trim(strings.TrimSpace(value), `"`)) {
+		if !strings.HasPrefix(name, "LD_") {
+			continue
+		}
+		if op == "-" {
+			delete(set, name)
+			continue
+		}
+		if set == nil {
+			set = map[string]bool{}
+		}
+		set[name] = true
+	}
+	sd.EnvKeepLD = len(set) > 0
+	if sd.Binding == "" {
+		p.envLD, p.policy.Defaults.EnvKeepLD = set, len(set) > 0
+	}
+	return len(set) > 0
 }
 
 func (p *parser) syntaxError(ref Ref) {
@@ -587,32 +624,19 @@ func (p *parser) expand(r rawRule) Rule {
 		for loc := commandOption.FindStringIndex(s); loc != nil; loc = commandOption.FindStringIndex(s) {
 			s = s[loc[1]:]
 		}
-		for {
-			tag, rest, ok := strings.Cut(s, ":")
-			if !ok || !slices.Contains(tags, strings.TrimSpace(tag)) {
-				break
-			}
-			switch strings.TrimSpace(tag) {
-			case "NOPASSWD":
-				nopass = true
-			case "PASSWD":
-				nopass = false
-			case "SETENV":
-				setenv = 1
-			case "NOSETENV":
-				setenv = -1
-			}
-			s = strings.TrimSpace(rest)
-		}
+		s = cutTags(s, &nopass, &setenv)
 		f := strings.Fields(s)
 		if len(f) == 0 || strings.HasPrefix(s, "!") {
+			rule.CommandNegation = rule.CommandNegation || len(f) > 0
 			continue // a negated command grants nothing
 		}
 		name := f[0]
 		if d, _, ok := strings.Cut(name, ":"); ok && slices.Contains(digests, d) && len(f) > 1 {
 			name = f[1] // "sha256:… /bin/ls"
 		}
-		all := slices.Contains(p.resolve(kindCmnd, []string{name}, 0), "ALL")
+		members := p.resolve(kindCmnd, []string{name}, 0)
+		all := slices.Contains(members, "ALL")
+		rule.CommandNegation = rule.CommandNegation || slices.ContainsFunc(members, isNegated)
 		commands++
 		if nopass {
 			nopassCount++
@@ -628,6 +652,31 @@ func (p *parser) expand(r rawRule) Rule {
 	}
 	return rule
 }
+
+// cutTags strips the tags before a command and applies them: they carry
+// over to the following commands of the line.
+func cutTags(s string, nopass *bool, setenv *int) string {
+	for {
+		tag, rest, ok := strings.Cut(s, ":")
+		tag = strings.TrimSpace(tag)
+		if !ok || !slices.Contains(tags, tag) {
+			return s
+		}
+		switch tag {
+		case "NOPASSWD":
+			*nopass = true
+		case "PASSWD":
+			*nopass = false
+		case "SETENV":
+			*setenv = 1
+		case "NOSETENV":
+			*setenv = -1
+		}
+		s = strings.TrimSpace(rest)
+	}
+}
+
+func isNegated(item string) bool { return strings.HasPrefix(item, "!") }
 
 func (p *parser) runas(prev *Runas, spec string) *Runas {
 	users, groups, _ := strings.Cut(spec, ":")

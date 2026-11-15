@@ -88,10 +88,11 @@ func TestParseMountinfoErrors(t *testing.T) {
 }
 
 func TestIsRemoteFS(t *testing.T) {
-	for _, fs := range []string{"nfs", "nfs4", "cifs", "smb3", "fuse", "fuse.sshfs", "autofs", "ceph", "glusterfs", "9p", "afs", "lustre", "gpfs"} {
+	for _, fs := range []string{"nfs", "nfs4", "cifs", "smb3", "fuse", "fuse.sshfs", "fuse.s3fs", "autofs", "ceph", "glusterfs", "9p", "afs", "lustre", "gpfs"} {
 		assert.True(t, isRemoteFS(fs), fs)
 	}
-	for _, fs := range []string{"ext4", "xfs", "btrfs", "tmpfs", "overlay", "zfs", "proc", "fusectl", "nfsd"} {
+	for _, fs := range []string{"ext4", "xfs", "btrfs", "tmpfs", "overlay", "zfs", "proc", "fusectl", "nfsd",
+		"fuse.snapfuse", "fuse.squashfuse", "fuse.squashfuse_ll", "fuse.lxcfs"} { // local FUSE: snaps in LXC, lxcfs
 		assert.False(t, isRemoteFS(fs), fs)
 	}
 }

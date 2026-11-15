@@ -19,7 +19,17 @@ const (
 	authKeysFileLimit = 1 << 20
 	maxKeysPerFile    = 2000
 	maxKeysTotal      = 2000
+	maxTrustFiles     = 500
 )
+
+// trustFileNames are files in a home that grant or hold access: host-based
+// trust for rsh and sshd (.rhosts, .shosts — sshd skips them unless
+// IgnoreRhosts no), credentials (.netrc, often in clear) and a command run
+// on each mail (.forward). Only their existence, owner and mode are read.
+var trustFileNames = []string{".rhosts", ".shosts", ".netrc", ".forward"}
+
+// hostsEquivFiles trust whole hosts for rsh and host-based ssh.
+var hostsEquivFiles = []string{"/etc/hosts.equiv", "/etc/shosts.equiv"}
 
 // Values of authKeysFile.Status.
 const (
@@ -44,6 +54,17 @@ type authKeysData struct {
 	// KeysExternal: AuthorizedKeysCommand is set, keys may come from it too.
 	KeysExternal  bool `json:"keysExternal"`
 	TrustedUserCA bool `json:"trustedUserCA"`
+	// TrustFiles are the trustFileNames found in homes, at most
+	// maxTrustFiles (TrustTruncated); HostsEquiv the hostsEquivFiles that
+	// are not empty.
+	TrustFiles     []trustFile `json:"trustFiles"`
+	TrustTruncated bool        `json:"trustTruncated,omitempty"`
+	HostsEquiv     []fileMeta  `json:"hostsEquiv"`
+}
+
+type trustFile struct {
+	User string `json:"user"`
+	fileMeta
 }
 
 type authKeysUser struct {
@@ -82,16 +103,52 @@ func collectAuthorizedKeys(ctx context.Context, sc *scanCtx) Section {
 	}
 	d := authKeysData{Users: []authKeysUser{}, ConfigKnown: known, KeysExternal: sshd.keysCommand, TrustedUserCA: sshd.trustedCA}
 	read := map[string]keysFile{} // a file shared by users is read once
+	homes := map[string]bool{}    // homes looked into for trust files
+	d.TrustFiles = []trustFile{}
 	for _, u := range acc.users {
 		if ctx.Err() != nil {
 			return unknown(ReasonTimeout)
 		}
-		if files := userKeysFiles(sc, sshd, u, read, &gaps); files != nil {
+		if files := userKeysFiles(sc, sshd, u, acc.groups[u.Name], read, &gaps); files != nil {
 			d.Users = append(d.Users, authKeysUser{Name: u.Name, Files: files})
 		}
+		d.addTrustFiles(sc, u, homes)
 	}
 	d.Truncated = capKeys(d.Users, maxKeysTotal)
+	d.HostsEquiv = []fileMeta{}
+	for _, p := range hostsEquivFiles {
+		if fi, err := sc.stat(p); err == nil && fi.Mode().IsRegular() && fi.Size() > 0 {
+			d.HostsEquiv = append(d.HostsEquiv, metaOf(p, fi))
+		}
+	}
 	return collected(gaps, d)
+}
+
+// addTrustFiles looks for the trust files of u's home, once per home. Each
+// path is checked against the mount table first, and lstat only: a link is
+// reported as found, never followed. A home that cannot be resolved is
+// skipped: its keys files carry the gap.
+func (d *authKeysData) addTrustFiles(sc *scanCtx, u account, homes map[string]bool) {
+	if u.home == "" {
+		return
+	}
+	home, err := sc.resolveUser(u.home)
+	if err != nil || homes[home] {
+		return
+	}
+	homes[home] = true
+	for _, name := range trustFileNames {
+		p := path.Join(home, name)
+		fi, err := sc.lstatUser(p)
+		if err != nil {
+			continue
+		}
+		if len(d.TrustFiles) == maxTrustFiles {
+			d.TrustTruncated = true
+			return
+		}
+		d.TrustFiles = append(d.TrustFiles, trustFile{User: u.Name, fileMeta: metaOf(p, fi)})
+	}
 }
 
 // capKeys keeps at most limit keys in all, in order; it reports whether any
@@ -113,9 +170,9 @@ func capKeys(users []authKeysUser, limit int) bool {
 // userKeysFiles walks the files sshd would read for u, missing ones left out.
 // read caches files by path; StrictModes is checked per user, as it
 // depends on the owner and home.
-func userKeysFiles(sc *scanCtx, sshd *sshdResult, u account, read map[string]keysFile, gaps *gapList) []authKeysFile {
+func userKeysFiles(sc *scanCtx, sshd *sshdResult, u account, groups []string, read map[string]keysFile, gaps *gapList) []authKeysFile {
 	var files []authKeysFile
-	for _, pattern := range sshd.filesFor(u.Name) {
+	for _, pattern := range sshd.filesFor(u.Name, groups) {
 		paths, errs := expandKeysPath(sc, pattern, u)
 		for _, e := range errs {
 			gaps.add(e.Path, e.Err)
@@ -143,15 +200,6 @@ func userKeysFiles(sc *scanCtx, sshd *sshdResult, u account, read map[string]key
 	return files
 }
 
-// filesFor is AuthorizedKeysFile for a user: a "Match User" block's, or
-// the global one.
-func (r *sshdResult) filesFor(user string) []string {
-	if f, ok := r.userKeysFiles[user]; ok {
-		return f
-	}
-	return r.authorizedKeysFiles
-}
-
 // expandKeysPath expands the tokens of an AuthorizedKeysFile entry (%% %h
 // %u %U), makes it absolute from home, and expands a glob (OpenSSH 10);
 // directories the glob could not list come back as errors.
@@ -164,10 +212,7 @@ func expandKeysPath(sc *scanCtx, pattern string, u account) ([]string, []sshdcon
 		p = strings.NewReplacer("%%", "%", "%h", u.home, "%u", u.Name, "%U", strconv.FormatInt(u.UID, 10)).Replace(p)
 	}
 	if !path.IsAbs(p) {
-		if u.home == "" {
-			return nil, nil
-		}
-		p = path.Join(u.home, p)
+		p = path.Join("/", u.home, p) // an empty home: sshd reads /.ssh/authorized_keys
 	}
 	p = path.Clean(p)
 	if !sshdconf.HasMeta(p) {
@@ -240,12 +285,14 @@ func strictModesOK(sc *scanCtx, file string, fi fs.FileInfo, u account) bool {
 }
 
 // readableBy: sshd opens the file as the user, not as root — a link to
-// /root/.ssh/authorized_keys gives the user nothing. Supplementary groups are
-// not known here, only the primary one.
+// /root/.ssh/authorized_keys gives the user nothing. Root reads any file.
+// Supplementary groups are not known here, only the primary one.
 func readableBy(fi fs.FileInfo, u account) bool {
 	uid, gid := fileOwner(fi)
 	perm := fi.Mode().Perm()
 	switch {
+	case u.UID == 0:
+		return true
 	case uid == u.UID:
 		return perm&0o400 != 0
 	case gid == u.GID:
