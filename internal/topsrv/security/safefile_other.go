@@ -16,3 +16,6 @@ func clearNonblock(*os.File) error { return nil }
 
 // privateFile has no owner to check off unix.
 func privateFile(os.FileInfo) bool { return true }
+
+// fileOwner has no owner to report off unix.
+func fileOwner(os.FileInfo) (uid, gid int64) { return -1, -1 }

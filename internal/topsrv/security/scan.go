@@ -28,6 +28,8 @@ type scanCtx struct {
 
 	// timeSync reads the kernel clock state; nil where it cannot be read.
 	timeSync func() (*timeSync, error)
+	key      tokenKey  // for tokens of secrets, see hmac.go
+	now      time.Time // start of the pass; zero in tests means the clock
 
 	mountsOnce sync.Once
 	mounts     mounts // remote mounts only, see remoteOnly
@@ -152,6 +154,15 @@ func (sc *scanCtx) mountTable() (mounts, error) {
 	return sc.mounts, sc.mountsErr
 }
 
+// today is the day of the pass, in days since 1970-01-01 as shadow counts.
+func (sc *scanCtx) today() int64 {
+	now := sc.now
+	if now.IsZero() {
+		now = time.Now()
+	}
+	return now.Unix() / int64(24*time.Hour/time.Second)
+}
+
 // result returns the typed result of an earlier section: from this pass, or
 // from the last pass it finished in time.
 func (sc *scanCtx) result(section string) any {
@@ -269,6 +280,7 @@ type sectionDef struct {
 var allSections = []sectionDef{
 	{name: SectionKernel, budget: 2 * time.Second, run: noResult(collectKernel)},
 	{name: SectionSysctl, budget: 2 * time.Second, host: true, run: noResult(collectSysctl)},
+	{name: SectionAccounts, budget: 2 * time.Second, host: true, run: collectAccounts},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
 
@@ -287,7 +299,7 @@ type cachedSection struct {
 // rebuilds only its sections.
 func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync, results: c.lastResults()}
+	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, results: c.lastResults()}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {

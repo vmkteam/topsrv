@@ -89,7 +89,7 @@ Where the agent runs. Without it every other section could give a false pass: in
 | `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -151,6 +151,43 @@ Raw values; norms depend on the host role and are the backend's job. A key the k
 | `ipv6Conf` | map | Interface → `accept_redirects`, `accept_ra`, `accept_source_route`, `forwarding`, `disable_ipv6`. The kernel reads `accept_redirects` and `accept_ra` from the interface only (writing `all` does not change existing interfaces), and forwarding on the interface switches them off (`accept_ra=2` excepted), so `all.accept_ra=0` alone proves nothing |
 | `confTruncated` | bool | `true` when there were more than 64 interfaces, absent otherwise. Physical interfaces are taken first, per-guest ones (`fwbr*`, `fwln*`, `fwpr*`, `tap*`, `vnet*`, `vif*`) last; container-side interfaces (`veth*`, `cali*`, `lxc*`) are always skipped |
 
+## `accounts`
+
+Users and groups from `/etc/passwd`, `/etc/shadow`, `/etc/group` and `/etc/nsswitch.conf`, read as files, **not through NSS**: a directory (LDAP, SSSD) is never queried. Without `/etc/passwd` the section is `unknown`; an unreadable shadow or group is a gap, and what depends on it is `null`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `users[]` | object | One per passwd user, in file order, at most 2000 (the receiving side caps a snapshot at 1 MB). Fields below |
+| `truncated` | bool | `true` when there were more users; the anomalies still cover all of them. Absent otherwise |
+| `privilegedGroups` | map | Group → members, for the groups present among `root`, `sudo`, `wheel`, `admin`, `adm`, `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `shadow`. Members are the group's member list and the users whose primary group it is. `docker`, `lxd` and `incus-admin` are root in all but name. `null` when group is unread |
+| `anomalies` | object | `uid0Users` (every user with uid 0, root included), `duplicateUids`, `duplicateNames`, `passwdShadowMismatch` (users with `x` in passwd and no shadow entry, and shadow entries with no passwd user; `null` when shadow is unread) |
+| `nisCompat` | bool | passwd or group has NIS `+`/`-` lines: users the agent does not see. Absent otherwise |
+| `nss` | object | Sources of `passwd`, `group`, `shadow`, `sudoers`, `netgroup` as listed in nsswitch.conf (an odd name comes as `invalid`), and `externalIdentities`: `true` when `passwd`, `group` or `shadow` also use `sss`, `ldap`, `winbind`, `nis`, `nisplus` or `hesiod` — some users and their sudo rules are not in the files. `systemd` does not count: it is the Debian and Ubuntu default and only adds DynamicUser and homed users. `null` without nsswitch.conf (musl) |
+| `files[]` | object | `{path, mode, uid, gid}` of passwd, shadow, group and gshadow; `mode` is octal (`"0640"`) |
+| `malformed[]` | object | Lines that were skipped: `{file, line, code}`, `code` is `fields` or `id`. Never the text of the line |
+
+`users[]`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `name`, `uid`, `gid`, `shell` | | From passwd. GECOS is not read, home directories are not sent |
+| `shellClass` | string | `login` (an interactive shell, or an empty field: `/bin/sh`), `nologin`, `false` or `other` (`/bin/sync`, `git-shell`). A `nologin` user may still forward ports over SSH |
+| `pw` | string | The password field, classified below. `null` when shadow is unread, or passwd has `x` and shadow has no entry |
+| `marker` | string | With `pw: none`: the marker as written — `!`, `!!`, `!*`, `*`, `*LK*`, `*NP*`, `x`, `LK`, `NP` — or `other` for any other text, which is never sent as it may be anything |
+| `algo` | string | With a hash: `yescrypt`, `gost-yescrypt`, `scrypt`, `sha512`, `sha256`, `bcrypt`, `md5`, `des`, or `other` for another `$id$` |
+| `pwToken` | string | With a hash: the first 8 bytes of HMAC-SHA256 over the user name and the hash, keyed with the host key (`agent.keyId`). It changes when the password changes and tells nothing about it; locking (`!` before the hash) keeps it |
+| `lastChangeDays` | int | The shadow field as kept: days since 1970-01-01 of the last change; `0` — change at next login. `null` when empty or not read |
+| `expired` | bool | As pam_unix decides: the expiry date reached, or the password past its maximum age plus the inactive period. Either blocks SSH key logins too. `null` without a shadow entry |
+| `dynamicUser` | bool | uid in 61184–65519, the range of systemd `DynamicUser=`. Absent otherwise |
+
+| `pw` | Password field |
+|------|----------------|
+| `empty` | `""` — no password at all |
+| `none` | A marker, see `marker`: no password login. sshd without PAM treats only a leading `!` as locked; `*` is a password that never matches |
+| `lockedHash` | `!` before a hash: locked, the hash kept — unlocking brings the old password back |
+| `hash` | A hash in shadow |
+| `hashInPasswd` | A hash in passwd, readable by every user. shadow is not consulted then |
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -175,6 +212,8 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | Environment of PID 1 | Only whether `container=` is set and its value |
 | DMI strings (product name, vendors) | Only the hypervisor name derived from them |
 | Command lines of processes | Only the base name of `argv[0]`, and only if it is a role process |
+| `/etc/shadow` | The class of each password field, its algorithm and a keyed token; never the hash |
+| `/etc/passwd` | Name, uid, gid, shell; GECOS is not read, home directories are not sent |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |

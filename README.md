@@ -225,7 +225,7 @@ Channel  = "stable"         # stable / beta
 | `Security.Disabled` | `false` | Disable the security collector |
 | `Security.Interval` | `6h` | Full snapshot period (±10% jitter), minimum `15m` |
 | `Security.DisablePush` | `false` | Collect for `/metrics` and dry-run only, send nothing |
-| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `roleSignals` (and the names of later sections) |
+| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `roleSignals` (and the names of later sections) |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
@@ -425,6 +425,7 @@ section carries a `status` — `ok`, `partial` (with `gaps`), `unknown` (with a
 | `environment` | Host or container (docker, podman, k8s, lxc, nspawn, openvz), hypervisor (kvm, vmware, …, or none), pid/net/user namespaces, libc, init. In an app container the host sections come out `unknown/container_env` |
 | `kernel` | Taint flags, loaded modules, modules hidden from `/proc/modules`, CPU vulnerabilities, active LSMs, lockdown, AppArmor/SELinux mode, livepatches, clock sync (adjtimex), module signature enforcement, Secure Boot, kexec, SMT, microcode, whitelisted `/proc/cmdline` tokens only |
 | `sysctl` | Raw hardening values (KSPP and CIS keys, user namespaces, `core_pattern`/`modprobe`/`hotplug`, forwarding), `rp_filter`, redirects, forwarding and `accept_ra` for `all` and per interface |
+| `accounts` | Users from passwd/shadow/group read as files: password field class (`empty`, a lock marker, a hash and its algorithm) and a keyed token that changes with the password — never the hash or GECOS; uid 0 and duplicate users, members of privileged groups (sudo, wheel, docker, lxd), NSS sources |
 | `roleSignals` | Role processes in the host network namespace (dockerd, kubelet, libvirtd, tailscaled, …), interface and tunnel types (bridge, wireguard, tun, gre), interfaces with a default route, role marker files (`/dev/kvm`, kubelet config) |
 
 Untrusted files are read without following FIFOs or devices and with size

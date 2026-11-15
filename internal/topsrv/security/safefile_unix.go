@@ -35,3 +35,12 @@ func privateFile(fi os.FileInfo) bool {
 	st, ok := fi.Sys().(*syscall.Stat_t)
 	return ok && fi.Mode().Perm()&0o077 == 0 && int(st.Uid) == os.Geteuid()
 }
+
+// fileOwner returns the owner uid and gid of fi.
+func fileOwner(fi os.FileInfo) (uid, gid int64) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return -1, -1
+	}
+	return int64(st.Uid), int64(st.Gid)
+}

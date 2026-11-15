@@ -29,7 +29,7 @@ import (
 func hostFixture() map[string]string {
 	roles := rolesFixture()
 	delete(roles, "proc/self") // a directory here
-	return merge(hostProc(), kernelFixture(), sysctlFixture(), roles, map[string]string{
+	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), roles, map[string]string{
 		"etc/os-release":             "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
 		"proc/sys/kernel/osrelease":  "6.1.0-27-amd64\n",
 		"var/lib/dpkg/status":        "",
@@ -76,7 +76,7 @@ func TestPass(t *testing.T) {
 	assert.Equal(t, 0, d.Agent.UID)
 	assert.Contains(t, d.Agent.CapEff, "CAP_SYS_PTRACE")
 	assert.Equal(t, StatusOK, d.Environment.Status)
-	require.Len(t, d.Sections, 3)
+	require.Len(t, d.Sections, len(allSections))
 	for name, sec := range d.Sections {
 		assert.Equal(t, StatusOK, sec.Status, "%s: %v", name, sec.Gaps)
 	}

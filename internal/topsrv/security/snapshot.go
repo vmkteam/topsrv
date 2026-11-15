@@ -13,6 +13,10 @@ import (
 // valueUnknown is the enum value for a fact that could not be read.
 const valueUnknown = "unknown"
 
+// valueInvalid replaces a token from a file that does not look like one: an
+// odd value is not sent as it is.
+const valueInvalid = "invalid"
+
 // Kind is the /v1/inventory discriminator of the security snapshot.
 const Kind = "security"
 
