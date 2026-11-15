@@ -49,7 +49,7 @@ var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "B
 var sshdUnits = []string{"ssh.service", "sshd.service"}
 
 // unitDirs in systemd's order of precedence.
-var unitDirs = []string{"/etc/systemd/system", "/run/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"}
+var unitDirs = []string{"/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"}
 
 // sshdBinaries may hold the PAM code: sshd-session since OpenSSH 9.8,
 // sshd-auth since 10.0.

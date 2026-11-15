@@ -57,6 +57,14 @@ func sentinelFiles() map[string]string {
 			"alice ALL = NOPASSWD: SVC\n" +
 			"SENTINELLINE is not sudoers\n",
 		"etc/doas.conf": "permit nopass alice as root cmd /usr/bin/SENTINEL args SENTINELSECRET\n",
+
+		// updates: a proxy password and a hook command apt reads with the
+		// periodic keys, a value of an unexpected form, a line apt refuses
+		"etc/apt/apt.conf.d/01proxy": "Acquire::http::Proxy \"http://u:SENTINELSECRET@192.0.2.1:3128\";\n" +
+			"DPkg::Pre-Invoke { \"/usr/bin/SENTINEL --token SENTINELSECRET\"; };\n",
+		"etc/apt/apt.conf.d/20auto-upgrades": "APT::Periodic::Update-Package-Lists \"1\";\n" +
+			"APT::Periodic::Unattended-Upgrade \"SENTINELSECRET\";\n",
+		"etc/apt/apt.conf.d/99broken": "SENTINELLINE is not apt.conf\n",
 	}
 }
 
@@ -120,7 +128,7 @@ func TestNoSecretsLeak(t *testing.T) {
 // nothing.
 func requireMarkersRead(t *testing.T, d Data) {
 	t.Helper()
-	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers} {
+	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers, SectionUpdates} {
 		require.Contains(t, []Status{StatusOK, StatusPartial}, d.Sections[name].Status, "%s: %+v", name, d.Sections[name])
 	}
 
@@ -149,4 +157,9 @@ func requireMarkersRead(t *testing.T, d Data) {
 	assert.True(t, slices.ContainsFunc(sudo.Rules, func(r sudoRule) bool { return slices.Contains(r.Principals, "alice") }),
 		"the rule using the alias")
 	assert.Len(t, sudo.DoasRules, 1)
+
+	apt := d.Sections[SectionUpdates].Data.(updatesData).APT
+	require.NotNil(t, apt)
+	assert.Equal(t, valueInvalid, *apt.Periodic.UnattendedUpgrade, "the value read and replaced")
+	assert.Len(t, apt.ParseErrors, 1, "the line apt refuses")
 }
