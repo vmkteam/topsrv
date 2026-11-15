@@ -100,7 +100,8 @@ type sshdMatch struct {
 	Evaluable bool                 `json:"evaluable"`
 	Keys      map[string]sshdValue `json:"keys"`
 	// EqualsSyntax: written criterion=pattern (criteria come split into
-	// pairs either way), which only OpenSSH 10.0+ accepts: older sshd exits.
+	// pairs either way): upstream OpenSSH takes it since 10.0, RHEL 9's
+	// 9.9p1 too; an older sshd exits on the line.
 	EqualsSyntax bool `json:"equalsSyntax,omitempty"`
 }
 

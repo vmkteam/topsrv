@@ -46,8 +46,8 @@ type MatchBlock struct {
 	Criteria []string // criterion, pattern pairs; Invalid-User alone
 	Source   string
 	Keys     map[string]Value
-	// EqualsSyntax: a criterion was written criterion=pattern, which sshd
-	// takes since OpenSSH 10.0 and refuses before.
+	// EqualsSyntax: a criterion was written criterion=pattern, which
+	// upstream sshd takes since OpenSSH 10.0 (RHEL 9's 9.9p1 too).
 	EqualsSyntax bool
 }
 
