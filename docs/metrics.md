@@ -30,7 +30,7 @@ For example PromQL queries and alert recipes, see [promql-recipes.md](promql-rec
 | `topsrv_disk_write_time_seconds_total` | counter | device | Write time |
 | `topsrv_disk_io_time_seconds_total` | counter | device | Total I/O time |
 | `topsrv_disk_io_time_weighted_seconds_total` | counter | device | Weighted I/O time (queue depth) |
-| `topsrv_filesystem_bytes` | gauge | mountpoint, device, fstype, type | Filesystem space (total/used/free) |
+| `topsrv_filesystem_bytes` | gauge | mountpoint, device, fstype, type | Filesystem space (total/used/free). Block-backed filesystems and ZFS datasets; pseudo, FUSE and network filesystems (tmpfs, overlay, sshfs, NFS, CIFS), bind mounts, mounted ZFS snapshots and Docker zfs-driver layers are left out. A filesystem mounted at several places (btrfs subvolumes) is reported once, at its first mountpoint |
 | `topsrv_filesystem_inodes` | gauge | mountpoint, type | Filesystem inodes (total/used/free) |
 
 ## Network (`topsrv_network_*`)

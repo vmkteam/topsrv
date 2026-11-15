@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"context"
+	"strings"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/shirou/gopsutil/v4/disk"
@@ -88,11 +89,19 @@ func (c *DiskCollector) collectFilesystems(ch chan<- prometheus.Metric) {
 		c.Print(context.Background(), "disk: Partitions failed", "error", err)
 		return
 	}
+	// A filesystem mounted at several places reports the same space at each:
+	// btrfs subvolumes, a bind of a whole mount (root "/", which gopsutil does
+	// not flag). The first mount wins, mountinfo lists them in mount order.
+	seen := make(map[string]bool, len(partitions))
 	for _, p := range partitions {
+		if seen[p.Device] || isEphemeralMount(p) {
+			continue
+		}
 		usage, err := disk.Usage(p.Mountpoint)
 		if err != nil {
 			continue
 		}
+		seen[p.Device] = true
 		ch <- prometheus.MustNewConstMetric(c.fsBytes, prometheus.GaugeValue, float64(usage.Total), p.Mountpoint, p.Device, p.Fstype, "total")
 		ch <- prometheus.MustNewConstMetric(c.fsBytes, prometheus.GaugeValue, float64(usage.Used), p.Mountpoint, p.Device, p.Fstype, "used")
 		ch <- prometheus.MustNewConstMetric(c.fsBytes, prometheus.GaugeValue, float64(usage.Free), p.Mountpoint, p.Device, p.Fstype, "free")
@@ -100,4 +109,16 @@ func (c *DiskCollector) collectFilesystems(ch chan<- prometheus.Metric) {
 		ch <- prometheus.MustNewConstMetric(c.fsInodes, prometheus.GaugeValue, float64(usage.InodesUsed), p.Mountpoint, "used")
 		ch <- prometheus.MustNewConstMetric(c.fsInodes, prometheus.GaugeValue, float64(usage.InodesFree), p.Mountpoint, "free")
 	}
+}
+
+// isEphemeralMount reports ZFS mounts that come and go with containers and
+// snapshot browsing. Partitions(false) keeps every ZFS dataset, so without
+// this a Docker host on the zfs storage driver would emit a series set per
+// running container layer, and every snapshot automounted under .zfs/snapshot
+// (source pool/ds@snap) would add one too.
+func isEphemeralMount(p disk.PartitionStat) bool {
+	if p.Fstype != "zfs" {
+		return false
+	}
+	return strings.Contains(p.Device, "@") || strings.Contains(p.Mountpoint, "/zfs/graph/")
 }
