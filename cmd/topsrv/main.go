@@ -97,7 +97,7 @@ func securityDryRun(logger embedlog.Logger) {
 			sections = append(sections, s)
 		}
 	}
-	out, err := app.SecurityDryRun(context.Background(), logger, cfg, sections)
+	out, err := app.SecurityDryRun(context.Background(), logger, cfg, version, sections)
 	exitOnError(err)
 	_, err = os.Stdout.Write(append(out, '\n'))
 	exitOnError(err)

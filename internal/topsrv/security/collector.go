@@ -263,9 +263,10 @@ func (c *Collector) recordMetrics(name string, sec Section) {
 }
 
 // DryRun runs one pass of the sections (every enabled one when empty) and
-// returns the snapshot as indented JSON, exactly what would be sent. It
-// writes nothing: the existing token key is used, or an ephemeral one.
-func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir string, sections []string) ([]byte, error) {
+// returns the snapshot as indented JSON, exactly what would be sent, with
+// the agentVersion the pusher stamps. It writes nothing: the existing token
+// key is used, or an ephemeral one.
+func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir, version string, sections []string) ([]byte, error) {
 	c := NewCollector(logger, cfg, stateDir)
 	for _, name := range sections {
 		switch {
@@ -283,5 +284,6 @@ func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir st
 	if !ok {
 		return nil, errors.New("security: the pass panicked, see the log")
 	}
+	p.AgentVersion = version
 	return json.MarshalIndent(p, "", "  ")
 }
