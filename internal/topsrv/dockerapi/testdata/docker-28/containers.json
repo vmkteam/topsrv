@@ -1,0 +1,157 @@
+[
+  {
+    "Id": "4eff220014e854cc5ac88e479af3896f35e53bfe8fa2d592993725b2ba4a15cf",
+    "Names": [
+      "/v6only"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:d2482869a6b838d3b4c9cad0c8085c06277909482771eb525d298fc3a7d07927",
+    "Command": "sleep 1d",
+    "Created": 1794757959,
+    "Ports": [
+      {
+        "IP": "::",
+        "PrivatePort": 443,
+        "PublicPort": 8443,
+        "Type": "tcp"
+      }
+    ],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "MacAddress": "f2:00:5a:b6:99:70",
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "7b0a467ae3784e4dc5f6d90cd827b07805bf11e74923b285622d041ecc2baca7",
+          "EndpointID": "e7ef1a6126b7fd06e561ac12561787ca01cd9132b8dfd81773e4fd3d22596b78",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.4",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  },
+  {
+    "Id": "e78cbe3a35ffdf32bda9919338a57570256fa16fbffe5a8e1a8a974a32911f96",
+    "Names": [
+      "/internal"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:d2482869a6b838d3b4c9cad0c8085c06277909482771eb525d298fc3a7d07927",
+    "Command": "sleep 1d",
+    "Created": 1794757959,
+    "Ports": [],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "MacAddress": "da:18:71:db:21:a1",
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "7b0a467ae3784e4dc5f6d90cd827b07805bf11e74923b285622d041ecc2baca7",
+          "EndpointID": "a14d25155c45f9dc5e4499f1c7dcae337a5bce5872bd2517dcc63e7e8d401fb2",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.3",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  },
+  {
+    "Id": "a9b5200ab75d5128276f380ff5a0a4dc7f16a75572bb4a15fb8a2589cbbd51d4",
+    "Names": [
+      "/web"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:d2482869a6b838d3b4c9cad0c8085c06277909482771eb525d298fc3a7d07927",
+    "Command": "sleep 1d",
+    "Created": 1794757959,
+    "Ports": [
+      {
+        "IP": "127.0.0.1",
+        "PrivatePort": 9000,
+        "PublicPort": 9000,
+        "Type": "tcp"
+      },
+      {
+        "IP": "0.0.0.0",
+        "PrivatePort": 53,
+        "PublicPort": 5353,
+        "Type": "udp"
+      },
+      {
+        "IP": "::",
+        "PrivatePort": 53,
+        "PublicPort": 5353,
+        "Type": "udp"
+      },
+      {
+        "IP": "0.0.0.0",
+        "PrivatePort": 80,
+        "PublicPort": 8080,
+        "Type": "tcp"
+      },
+      {
+        "IP": "::",
+        "PrivatePort": 80,
+        "PublicPort": 8080,
+        "Type": "tcp"
+      }
+    ],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "MacAddress": "b2:80:e3:b6:b2:bc",
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "7b0a467ae3784e4dc5f6d90cd827b07805bf11e74923b285622d041ecc2baca7",
+          "EndpointID": "e258da9a678867ba08b278835802bc00a794c5d873c4153327630ba31cb8182b",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.2",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  }
+]

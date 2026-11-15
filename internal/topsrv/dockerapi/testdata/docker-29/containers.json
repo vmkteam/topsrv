@@ -1,0 +1,226 @@
+[
+  {
+    "Id": "6d82d159333634d306d676a853671d33e28621a91089ac97d2ce421ed06a04a4",
+    "Names": [
+      "/v6only"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
+    "ImageManifestDescriptor": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:365a051f12e05767b598e643676f14a450fb678a75ccf2beb0052c95d5c73b83",
+      "size": 610,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm64v8",
+        "org.opencontainers.image.base.name": "scratch",
+        "org.opencontainers.image.created": "2026-09-08T23:04:09Z",
+        "org.opencontainers.image.revision": "b6edf7d5c5200d629d7c3f7758293a3675471dde",
+        "org.opencontainers.image.source": "https://github.com/docker-library/busybox.git",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/busybox",
+        "org.opencontainers.image.version": "1.38.0-glibc"
+      },
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux",
+        "variant": "v8"
+      }
+    },
+    "Command": "sleep 1d",
+    "Created": 1794757997,
+    "Ports": [
+      {
+        "IP": "::",
+        "PrivatePort": 443,
+        "PublicPort": 8443,
+        "Type": "tcp"
+      }
+    ],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "Health": {
+      "Status": "none",
+      "FailingStreak": 0
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "4a61a274b905e9ae823f1141c8e1c7f098486ac368875ef87be0018ed700aabb",
+          "EndpointID": "3e9ca98b1367b4c96f525e325cf6a6946edf5e747453819375ad8a6dae15ed4d",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.4",
+          "MacAddress": "7a:cd:5f:82:b2:67",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  },
+  {
+    "Id": "f703a19eff6a64d693dbd7749ce740b506379465045d027e87868ec8327f5a9b",
+    "Names": [
+      "/internal"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
+    "ImageManifestDescriptor": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:365a051f12e05767b598e643676f14a450fb678a75ccf2beb0052c95d5c73b83",
+      "size": 610,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm64v8",
+        "org.opencontainers.image.base.name": "scratch",
+        "org.opencontainers.image.created": "2026-09-08T23:04:09Z",
+        "org.opencontainers.image.revision": "b6edf7d5c5200d629d7c3f7758293a3675471dde",
+        "org.opencontainers.image.source": "https://github.com/docker-library/busybox.git",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/busybox",
+        "org.opencontainers.image.version": "1.38.0-glibc"
+      },
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux",
+        "variant": "v8"
+      }
+    },
+    "Command": "sleep 1d",
+    "Created": 1794757997,
+    "Ports": [],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "Health": {
+      "Status": "none",
+      "FailingStreak": 0
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "4a61a274b905e9ae823f1141c8e1c7f098486ac368875ef87be0018ed700aabb",
+          "EndpointID": "509c621ca59ec8dfd879501057e4f490e880a7dc1d2decc2686d79f0c681a0e5",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.3",
+          "MacAddress": "0a:ba:dd:72:73:93",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  },
+  {
+    "Id": "7d2405360525847977c340381215ed2b920e1c2223690fc78ff7709eff88fd50",
+    "Names": [
+      "/web"
+    ],
+    "Image": "busybox",
+    "ImageID": "sha256:a46257e06c82ad85242d0d38077d0a52d9896389ca60a1a59d3463db586e5fa4",
+    "ImageManifestDescriptor": {
+      "mediaType": "application/vnd.oci.image.manifest.v1+json",
+      "digest": "sha256:365a051f12e05767b598e643676f14a450fb678a75ccf2beb0052c95d5c73b83",
+      "size": 610,
+      "annotations": {
+        "com.docker.official-images.bashbrew.arch": "arm64v8",
+        "org.opencontainers.image.base.name": "scratch",
+        "org.opencontainers.image.created": "2026-09-08T23:04:09Z",
+        "org.opencontainers.image.revision": "b6edf7d5c5200d629d7c3f7758293a3675471dde",
+        "org.opencontainers.image.source": "https://github.com/docker-library/busybox.git",
+        "org.opencontainers.image.url": "https://hub.docker.com/_/busybox",
+        "org.opencontainers.image.version": "1.38.0-glibc"
+      },
+      "platform": {
+        "architecture": "arm64",
+        "os": "linux",
+        "variant": "v8"
+      }
+    },
+    "Command": "sleep 1d",
+    "Created": 1794757996,
+    "Ports": [
+      {
+        "IP": "0.0.0.0",
+        "PrivatePort": 53,
+        "PublicPort": 5353,
+        "Type": "udp"
+      },
+      {
+        "IP": "::",
+        "PrivatePort": 53,
+        "PublicPort": 5353,
+        "Type": "udp"
+      },
+      {
+        "IP": "0.0.0.0",
+        "PrivatePort": 80,
+        "PublicPort": 8080,
+        "Type": "tcp"
+      },
+      {
+        "IP": "::",
+        "PrivatePort": 80,
+        "PublicPort": 8080,
+        "Type": "tcp"
+      },
+      {
+        "IP": "127.0.0.1",
+        "PrivatePort": 9000,
+        "PublicPort": 9000,
+        "Type": "tcp"
+      }
+    ],
+    "Labels": {},
+    "State": "running",
+    "Status": "Up Less than a second",
+    "HostConfig": {
+      "NetworkMode": "bridge"
+    },
+    "Health": {
+      "Status": "none",
+      "FailingStreak": 0
+    },
+    "NetworkSettings": {
+      "Networks": {
+        "bridge": {
+          "IPAMConfig": null,
+          "Links": null,
+          "Aliases": null,
+          "DriverOpts": null,
+          "GwPriority": 0,
+          "NetworkID": "4a61a274b905e9ae823f1141c8e1c7f098486ac368875ef87be0018ed700aabb",
+          "EndpointID": "3e8239bd891d0b2cc1b37f0574e4ae3970f86a979fd36984e6257005385220eb",
+          "Gateway": "172.17.0.1",
+          "IPAddress": "172.17.0.2",
+          "MacAddress": "22:4b:dd:3f:17:d4",
+          "IPPrefixLen": 16,
+          "IPv6Gateway": "",
+          "GlobalIPv6Address": "",
+          "GlobalIPv6PrefixLen": 0,
+          "DNSNames": null
+        }
+      }
+    },
+    "Mounts": []
+  }
+]
