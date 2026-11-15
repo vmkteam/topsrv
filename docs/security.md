@@ -89,7 +89,7 @@ Where the agent runs. Without it every other section could give a false pass: in
 | `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd`, `authorizedKeys` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -225,6 +225,22 @@ Each path is checked against `/proc/self/mountinfo` before any syscall, and so i
 | `keysExternal` | bool | `AuthorizedKeysCommand` is set: more keys may come from it |
 | `trustedUserCA` | bool | `TrustedUserCAKeys` is set: certificates signed by the CA are accepted too |
 
+## `sudoers`
+
+Who may run what as whom, parsed by sudoers(5) without sudo or visudo: `/etc/sudoers` with `@include`/`#include` (relative to the including file, `%h` the short host name, quoted paths) and `@includedir` (sudo skips names with a `.` or ending in `~`), up to depth 128, loops caught; aliases expanded. On Alpine `/etc/doas.conf` and `/etc/doas.d/*.conf` too. `na` with neither; `unknown` when `/etc/sudoers` is unreadable (it is 0440 root); an unreadable include is a gap. **Command texts are never sent**, only what the rules allow.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `sudoPresent` | bool | `/etc/sudoers` was read |
+| `rules[]` | object | In file order — sudo applies the last match: `{order, source, principals, hostsAll, runas, commandsAll, nopasswdAll, nopasswdAny, setenv}`. `principals` as written, aliases expanded: `user`, `%group`, `#uid`, `%#gid`, `+netgroup`, `ALL`, `!` for a negation. `runas` is `{users, groups, hasNegation}`, `null` without a runas spec (sudo's default, root); `hasNegation` — `(ALL, !root)` — is a fact, never a protection (CVE-2019-14287). `nopasswdAll`/`nopasswdAny` from the tags, which carry over to the following commands (`PASSWD:` after `NOPASSWD:` takes it back); negated commands grant nothing. `setenv` — `SETENV:`, which `ALL` implies. One rule per host list of a line |
+| `defaults` | object | Global Defaults after the whole policy: `authenticate` (`false` — no password for anyone), `rootpw`, `usePty` (`null` when not set), `envKeepLD` (`LD_*` kept in `env_keep`) |
+| `scopedDefaults[]` | object | Bound Defaults (`Defaults:user`, `@host`, `!command`, `>runas`) that switch `authenticate` off, set `rootpw` or keep `LD_*`: `{source, binding, list, …}` |
+| `files[]` | object | `{path, mode, uid, gid}` of the files read |
+| `ignoredFiles` | []string | includedir entries sudo skips: `sudoers.d/admin.conf` is never read |
+| `externalSources` | []string | Sources of `sudoers:` in nsswitch.conf other than `files` (`sss`, `ldap`): rules from them are not here |
+| `parseErrors[]` | object | `{file, line, code}`: `syntax`, `include_depth`, `include_loop`, `too_many_files`. Never the text |
+| `doasRules[]` | object | `{source, permit, principal, nopass, persist, keepenv, asRoot, cmd}`: `principal` a user or `:group`, `asRoot` without `as` or `as root`, `cmd` when restricted to one command. `null` without doas.conf |
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -254,6 +270,7 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | sshd configuration | The listed keywords with `file:line`; `AuthorizedKeysCommand`, `TrustedUserCAKeys`, `Banner` only as set or not |
 | Command line of the sshd listener | Only `-f`, `-o`, `-p`, to parse the configuration as sshd does |
 | `authorized_keys` | Fingerprint, type, size and which options a key has; never the comment or the values of `from=`, `command=`, `environment=` |
+| sudoers, doas.conf | Principals, host and runas lists, flags of the rules; never the commands |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |

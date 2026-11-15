@@ -29,7 +29,7 @@ import (
 func hostFixture() map[string]string {
 	roles := rolesFixture()
 	delete(roles, "proc/self") // a directory here
-	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), sshdFixture(), roles, map[string]string{
+	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), sshdFixture(), sudoFixture(), roles, map[string]string{
 		"etc/os-release":             "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
 		"proc/sys/kernel/osrelease":  "6.1.0-27-amd64\n",
 		"var/lib/dpkg/status":        "",
