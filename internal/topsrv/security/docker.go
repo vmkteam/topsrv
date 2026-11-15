@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"net"
 	"net/netip"
+	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -113,7 +114,8 @@ func collectDocker(ctx context.Context, sc *scanCtx) Section {
 	gaps.add("/proc/"+p.pid+"/cmdline", err)
 	flags := dockerapi.ParseArgs(strings.Split(strings.TrimRight(string(head), "\x00"), "\x00"))
 
-	file, fileSettings := readDockerConfig(sc, cmp.Or(flags.ConfigFile, dockerapi.DefaultConfigFile), &gaps)
+	configFile := path.Join("/", cmp.Or(flags.ConfigFile, dockerapi.DefaultConfigFile)) // relative to dockerd's cwd, /
+	file, fileSettings := readDockerConfig(sc, configFile, &gaps)
 	d.Config = dockerConfigOf(dockerapi.Merge(flags, fileSettings), file)
 	hosts := dockerapi.ResolveHosts(flags, fileSettings, unitValues(sc, dockerSocketUnit, "ListenStream"))
 	d.Hosts = dockerHostsOf(hosts)
@@ -144,7 +146,14 @@ func dockerDaemon(sc *scanCtx) (*process, error) {
 	hostMnt, _ := sc.readlink("/proc/1/ns/mnt")
 	hostNet, _ := sc.readlink("/proc/1/ns/net")
 	for _, p := range procs {
-		if p.name != "dockerd" || !trustedProcess(sc, p) {
+		if p.name != "dockerd" {
+			continue
+		}
+		if p.exe == "" { // found by argv[0]: without CAP_SYS_PTRACE its binary cannot be checked
+			err = fs.ErrPermission
+			continue
+		}
+		if !trustedProcess(sc, p) {
 			continue
 		}
 		if sameNamespace(sc, p.pid, "mnt", hostMnt) && sameNamespace(sc, p.pid, "net", hostNet) {

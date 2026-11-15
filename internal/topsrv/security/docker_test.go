@@ -171,6 +171,11 @@ func TestDockerAbsent(t *testing.T) {
 		sec, _ := dockerOf(t, sc)
 		assert.Equal(t, StatusNA, sec.Status, "not trusted: its -H and daemon.json are not read")
 	})
+	t.Run("a dockerd whose binary cannot be checked", func(t *testing.T) {
+		files := merge(dockerFixture(), map[string]string{"proc/300/exe": ""}) // readlink fails without CAP_SYS_PTRACE
+		sec, _ := dockerOf(t, fixture(t, files))
+		assert.Equal(t, unknown(ReasonPermissionDenied), sec, "found by argv[0], not trusted, not absent either")
+	})
 	t.Run("processes hidden", func(t *testing.T) {
 		sc := fixture(t, dockerFixture())
 		for _, pid := range []string{"1", "300"} { // hidepid=2: root's processes are not listed
@@ -252,7 +257,7 @@ func TestDockerHosts(t *testing.T) {
 func TestDockerConfig(t *testing.T) {
 	t.Run("--config-file, values of a form dockerd refuses", func(t *testing.T) {
 		sc := fixture(t, merge(dockerFixture(), map[string]string{
-			"proc/300/cmdline": "dockerd\x00--config-file\x00/srv/docker.json\x00--iptables=false\x00",
+			"proc/300/cmdline": "dockerd\x00--config-file\x00srv/docker.json\x00--iptables=false\x00", // relative to /
 			"srv/docker.json":  `{"firewall-backend": "SENTINEL", "ip": "SENTINEL", "userns-remap": "dockremap", "icc": "no"}`,
 		}))
 		_, d := dockerOf(t, sc)
