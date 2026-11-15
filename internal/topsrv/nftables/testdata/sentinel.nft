@@ -1,0 +1,15 @@
+# Markers where a rule carries text: a comment (rule userdata), a set name,
+# an address and a log prefix. None may leave the agent.
+table inet filter {
+	set SENTINEL_set {
+		type ipv4_addr
+		elements = { 192.0.2.1 }
+	}
+
+	chain input {
+		type filter hook input priority filter; policy accept;
+		ip saddr @SENTINEL_set counter accept comment "SENTINELSECRET"
+		ip saddr 192.0.2.2 log prefix "SENTINELSECRET " counter drop
+		meta mark set 0x5345 counter log prefix "SENTINELLINE " drop comment "SENTINELLINE"
+	}
+}

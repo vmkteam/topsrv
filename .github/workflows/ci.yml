@@ -56,6 +56,28 @@ jobs:
         with:
           scandir: scripts
 
+  # nftables read through a network namespace of its own, the way the agent
+  # reads PID 1's (Dial → setns): each ruleset of internal/topsrv/nftables/
+  # testdata is loaded with nft and iptables-nft-restore and read back. Needs
+  # root; the test binary is built as the runner user and only run with sudo.
+  # Not a required check until it proves stable.
+  firewall-netns:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Install nftables
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq nftables iptables
+
+      - name: Netns tests
+        run: |
+          go test -c -tags integration -o "$RUNNER_TEMP/nftables.test" ./internal/topsrv/nftables/
+          cd internal/topsrv/nftables && sudo "$RUNNER_TEMP/nftables.test" -test.run Netns -test.v
+
   release:
     needs: test
     runs-on: ubuntu-latest

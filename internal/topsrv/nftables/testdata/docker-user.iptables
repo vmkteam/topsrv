@@ -1,0 +1,321 @@
+*raw
+:PREROUTING ACCEPT [108495418:308958053191]
+:OUTPUT ACCEPT [0:0]
+-A PREROUTING -d 192.0.2.1/32 ! -i br-000000000001 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8000 -j DROP
+-A PREROUTING -d 192.0.2.2/32 ! -i docker0 -j DROP
+-A PREROUTING -d 192.0.2.3/32 ! -i docker0 -j DROP
+-A PREROUTING -d 192.0.2.4/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8181 -j DROP
+-A PREROUTING -d 192.0.2.5/32 ! -i br-000000000002 -j DROP
+-A PREROUTING -d 192.0.2.6/32 ! -i br-000000000002 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18088 -j DROP
+-A PREROUTING -d 192.0.2.7/32 ! -i br-000000000003 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18100 -j DROP
+-A PREROUTING -d 192.0.2.8/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8180 -j DROP
+-A PREROUTING -d 192.0.2.9/32 ! -i br-000000000003 -j DROP
+-A PREROUTING -d 192.0.2.10/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18101 -j DROP
+-A PREROUTING -d 192.0.2.11/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18103 -j DROP
+-A PREROUTING -d 192.0.2.12/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18102 -j DROP
+-A PREROUTING -d 192.0.2.13/32 ! -i docker0 -j DROP
+-A PREROUTING -d 192.0.2.14/32 ! -i br-000000000002 -j DROP
+-A PREROUTING -d 192.0.2.15/32 ! -i br-000000000002 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18089 -j DROP
+-A PREROUTING -d 192.0.2.16/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8190 -j DROP
+-A PREROUTING -d 192.0.2.17/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8191 -j DROP
+-A PREROUTING -d 192.0.2.18/32 ! -i br-000000000004 -j DROP
+-A PREROUTING -d 192.0.2.19/32 ! -i br-000000000004 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8291 -j DROP
+-A PREROUTING -d 192.0.2.20/32 ! -i br-000000000004 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8292 -j DROP
+-A PREROUTING -d 192.0.2.21/32 ! -i br-000000000005 -j DROP
+-A PREROUTING -d 192.0.2.22/32 ! -i br-000000000005 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8183 -j DROP
+-A PREROUTING -d 192.0.2.23/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 10000 -j DROP
+-A PREROUTING -d 192.0.2.24/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 10001 -j DROP
+-A PREROUTING -d 192.0.2.25/32 ! -i br-000000000006 -j DROP
+-A PREROUTING -d 192.0.2.26/32 ! -i br-000000000006 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8184 -j DROP
+-A PREROUTING -d 192.0.2.27/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 9103 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 9104 -j DROP
+-A PREROUTING -d 192.0.2.28/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8123 -j DROP
+-A PREROUTING -d 192.0.2.29/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8125 -j DROP
+-A PREROUTING -d 192.0.2.30/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 18789 -j DROP
+-A PREROUTING -d 192.0.2.31/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8642 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 9119 -j DROP
+-A PREROUTING -d 192.0.2.32/32 ! -i docker0 -j DROP
+-A PREROUTING -d 192.0.2.33/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8186 -j DROP
+-A PREROUTING -d 192.0.2.34/32 ! -i docker0 -j DROP
+-A PREROUTING -d 127.0.0.1/32 ! -i lo -p tcp -m tcp --dport 8187 -j DROP
+COMMIT
+*filter
+:INPUT DROP [1102631:65881220]
+:FORWARD DROP [0:0]
+:OUTPUT ACCEPT [2402:156923]
+:DOCKER - [0:0]
+:DOCKER-BRIDGE - [0:0]
+:DOCKER-CT - [0:0]
+:DOCKER-FORWARD - [0:0]
+:DOCKER-INTERNAL - [0:0]
+:DOCKER-USER - [0:0]
+:ufw-after-forward - [0:0]
+:ufw-after-input - [0:0]
+:ufw-after-logging-forward - [0:0]
+:ufw-after-logging-input - [0:0]
+:ufw-after-logging-output - [0:0]
+:ufw-after-output - [0:0]
+:ufw-before-forward - [0:0]
+:ufw-before-input - [0:0]
+:ufw-before-logging-forward - [0:0]
+:ufw-before-logging-input - [0:0]
+:ufw-before-logging-output - [0:0]
+:ufw-before-output - [0:0]
+:ufw-logging-allow - [0:0]
+:ufw-logging-deny - [0:0]
+:ufw-not-local - [0:0]
+:ufw-reject-forward - [0:0]
+:ufw-reject-input - [0:0]
+:ufw-reject-output - [0:0]
+:ufw-skip-to-policy-forward - [0:0]
+:ufw-skip-to-policy-input - [0:0]
+:ufw-skip-to-policy-output - [0:0]
+:ufw-track-forward - [0:0]
+:ufw-track-input - [0:0]
+:ufw-track-output - [0:0]
+:ufw-user-forward - [0:0]
+:ufw-user-input - [0:0]
+:ufw-user-limit - [0:0]
+:ufw-user-limit-accept - [0:0]
+:ufw-user-logging-forward - [0:0]
+:ufw-user-logging-input - [0:0]
+:ufw-user-logging-output - [0:0]
+:ufw-user-output - [0:0]
+-A INPUT -j ufw-before-logging-input
+-A INPUT -j ufw-before-input
+-A INPUT -j ufw-after-input
+-A INPUT -j ufw-after-logging-input
+-A INPUT -j ufw-reject-input
+-A INPUT -j ufw-track-input
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+-A FORWARD -j ufw-before-logging-forward
+-A FORWARD -j ufw-before-forward
+-A FORWARD -j ufw-after-forward
+-A FORWARD -j ufw-after-logging-forward
+-A FORWARD -j ufw-reject-forward
+-A FORWARD -j ufw-track-forward
+-A OUTPUT -j ufw-before-logging-output
+-A OUTPUT -j ufw-before-output
+-A OUTPUT -j ufw-after-output
+-A OUTPUT -j ufw-after-logging-output
+-A OUTPUT -j ufw-reject-output
+-A OUTPUT -j ufw-track-output
+-A DOCKER -d 192.0.2.34/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 81 -j ACCEPT
+-A DOCKER -d 192.0.2.33/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 81 -j ACCEPT
+-A DOCKER -d 192.0.2.31/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 9119 -j ACCEPT
+-A DOCKER -d 192.0.2.31/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8642 -j ACCEPT
+-A DOCKER -d 192.0.2.30/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 18789 -j ACCEPT
+-A DOCKER -d 192.0.2.29/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8123 -j ACCEPT
+-A DOCKER -d 192.0.2.28/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8123 -j ACCEPT
+-A DOCKER -d 192.0.2.27/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 7999 -j ACCEPT
+-A DOCKER -d 192.0.2.27/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 7990 -j ACCEPT
+-A DOCKER -d 192.0.2.26/32 ! -i br-000000000006 -o br-000000000006 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.24/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 10000 -j ACCEPT
+-A DOCKER -d 192.0.2.23/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 10000 -j ACCEPT
+-A DOCKER -d 192.0.2.22/32 ! -i br-000000000005 -o br-000000000005 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.20/32 ! -i br-000000000004 -o br-000000000004 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.19/32 ! -i br-000000000004 -o br-000000000004 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.17/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.16/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.15/32 ! -i br-000000000002 -o br-000000000002 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.12/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8080 -j ACCEPT
+-A DOCKER -d 192.0.2.11/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8080 -j ACCEPT
+-A DOCKER -d 192.0.2.10/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8080 -j ACCEPT
+-A DOCKER -d 192.0.2.8/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.7/32 ! -i br-000000000003 -o br-000000000003 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.6/32 ! -i br-000000000002 -o br-000000000002 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.4/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 80 -j ACCEPT
+-A DOCKER -d 192.0.2.3/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8943 -j ACCEPT
+-A DOCKER -d 192.0.2.2/32 ! -i docker0 -o docker0 -p tcp -m tcp --dport 8942 -j ACCEPT
+-A DOCKER -d 192.0.2.1/32 ! -i br-000000000001 -o br-000000000001 -p tcp -m tcp --dport 8000 -j ACCEPT
+-A DOCKER ! -i br-000000000001 -o br-000000000001 -j DROP
+-A DOCKER ! -i docker0 -o docker0 -j DROP
+-A DOCKER ! -i br-000000000002 -o br-000000000002 -j DROP
+-A DOCKER ! -i br-000000000003 -o br-000000000003 -j DROP
+-A DOCKER ! -i br-000000000004 -o br-000000000004 -j DROP
+-A DOCKER ! -i br-000000000005 -o br-000000000005 -j DROP
+-A DOCKER ! -i br-000000000006 -o br-000000000006 -j DROP
+-A DOCKER ! -i br-000000000007 -o br-000000000007 -j DROP
+-A DOCKER ! -i br-000000000008 -o br-000000000008 -j DROP
+-A DOCKER ! -i br-000000000009 -o br-000000000009 -j DROP
+-A DOCKER-BRIDGE -o br-000000000001 -j DOCKER
+-A DOCKER-BRIDGE -o docker0 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000002 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000003 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000004 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000005 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000006 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000007 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000008 -j DOCKER
+-A DOCKER-BRIDGE -o br-000000000009 -j DOCKER
+-A DOCKER-CT -o br-000000000001 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000002 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000003 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000004 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000005 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000006 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000007 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000008 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-CT -o br-000000000009 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-FORWARD -j DOCKER-CT
+-A DOCKER-FORWARD -j DOCKER-INTERNAL
+-A DOCKER-FORWARD -j DOCKER-BRIDGE
+-A DOCKER-FORWARD -i br-000000000001 -j ACCEPT
+-A DOCKER-FORWARD -i docker0 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000002 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000003 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000004 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000005 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000006 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000007 -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000a -o br-00000000000a -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000b -o br-00000000000b -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000c -o br-00000000000c -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000008 -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000d -o br-00000000000d -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000e -o br-00000000000e -j ACCEPT
+-A DOCKER-FORWARD -i br-00000000000f -o br-00000000000f -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000009 -j ACCEPT
+-A DOCKER-FORWARD -i br-000000000010 -o br-000000000010 -j ACCEPT
+-A DOCKER-INTERNAL ! -s 198.51.100.1/32 -o br-000000000010 -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.1/32 -i br-000000000010 -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.2/32 -o br-00000000000f -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.2/32 -i br-00000000000f -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.3/32 -o br-00000000000e -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.3/32 -i br-00000000000e -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.4/32 -o br-00000000000d -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.4/32 -i br-00000000000d -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.5/32 -o br-00000000000c -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.5/32 -i br-00000000000c -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.6/32 -o br-00000000000b -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.6/32 -i br-00000000000b -j DROP
+-A DOCKER-INTERNAL ! -s 198.51.100.7/32 -o br-00000000000a -j DROP
+-A DOCKER-INTERNAL ! -d 198.51.100.7/32 -i br-00000000000a -j DROP
+-A DOCKER-USER -m conntrack --ctstate RELATED,ESTABLISHED -j RETURN
+-A DOCKER-USER -i eno1 -j DROP
+-A DOCKER-USER -j RETURN
+-A ufw-after-input -p udp -m udp --dport 137 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 138 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp -m tcp --dport 139 -j ufw-skip-to-policy-input
+-A ufw-after-input -p tcp -m tcp --dport 445 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 67 -j ufw-skip-to-policy-input
+-A ufw-after-input -p udp -m udp --dport 68 -j ufw-skip-to-policy-input
+-A ufw-after-input -m addrtype --dst-type BROADCAST -j ufw-skip-to-policy-input
+-A ufw-after-logging-input -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW BLOCK] "
+-A ufw-before-forward -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 3 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 11 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 12 -j ACCEPT
+-A ufw-before-forward -p icmp -m icmp --icmp-type 8 -j ACCEPT
+-A ufw-before-forward -j ufw-user-forward
+-A ufw-before-input -i lo -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-input -m conntrack --ctstate INVALID -j ufw-logging-deny
+-A ufw-before-input -m conntrack --ctstate INVALID -j DROP
+-A ufw-before-input -p icmp -m icmp --icmp-type 3 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 11 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 12 -j ACCEPT
+-A ufw-before-input -p icmp -m icmp --icmp-type 8 -j ACCEPT
+-A ufw-before-input -p udp -m udp --sport 67 --dport 68 -j ACCEPT
+-A ufw-before-input -j ufw-not-local
+-A ufw-before-input -d 224.0.0.251/32 -p udp -m udp --dport 5353 -j ACCEPT
+-A ufw-before-input -d 239.255.255.250/32 -p udp -m udp --dport 1900 -j ACCEPT
+-A ufw-before-input -j ufw-user-input
+-A ufw-before-output -o lo -j ACCEPT
+-A ufw-before-output -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A ufw-before-output -j ufw-user-output
+-A ufw-logging-allow -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW ALLOW] "
+-A ufw-logging-deny -m conntrack --ctstate INVALID -m limit --limit 3/min --limit-burst 10 -j RETURN
+-A ufw-logging-deny -m limit --limit 3/min --limit-burst 10 -j LOG --log-prefix "[UFW BLOCK] "
+-A ufw-not-local -m addrtype --dst-type LOCAL -j RETURN
+-A ufw-not-local -m addrtype --dst-type MULTICAST -j RETURN
+-A ufw-not-local -m addrtype --dst-type BROADCAST -j RETURN
+-A ufw-not-local -m limit --limit 3/min --limit-burst 10 -j ufw-logging-deny
+-A ufw-not-local -j DROP
+-A ufw-skip-to-policy-forward -j ACCEPT
+-A ufw-skip-to-policy-input -j DROP
+-A ufw-skip-to-policy-output -j ACCEPT
+-A ufw-track-forward -p tcp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-track-forward -p udp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-track-output -p tcp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-track-output -p udp -m conntrack --ctstate NEW -j ACCEPT
+-A ufw-user-input -p tcp -m tcp --dport 22 -j ACCEPT
+-A ufw-user-input -p tcp -m tcp --dport 80 -j ACCEPT
+-A ufw-user-input -p tcp -m tcp --dport 443 -j ACCEPT
+-A ufw-user-input -p udp -m udp --dport 443 -j ACCEPT
+-A ufw-user-limit -m limit --limit 3/min -j LOG --log-prefix "[UFW LIMIT BLOCK] "
+-A ufw-user-limit -j REJECT --reject-with icmp-port-unreachable
+-A ufw-user-limit-accept -j ACCEPT
+COMMIT
+*nat
+:PREROUTING ACCEPT [2457717:142637293]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [3454230:219718860]
+:POSTROUTING ACCEPT [3488645:221887647]
+:DOCKER - [0:0]
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 198.51.100.8/32 ! -o br-000000000009 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.9/32 ! -o br-000000000008 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.10/32 ! -o br-000000000007 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.11/32 ! -o br-000000000006 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.12/32 ! -o br-000000000005 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.13/32 ! -o br-000000000004 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.14/32 ! -o br-000000000003 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.15/32 ! -o br-000000000002 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.16/32 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.17/32 ! -o br-000000000001 -j MASQUERADE
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000001 -p tcp -m tcp --dport 8000 -j DNAT --to-destination 192.0.2.1:8000
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8942 -j DNAT --to-destination 192.0.2.2:8942
+-A DOCKER ! -i docker0 -p tcp -m tcp --dport 8943 -j DNAT --to-destination 192.0.2.3:8943
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8181 -j DNAT --to-destination 192.0.2.4:80
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000002 -p tcp -m tcp --dport 18088 -j DNAT --to-destination 192.0.2.6:80
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000003 -p tcp -m tcp --dport 18100 -j DNAT --to-destination 192.0.2.7:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8180 -j DNAT --to-destination 192.0.2.8:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 18101 -j DNAT --to-destination 192.0.2.10:8080
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 18103 -j DNAT --to-destination 192.0.2.11:8080
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 18102 -j DNAT --to-destination 192.0.2.12:8080
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000002 -p tcp -m tcp --dport 18089 -j DNAT --to-destination 192.0.2.15:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8190 -j DNAT --to-destination 192.0.2.16:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8191 -j DNAT --to-destination 192.0.2.17:80
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000004 -p tcp -m tcp --dport 8291 -j DNAT --to-destination 192.0.2.19:80
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000004 -p tcp -m tcp --dport 8292 -j DNAT --to-destination 192.0.2.20:80
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000005 -p tcp -m tcp --dport 8183 -j DNAT --to-destination 192.0.2.22:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 10000 -j DNAT --to-destination 192.0.2.23:10000
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 10001 -j DNAT --to-destination 192.0.2.24:10000
+-A DOCKER -d 127.0.0.1/32 ! -i br-000000000006 -p tcp -m tcp --dport 8184 -j DNAT --to-destination 192.0.2.26:80
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 9103 -j DNAT --to-destination 192.0.2.27:7990
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 9104 -j DNAT --to-destination 192.0.2.27:7999
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8123 -j DNAT --to-destination 192.0.2.28:8123
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8125 -j DNAT --to-destination 192.0.2.29:8123
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 18789 -j DNAT --to-destination 192.0.2.30:18789
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8642 -j DNAT --to-destination 192.0.2.31:8642
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 9119 -j DNAT --to-destination 192.0.2.31:9119
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8186 -j DNAT --to-destination 192.0.2.33:81
+-A DOCKER -d 127.0.0.1/32 ! -i docker0 -p tcp -m tcp --dport 8187 -j DNAT --to-destination 192.0.2.34:81
+COMMIT

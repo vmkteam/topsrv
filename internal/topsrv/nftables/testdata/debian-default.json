@@ -1,0 +1,64 @@
+[
+ {
+  "request": {
+   "type": "gen",
+   "family": "unspec"
+  },
+  "reply": [
+   "OAAAAA8KAAABAAAAPhUAAAAAAAIIAAEAAAAAAggAAgAAMtX9EgADAG5mdGFibGVzLnRlc3QAAAA=",
+   "JAAAAAIAAAEBAAAAPhUAAAAAAAAUAAAAEAoFAAEAAAAAAAAA"
+  ]
+ },
+ {
+  "request": {
+   "type": "tables",
+   "family": "unspec"
+  },
+  "reply": [
+   "PAAAAAAKAgACAAAAPhUAAAEAAAILAAEAZmlsdGVyAAAIAAMAAAAAAwwABAAAAAAAAAAAAQgAAgAAAAAA",
+   "FAAAAAMAAgACAAAAPhUAAAAAAAA="
+  ]
+ },
+ {
+  "request": {
+   "type": "chains",
+   "family": "unspec"
+  },
+  "reply": [
+   "cAAAAAMKAgADAAAAPhUAAAEAAAILAAEAZmlsdGVyAAAKAAMAaW5wdXQAAAAMAAIAAAAAAAAAAAEUAAQACAABAAAAAAEIAAIAAAAAAAgABQAAAAABCwAHAGZpbHRlcgAACAAKAAAAAAEIAAYAAAAAAHAAAAADCgIAAwAAAD4VAAABAAACCwABAGZpbHRlcgAADAADAGZvcndhcmQADAACAAAAAAAAAAACFAAEAAgAAQAAAAACCAACAAAAAAAIAAUAAAAAAQsABwBmaWx0ZXIAAAgACgAAAAABCAAGAAAAAABwAAAAAwoCAAMAAAA+FQAAAQAAAgsAAQBmaWx0ZXIAAAsAAwBvdXRwdXQAAAwAAgAAAAAAAAAAAxQABAAIAAEAAAAAAwgAAgAAAAAACAAFAAAAAAELAAcAZmlsdGVyAAAIAAoAAAAAAQgABgAAAAAA",
+   "FAAAAAMAAgADAAAAPhUAAAAAAAA="
+  ]
+ },
+ {
+  "request": {
+   "type": "rules",
+   "family": "inet",
+   "table": "filter",
+   "chain": "input"
+  },
+  "reply": [
+   "FAAAAAMAAgAEAAAAPhUAAAAAAAA="
+  ]
+ },
+ {
+  "request": {
+   "type": "rules",
+   "family": "inet",
+   "table": "filter",
+   "chain": "forward"
+  },
+  "reply": [
+   "FAAAAAMAAgAFAAAAPhUAAAAAAAA="
+  ]
+ },
+ {
+  "request": {
+   "type": "gen",
+   "family": "unspec"
+  },
+  "reply": [
+   "OAAAAA8KAAAGAAAAPhUAAAAAAAIIAAEAAAAAAggAAgAAMtX9EgADAG5mdGFibGVzLnRlc3QAAAA=",
+   "JAAAAAIAAAEGAAAAPhUAAAAAAAAUAAAAEAoFAAYAAAAAAAAA"
+  ]
+ }
+]

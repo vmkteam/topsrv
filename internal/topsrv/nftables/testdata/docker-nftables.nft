@@ -1,0 +1,185 @@
+# Docker 29.9.3 with "firewall-backend": "nftables" on Debian 13, after a first
+# start with the iptables backend: ip filter/nat and DOCKER-USER are left over.
+table ip nat {
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+	}
+
+	chain POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+	}
+}
+table ip filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 0 bytes 0 jump DOCKER-USER
+	}
+
+	chain DOCKER-USER {
+	}
+}
+table ip6 nat {
+	chain PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+	}
+
+	chain OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+	}
+}
+table ip6 filter {
+	chain FORWARD {
+		type filter hook forward priority filter; policy accept;
+		counter packets 0 bytes 0 jump DOCKER-USER
+	}
+
+	chain DOCKER-USER {
+	}
+}
+table ip docker-bridges {
+	map filter-forward-in-jumps {
+		type ifname : verdict
+		elements = { "docker0" : jump filter-forward-in__docker0,
+			     "br-000000000001" : jump filter-forward-in__br-000000000001 }
+	}
+
+	map filter-forward-out-jumps {
+		type ifname : verdict
+		elements = { "docker0" : jump filter-forward-out__docker0,
+			     "br-000000000001" : jump filter-forward-out__br-000000000001 }
+	}
+
+	map nat-postrouting-in-jumps {
+		type ifname : verdict
+		elements = { "docker0" : jump nat-postrouting-in__docker0,
+			     "br-000000000001" : jump nat-postrouting-in__br-000000000001 }
+	}
+
+	map nat-postrouting-out-jumps {
+		type ifname : verdict
+		elements = { "docker0" : jump nat-postrouting-out__docker0,
+			     "br-000000000001" : jump nat-postrouting-out__br-000000000001 }
+	}
+
+	chain filter-FORWARD {
+		type filter hook forward priority filter; policy accept;
+		oifname vmap @filter-forward-in-jumps
+		iifname vmap @filter-forward-out-jumps
+	}
+
+	chain nat-OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+		ip daddr != 127.0.0.0/8 fib daddr type local counter packets 0 bytes 0 jump nat-prerouting-and-output
+	}
+
+	chain nat-POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		iifname vmap @nat-postrouting-out-jumps
+		oifname vmap @nat-postrouting-in-jumps
+	}
+
+	chain nat-PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		fib daddr type local counter packets 0 bytes 0 jump nat-prerouting-and-output
+	}
+
+	chain nat-prerouting-and-output {
+		iifname != "docker0" tcp dport 8080 counter packets 0 bytes 0 dnat to 172.17.0.2:80 comment "DNAT"
+		iifname != "br-000000000001" ip daddr 127.0.0.1 tcp dport 5432 counter packets 0 bytes 0 dnat to 172.18.0.2:5432 comment "DNAT"
+	}
+
+	chain raw-PREROUTING {
+		type filter hook prerouting priority raw; policy accept;
+		ip daddr 172.17.0.2 iifname != "docker0" counter packets 0 bytes 0 drop comment "DROP DIRECT ACCESS"
+		ip daddr 172.18.0.2 iifname != "br-000000000001" counter packets 0 bytes 0 drop comment "DROP DIRECT ACCESS"
+		iifname != "lo" ip daddr 127.0.0.1 tcp dport 5432 counter packets 0 bytes 0 drop comment "DROP REMOTE LOOPBACK"
+	}
+
+	chain filter-forward-in__docker0 {
+		ct state established,related counter packets 0 bytes 0 accept
+		iifname "docker0" counter packets 0 bytes 0 accept comment "ICC"
+		ip daddr 172.17.0.2 tcp dport 80 counter packets 0 bytes 0 accept
+		counter packets 0 bytes 0 drop comment "UNPUBLISHED PORT DROP"
+	}
+
+	chain filter-forward-out__docker0 {
+		ct state established,related counter packets 0 bytes 0 accept
+		counter packets 0 bytes 0 accept comment "OUTGOING"
+	}
+
+	chain nat-postrouting-in__docker0 {
+	}
+
+	chain nat-postrouting-out__docker0 {
+		oifname != "docker0" ip saddr 172.17.0.0/16 counter packets 0 bytes 0 masquerade comment "MASQUERADE"
+	}
+
+	chain filter-forward-in__br-000000000001 {
+		ct state established,related counter packets 0 bytes 0 accept
+		iifname "br-000000000001" counter packets 0 bytes 0 accept comment "ICC"
+		ip daddr 172.18.0.2 tcp dport 5432 counter packets 0 bytes 0 accept
+		counter packets 0 bytes 0 drop comment "UNPUBLISHED PORT DROP"
+	}
+
+	chain filter-forward-out__br-000000000001 {
+		ct state established,related counter packets 0 bytes 0 accept
+		counter packets 0 bytes 0 accept comment "OUTGOING"
+	}
+
+	chain nat-postrouting-in__br-000000000001 {
+	}
+
+	chain nat-postrouting-out__br-000000000001 {
+		oifname != "br-000000000001" ip saddr 172.18.0.0/16 counter packets 0 bytes 0 masquerade comment "MASQUERADE"
+	}
+}
+table ip6 docker-bridges {
+	map filter-forward-in-jumps {
+		type ifname : verdict
+	}
+
+	map filter-forward-out-jumps {
+		type ifname : verdict
+	}
+
+	map nat-postrouting-in-jumps {
+		type ifname : verdict
+	}
+
+	map nat-postrouting-out-jumps {
+		type ifname : verdict
+	}
+
+	chain filter-FORWARD {
+		type filter hook forward priority filter; policy accept;
+		oifname vmap @filter-forward-in-jumps
+		iifname vmap @filter-forward-out-jumps
+	}
+
+	chain nat-OUTPUT {
+		type nat hook output priority dstnat; policy accept;
+		ip6 daddr != ::1 fib daddr type local counter packets 0 bytes 0 jump nat-prerouting-and-output
+	}
+
+	chain nat-POSTROUTING {
+		type nat hook postrouting priority srcnat; policy accept;
+		iifname vmap @nat-postrouting-out-jumps
+		oifname vmap @nat-postrouting-in-jumps
+	}
+
+	chain nat-PREROUTING {
+		type nat hook prerouting priority dstnat; policy accept;
+		fib daddr type local counter packets 0 bytes 0 jump nat-prerouting-and-output
+	}
+
+	chain nat-prerouting-and-output {
+	}
+
+	chain raw-PREROUTING {
+		type filter hook prerouting priority raw; policy accept;
+	}
+}
