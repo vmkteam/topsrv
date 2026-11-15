@@ -100,6 +100,9 @@ type Ref struct {
 	Code string
 }
 
+// Source is "file:line".
+func (r Ref) Source() string { return r.File + ":" + strconv.Itoa(r.Line) }
+
 // ReadError is a file that was named but could not be read.
 type ReadError struct {
 	Path string
@@ -144,6 +147,7 @@ type parser struct {
 	hostname string
 	policy   *Policy
 	aliases  map[string]map[string][]string // kind → name → members
+	expanded map[string][]string            // kind + name → members, aliases expanded
 	raw      []rawRule
 	stack    []string
 }
@@ -151,7 +155,7 @@ type parser struct {
 // Parse reads the policy starting at main. hostname is the short host name,
 // for %h in include paths.
 func Parse(main, hostname string, files Files) *Policy {
-	p := &parser{files: files, hostname: hostname, policy: &Policy{}, aliases: map[string]map[string][]string{}}
+	p := &parser{files: files, hostname: hostname, policy: &Policy{}, aliases: map[string]map[string][]string{}, expanded: map[string][]string{}}
 	p.parseFile(main, 0, false)
 	for _, r := range p.raw {
 		p.policy.Rules = append(p.policy.Rules, p.expand(r))
@@ -308,8 +312,9 @@ func stripComment(s string) string {
 	return s
 }
 
-// splitTop splits s at sep outside quotes and parentheses and not escaped.
-func splitTop(s string, sep byte) []string {
+// splitTop splits s where at says, outside quotes and parentheses and not
+// escaped.
+func splitTop(s string, at func(i int) bool) []string {
 	var (
 		out    []string
 		depth  int
@@ -327,7 +332,7 @@ func splitTop(s string, sep byte) []string {
 			depth++
 		case c == ')':
 			depth--
-		case c == sep && depth == 0:
+		case depth == 0 && at(i):
 			out = append(out, s[start:i])
 			start = i + 1
 		}
@@ -335,10 +340,15 @@ func splitTop(s string, sep byte) []string {
 	return append(out, s[start:])
 }
 
+// splitAt splits s at a separator byte, as splitTop.
+func splitAt(s string, sep byte) []string {
+	return splitTop(s, func(i int) bool { return s[i] == sep })
+}
+
 // list splits a comma list, items trimmed.
 func list(s string) []string {
 	var out []string
-	for _, item := range splitTop(s, ',') {
+	for _, item := range splitAt(s, ',') {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}
@@ -347,7 +357,7 @@ func list(s string) []string {
 }
 
 func (p *parser) alias(kind, s string, ref Ref) {
-	for _, def := range splitTop(s, ':') {
+	for _, def := range splitAt(s, ':') {
 		name, members, ok := strings.Cut(def, "=")
 		name = strings.TrimSpace(name)
 		if !ok || !aliasName.MatchString(name) {
@@ -375,7 +385,7 @@ func (p *parser) userSpec(s string, ref Ref) {
 		return
 	}
 	users := list(fields[0])
-	source := ref.File + ":" + strconv.Itoa(ref.Line)
+	source := ref.Source()
 	p.raw = append(p.raw, rawRule{source: source, users: users, hosts: list(fields[1]), cmnds: cmnds})
 	for _, spec := range specs[1:] {
 		hosts, cmnds, ok := strings.Cut(spec, "=")
@@ -393,25 +403,7 @@ func hostSpecs(s string) []string {
 	if !strings.Contains(s, "=") {
 		return nil
 	}
-	var out []string
-	start, depth, quoted := 0, 0, false
-	for i := 0; i < len(s); i++ {
-		switch c := s[i]; {
-		case c == '\\':
-			i++
-		case c == '"':
-			quoted = !quoted
-		case quoted:
-		case c == '(':
-			depth++
-		case c == ')':
-			depth--
-		case c == ':' && depth == 0 && !tagOrDigestBefore(s[:i]):
-			out = append(out, s[start:i])
-			start = i + 1
-		}
-	}
-	return append(out, s[start:])
+	return splitTop(s, func(i int) bool { return s[i] == ':' && !tagOrDigestBefore(s[:i]) })
 }
 
 func tagOrDigestBefore(s string) bool {
@@ -434,7 +426,7 @@ func (p *parser) defaults(s string, ref Ref) {
 		}
 		bound = list(head[len("Defaults")+1:])
 	}
-	sd := ScopedDefault{Source: ref.File + ":" + strconv.Itoa(ref.Line), Binding: binding, List: bound}
+	sd := ScopedDefault{Source: ref.Source(), Binding: binding, List: bound}
 	tracked := false
 	for _, param := range list(rest) {
 		tracked = p.defaultParam(&sd, param) || tracked
@@ -497,8 +489,8 @@ func (p *parser) syntaxError(ref Ref) {
 // expand resolves the aliases of a rule and reads its command list for
 // flags. Tags and runas carry over to the following commands, as in sudo.
 func (p *parser) expand(r rawRule) Rule {
-	rule := Rule{Source: r.source, Principals: p.resolve("user", r.users, false, 0)}
-	rule.HostsAll = slices.Contains(p.resolve("host", r.hosts, false, 0), "ALL")
+	rule := Rule{Source: r.source, Principals: p.resolve("user", r.users, 0)}
+	rule.HostsAll = slices.Contains(p.resolve("host", r.hosts, 0), "ALL")
 	nopass, setenv := false, false
 	commands, nopassCount := 0, 0
 	for _, item := range list(r.cmnds) {
@@ -539,7 +531,7 @@ func (p *parser) expand(r rawRule) Rule {
 		if d, _, ok := strings.Cut(name, ":"); ok && slices.Contains(digests, d) && len(f) > 1 {
 			name = f[1] // "sha256:… /bin/ls"
 		}
-		all := slices.Contains(p.resolve("cmnd", []string{name}, false, 0), "ALL")
+		all := slices.Contains(p.resolve("cmnd", []string{name}, 0), "ALL")
 		commands++
 		if nopass {
 			nopassCount++
@@ -554,7 +546,7 @@ func (p *parser) expand(r rawRule) Rule {
 
 func (p *parser) runas(prev *Runas, spec string) *Runas {
 	users, groups, _ := strings.Cut(spec, ":")
-	r := &Runas{Users: p.resolve("runas", list(users), false, 0), Groups: append([]string{}, list(groups)...)}
+	r := &Runas{Users: p.resolve("runas", list(users), 0), Groups: append([]string{}, list(groups)...)}
 	for _, x := range slices.Concat(r.Users, r.Groups) {
 		r.HasNegation = r.HasNegation || strings.HasPrefix(x, "!")
 	}
@@ -566,23 +558,55 @@ func (p *parser) runas(prev *Runas, spec string) *Runas {
 	return r
 }
 
+// maxExpanded caps the members an alias expands to: aliases that each use
+// the next one several times would grow exponentially.
+const maxExpanded = 4096
+
 // resolve expands aliases of a kind in items, recursively; a negated alias
-// negates its members. Depth bounds alias loops.
-func (p *parser) resolve(kind string, items []string, negate bool, depth int) []string {
+// negates its members. Each alias is expanded once and the result reused.
+func (p *parser) resolve(kind string, items []string, depth int) []string {
 	out := []string{}
 	for _, item := range items {
-		neg := negate
+		neg := false
 		for strings.HasPrefix(item, "!") {
 			item, neg = strings.TrimSpace(item[1:]), !neg
 		}
-		if members, ok := p.aliases[kind][item]; ok && depth < 16 {
-			out = append(out, p.resolve(kind, members, neg, depth+1)...)
-			continue
+		if _, ok := p.aliases[kind][item]; ok && depth < 16 {
+			for _, m := range p.aliasMembers(kind, item, depth) {
+				if neg {
+					m = negated(m)
+				}
+				out = append(out, m)
+			}
+		} else {
+			if neg {
+				item = "!" + item
+			}
+			out = append(out, item)
 		}
-		if neg {
-			item = "!" + item
+		if len(out) > maxExpanded {
+			return out[:maxExpanded]
 		}
-		out = append(out, item)
 	}
 	return out
+}
+
+// aliasMembers returns the members of an alias with nested aliases
+// expanded, computed once.
+func (p *parser) aliasMembers(kind, name string, depth int) []string {
+	key := kind + "\x00" + name
+	if m, ok := p.expanded[key]; ok {
+		return m
+	}
+	p.expanded[key] = nil // a loop expands to nothing
+	m := p.resolve(kind, p.aliases[kind][name], depth+1)
+	p.expanded[key] = m
+	return m
+}
+
+func negated(m string) string {
+	if rest, ok := strings.CutPrefix(m, "!"); ok {
+		return rest
+	}
+	return "!" + m
 }

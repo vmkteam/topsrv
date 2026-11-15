@@ -37,9 +37,12 @@ func memFiles(files map[string]string) Files {
 	}
 }
 
-func parse(t *testing.T, files map[string]string, opts Options) *Config {
+func parse(t *testing.T, files map[string]string, flags Flags) *Config {
 	t.Helper()
-	return Parse(DefaultConfig, opts, memFiles(files))
+	if flags.ConfigFile == "" {
+		flags.ConfigFile = DefaultConfig
+	}
+	return Parse(flags, memFiles(files))
 }
 
 func TestSplitLine(t *testing.T) {
@@ -117,7 +120,7 @@ func TestParseOrderAndClasses(t *testing.T) {
 		"/etc/ssh/sshd_config.d/10-redhat.conf":     "ChallengeResponseAuthentication no\nAllowUsers bob carol\n",
 		"/etc/ssh/sshd_config.d/.hidden.conf":       "PermitRootLogin yes\n",
 		"/etc/ssh/sshd_config.d/notes.txt":          "PermitRootLogin yes\n",
-	}, Options{})
+	}, Flags{})
 
 	assert.True(t, cfg.Valid(), "errors: %v %v", cfg.Errors, cfg.ReadErrors)
 	assert.Equal(t, []string{DefaultConfig, "/etc/ssh/sshd_config.d/10-redhat.conf", "/etc/ssh/sshd_config.d/50-cloud-init.conf"}, cfg.Files,
@@ -137,7 +140,7 @@ func TestParseOrderAndClasses(t *testing.T) {
 func TestParseCmdline(t *testing.T) {
 	files := map[string]string{DefaultConfig: "Port 22\nPermitRootLogin no\nPasswordAuthentication no\n"}
 
-	cfg := parse(t, files, Options{Options: []string{"PermitRootLogin=yes", "PasswordAuthentication yes"}, Ports: []string{"2200"}})
+	cfg := parse(t, files, Flags{Options: []string{"PermitRootLogin=yes", "PasswordAuthentication yes"}, Ports: []string{"2200"}})
 
 	assert.Equal(t, Value{Values: []string{"yes"}, Source: "cmdline"}, cfg.Global["PermitRootLogin"], "-o comes first and wins")
 	assert.Equal(t, Value{Values: []string{"yes"}, Source: "cmdline"}, cfg.Global["PasswordAuthentication"])
@@ -157,7 +160,7 @@ func TestParseMatch(t *testing.T) {
 			"PermitRootLogin no\n",
 		"/etc/ssh/inc.conf":     "Match Address 10.0.0.0/8\nAllowTcpForwarding yes\n",
 		"/etc/ssh/inmatch.conf": "MaxAuthTries 2\n",
-	}, Options{})
+	}, Flags{})
 
 	assert.Equal(t, []string{"no"}, cfg.Global["X11Forwarding"].Values, "a Match in an include ends with the file")
 	assert.Equal(t, []string{"no"}, cfg.Global["PermitRootLogin"].Values, "Match All returns to the global context")
@@ -179,14 +182,14 @@ func TestParseInclude(t *testing.T) {
 			DefaultConfig:            "Include extra.conf missing.conf nothere/*.conf\nPermitRootLogin no\n",
 			"/etc/ssh/extra.conf":    "PermitRootLogin yes\n",
 			"/etc/ssh/unrelated.cfg": "",
-		}, Options{})
+		}, Flags{})
 
 		assert.True(t, cfg.Valid(), "%v %v", cfg.Errors, cfg.ReadErrors)
 		assert.Equal(t, []string{"yes"}, cfg.Global["PermitRootLogin"].Values)
 	})
 
 	t.Run("a loop stops at depth 16 and makes the config invalid", func(t *testing.T) {
-		cfg := parse(t, map[string]string{DefaultConfig: "Include /etc/ssh/sshd_config\n"}, Options{})
+		cfg := parse(t, map[string]string{DefaultConfig: "Include /etc/ssh/sshd_config\n"}, Flags{})
 
 		assert.False(t, cfg.Valid())
 		assert.Len(t, cfg.Files, maxIncludeDepth+1)
@@ -203,8 +206,8 @@ func TestParseInclude(t *testing.T) {
 			files[fmt.Sprintf("/etc/ssh/%d.conf", n)] = "PermitRootLogin no\n"
 			return files
 		}
-		assert.True(t, parse(t, chain(16), Options{}).Valid())
-		assert.False(t, parse(t, chain(17), Options{}).Valid())
+		assert.True(t, parse(t, chain(16), Flags{}).Valid())
+		assert.False(t, parse(t, chain(17), Flags{}).Valid())
 	})
 
 	t.Run("an unreadable include is a read error", func(t *testing.T) {
@@ -217,7 +220,7 @@ func TestParseInclude(t *testing.T) {
 			return read(p)
 		}
 
-		cfg := Parse(DefaultConfig, Options{}, files)
+		cfg := Parse(Flags{ConfigFile: DefaultConfig}, files)
 
 		assert.False(t, cfg.Valid())
 		require.Len(t, cfg.ReadErrors, 1)
@@ -230,7 +233,7 @@ func TestParseInclude(t *testing.T) {
 			files[fmt.Sprintf("/etc/ssh/d/%03d.conf", i)] = ""
 		}
 
-		cfg := parse(t, files, Options{})
+		cfg := parse(t, files, Flags{})
 
 		assert.Len(t, cfg.Files, maxFiles)
 		assert.False(t, cfg.Valid())
@@ -240,7 +243,7 @@ func TestParseInclude(t *testing.T) {
 func TestParseErrors(t *testing.T) {
 	cfg := parse(t, map[string]string{
 		DefaultConfig: "Banner \"SENTINELLINE\nPort\nPermitRootLogin yes no\nMatch\nBogus SENTINELLINE\n#!# x\nweird-key! x\n",
-	}, Options{})
+	}, Flags{})
 
 	assert.Equal(t, []Ref{
 		{File: DefaultConfig, Line: 1, Code: CodeUnterminatedQuote},

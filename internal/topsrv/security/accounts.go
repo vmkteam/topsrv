@@ -205,7 +205,8 @@ func parsePasswd(b []byte) (users []passwdEntry, malformed []lineRef, nisCompat 
 			malformed = append(malformed, lineRef{File: pathPasswd, Line: n, Code: codeID})
 			continue
 		}
-		users = append(users, passwdEntry{name: f[0], pw: f[1], uid: uid, gid: gid, home: f[5], shell: f[6]})
+		// Cloned: the result outlives the pass, the file must not.
+		users = append(users, passwdEntry{name: strings.Clone(f[0]), pw: f[1], uid: uid, gid: gid, home: strings.Clone(f[5]), shell: strings.Clone(f[6])})
 	}
 	return users, malformed, nisCompat
 }
@@ -352,8 +353,8 @@ func classifyPW(field string, inPasswd bool) pwClass {
 		return pwClass{pw: pwHash, algo: algo, hash: hash}
 	}
 	marker := "other"
-	if slices.Contains(pwMarkers, field) {
-		marker = field
+	if i := slices.Index(pwMarkers, field); i >= 0 {
+		marker = pwMarkers[i] // the constant, not a slice of the shadow file
 	}
 	return pwClass{pw: pwNone, marker: marker}
 }

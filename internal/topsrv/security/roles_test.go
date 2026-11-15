@@ -39,10 +39,12 @@ func rolesFixture() map[string]string {
 		"proc/2/cmdline":                       "",
 		"proc/100/exe":                         "-> /usr/bin/dockerd",
 		"proc/101/exe":                         "-> /usr/bin/containerd (deleted)",
+		"proc/102/exe":                         "", // not a link: readlink fails as for another user's process
 		"proc/102/cmdline":                     "/usr/local/bin/k3s\x00server\x00--token\x00SENTINELSECRET\x00",
 		"proc/103/exe":                         "-> /usr/bin/qemu-system-x86_64",
 		"proc/104/exe":                         "-> /usr/sbin/sshd",
 		"proc/105/exe":                         "-> /usr/bin/dockerd",
+		"proc/106/exe":                         "",
 		"proc/106/cmdline":                     "tailscaled\x00--state=/var/lib/tailscale/tailscaled.state\x00",
 		"proc/net/route":                       testRouteV4,
 		"proc/net/ipv6_route":                  testRouteV6,

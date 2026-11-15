@@ -59,6 +59,9 @@ func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSpeed(ch)
 }
 
+// labelInterface is the interface label of the network metrics.
+const labelInterface = "interface"
+
 func (c *NetworkCollector) collectIO(ch chan<- prometheus.Metric) {
 	counters, err := net.IOCounters(true)
 	if err != nil {

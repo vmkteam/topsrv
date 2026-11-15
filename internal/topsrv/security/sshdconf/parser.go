@@ -31,15 +31,6 @@ type Files struct {
 	ReadDir  func(dir string) ([]string, error)
 }
 
-// Options are what the command line of sshd adds.
-type Options struct {
-	// Options are -o values, "Keyword=value" or "Keyword value", in order.
-	// They are processed before the files and win.
-	Options []string
-	// Ports are -p values; with any, Port lines of the files are ignored.
-	Ports []string
-}
-
 // Value is the value of a keyword and where it came from.
 type Value struct {
 	// Values: one for a scalar, every value for an accumulating keyword, the
@@ -61,6 +52,14 @@ type Ref struct {
 	File string
 	Line int
 	Code string
+}
+
+// Source is "file:line", or "cmdline" for what the command line set.
+func (r Ref) Source() string {
+	if r.File == SourceCmdline {
+		return SourceCmdline
+	}
+	return r.File + ":" + strconv.Itoa(r.Line)
 }
 
 // ReadError is a file that was named but could not be read.
@@ -96,19 +95,21 @@ type parser struct {
 	portsFlag bool
 }
 
-// Parse reads the configuration starting at main.
-func Parse(main string, opts Options, files Files) *Config {
-	p := &parser{files: files, cfg: &Config{Global: map[string]Value{}}, portsFlag: len(opts.Ports) > 0}
-	for _, port := range opts.Ports {
-		p.set(nil, keywords["port"], []string{port}, SourceCmdline, Ref{File: SourceCmdline})
+// Parse reads the configuration flags name: -f, then -o before the files
+// (they win) and -p (it drops the Port lines of the files).
+func Parse(flags Flags, files Files) *Config {
+	p := &parser{files: files, cfg: &Config{Global: map[string]Value{}}, portsFlag: len(flags.Ports) > 0}
+	cmdline := Ref{File: SourceCmdline}
+	for _, port := range flags.Ports {
+		p.set(nil, keywords["port"], []string{port}, cmdline)
 	}
-	for _, o := range opts.Options {
+	for _, o := range flags.Options {
 		kw, args, code := splitLine(o)
 		if k, ok := lookup(kw); ok && code == "" && k.class != include && k.class != match {
-			p.set(nil, k, args, SourceCmdline, Ref{File: SourceCmdline})
+			p.set(nil, k, args, cmdline)
 		}
 	}
-	p.parseFile(main, 0, nil, false)
+	p.parseFile(flags.ConfigFile, 0, nil, false)
 	return p.cfg
 }
 
@@ -158,7 +159,7 @@ func (p *parser) parseFile(name string, depth int, block *MatchBlock, missingOK 
 				p.fail(ref, CodeNotInMatch)
 				continue
 			}
-			p.set(cur, k, args, ref.File+":"+strconv.Itoa(ref.Line), ref)
+			p.set(cur, k, args, ref)
 		}
 	}
 }
@@ -178,8 +179,8 @@ func (p *parser) include(args []string, depth int, cur *MatchBlock, ref Ref) {
 		if !strings.HasPrefix(arg, "/") {
 			arg = path.Join(sshDir, arg)
 		}
-		literal := !hasMeta(arg)
-		for _, name := range p.files.glob(arg) {
+		literal := !HasMeta(arg)
+		for _, name := range Glob(arg, p.files.ReadDir) {
 			p.parseFile(name, depth+1, cur, literal)
 		}
 	}
@@ -194,14 +195,15 @@ func (p *parser) match(args []string, cur *MatchBlock, ref Ref) *MatchBlock {
 	if len(args) == 1 && strings.EqualFold(args[0], "all") {
 		return nil
 	}
-	b := &MatchBlock{Criteria: args, Source: ref.File + ":" + strconv.Itoa(ref.Line), Keys: map[string]Value{}}
+	b := &MatchBlock{Criteria: args, Source: ref.Source(), Keys: map[string]Value{}}
 	p.cfg.MatchBlocks = append(p.cfg.MatchBlocks, b)
 	return b
 }
 
 // set stores a keyword's values in the global context (block nil) or in a
 // Match block, by the keyword's class.
-func (p *parser) set(block *MatchBlock, k keyword, args []string, source string, ref Ref) {
+func (p *parser) set(block *MatchBlock, k keyword, args []string, ref Ref) {
+	source := ref.Source()
 	if len(args) == 0 {
 		p.fail(ref, CodeMissingArgument)
 		return

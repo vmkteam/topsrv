@@ -211,14 +211,14 @@ Keywords in `effective`: `PermitRootLogin` (`without-password` comes as `prohibi
 
 ## `authorizedKeys`
 
-The keys sshd would accept for each user: the users come from `accounts`, the paths from `sshd` (`AuthorizedKeysFile` with its `Match User` overrides, `%%`, `%h`, `%u`, `%U`, relative to home, a glob since OpenSSH 10). `nologin` users are walked too: `ssh -N` works for them. Without the sshd configuration (`unknown`) sshd's default paths are walked and `configKnown` is `false`; `na` when sshd is not installed; `unknown` when `accounts` gave no users or the mount table is unreadable — then no home directory is touched.
+The keys sshd would accept for each user: the users come from `accounts`, the paths from `sshd` (`AuthorizedKeysFile` with its `Match User` overrides, `%%`, `%h`, `%u`, `%U`, relative to home, a glob since OpenSSH 10). `nologin` users are walked too: `ssh -N` works for them. Without the sshd configuration sshd's default paths are walked and `configKnown` is `false` — with a gap on `/etc/ssh/sshd_config` when the `sshd` section was `unknown`, none when it is disabled; `na` when sshd is not installed; `unknown` when `accounts` gave no users (with its reason) or the mount table is unreadable — then no home directory is touched. A file that could not be read — `unreadable`, `remote_fs_skipped`, `too_large` — is a gap too, so the section is `partial`: its keys are not known.
 
 Each path is checked against `/proc/self/mountinfo` before any syscall, and so is every step of a symlink, which sshd follows: a link into autofs would mount it. Only a regular file is read, up to 1 MiB and 2000 keys.
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `users[]` | object | `{name, files[]}` for users with at least one of the files. A user not listed has none |
-| `files[]` | object | `{path, status, keys[], truncated}`. `status`: `ok`; `unreadable` (permission denied — NFS with root_squash — never "no keys"); `skipped_remote_fs`; `ignored_by_sshd` (not a regular file, or StrictModes: the file or a directory up to home is owned by another user or writable by group or others — the keys are still listed, they work once fixed); `too_large`. `missing` files are not listed |
+| `files[]` | object | `{path, status, keys[], truncated}`. `status`: `ok`; `unreadable` (permission denied — NFS with root_squash — never "no keys"); `remote_fs_skipped`; `ignored_by_sshd` (not a regular file, or StrictModes: the file or a directory up to home is owned by another user or writable by group or others — the keys are still listed, they work once fixed); `too_large`. `missing` files are not listed |
 | `keys[]` | object | `{fp, type, bits, typeMismatch, options, rejected}`: `fp` is `SHA256:` and the unpadded base64 of the key blob's sha256, as `ssh-keygen -l`; `bits` from the blob (RSA modulus, DSA p, ECDSA curve, 256 for Ed25519); `typeMismatch` when the blob is of another type than the line says; `rejected` when an option sshd does not know makes it drop the line |
 | `keys[].options` | object | Which options are there, never their values: `restrict`, `from`, `command`, `noPortForwarding`, `noPty`, `permitopen`, `certAuthority`, `expiry`, `environment` |
 | `configKnown` | bool | The paths come from the sshd configuration |

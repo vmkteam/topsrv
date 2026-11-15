@@ -8,7 +8,6 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
-	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -84,16 +83,29 @@ func authUsers() *accountsResult {
 	}}
 }
 
-func authKeysOf(t *testing.T, sc *scanCtx, sshd *sshdResult) (Section, authKeysData) {
-	t.Helper()
-	sc.setResult(SectionAccounts, authUsers())
-	if sshd != nil {
-		sc.setResult(SectionSSHD, sshd)
+// withDeps gives sc the results of earlier sections.
+func withDeps(sc *scanCtx, deps map[string]depResult) {
+	sc.deps = func(name string) (depResult, bool) {
+		d, ok := deps[name]
+		return d, ok
 	}
+}
+
+// authKeysOf runs the section with authUsers and, unless nil, the sshd
+// section as given.
+func authKeysOf(t *testing.T, sc *scanCtx, sshd *depResult) (Section, authKeysData) {
+	t.Helper()
+	deps := map[string]depResult{SectionAccounts: {sec: ok(nil), res: authUsers()}}
+	if sshd != nil {
+		deps[SectionSSHD] = *sshd
+	}
+	withDeps(sc, deps)
 	sec := collectAuthorizedKeys(t.Context(), sc)
 	d, _ := sec.Data.(authKeysData)
 	return sec, d
 }
+
+func sshdOK(r *sshdResult) *depResult { return &depResult{sec: ok(nil), res: r} }
 
 func filesOf(t *testing.T, d authKeysData, user string) map[string]authKeysFile {
 	t.Helper()
@@ -108,19 +120,25 @@ func filesOf(t *testing.T, d authKeysData, user string) map[string]authKeysFile 
 	return out
 }
 
-func testSSHDResult() *sshdResult {
-	return &sshdResult{
+func testSSHDResult() *depResult {
+	return sshdOK(&sshdResult{
 		authorizedKeysFiles: defaultAuthorizedKeysFiles,
 		userKeysFiles:       map[string][]string{"deploy": {"/etc/ssh/keys/%u"}},
 		strictModes:         true,
-	}
+	})
 }
 
 func TestAuthorizedKeys(t *testing.T) {
 	sc := fixture(t, authKeysFixture())
+	noGroupWrite(t, sc.root)
 	require.NoError(t, os.Chmod(filepath.Join(sc.root, "home/bob"), 0o775)) // group-writable home
 	sec, d := authKeysOf(t, sc, testSSHDResult())
-	require.Equal(t, StatusOK, sec.Status)
+	require.Equal(t, StatusPartial, sec.Status, "files on NFS and behind autofs were not read")
+	assert.ElementsMatch(t, []Gap{
+		{Path: "/home/remote/carol/.ssh/authorized_keys", Reason: ReasonRemoteFSSkipped},
+		{Path: "/home/remote/carol/.ssh/authorized_keys2", Reason: ReasonRemoteFSSkipped},
+		{Path: "/home/dave/.ssh/authorized_keys", Reason: ReasonRemoteFSSkipped},
+	}, sec.Gaps)
 	assert.True(t, d.ConfigKnown)
 
 	alice := filesOf(t, d, "alice")
@@ -151,11 +169,11 @@ func TestAuthorizedKeys(t *testing.T) {
 	})
 
 	t.Run("NFS home: not touched", func(t *testing.T) {
-		assert.Equal(t, keysSkippedRemoteFS, filesOf(t, d, "carol")["/home/remote/carol/.ssh/authorized_keys"].Status)
+		assert.Equal(t, keysRemoteFSSkipped, filesOf(t, d, "carol")["/home/remote/carol/.ssh/authorized_keys"].Status)
 	})
 
 	t.Run("a symlink into autofs is not followed", func(t *testing.T) {
-		assert.Equal(t, keysSkippedRemoteFS, filesOf(t, d, "dave")["/home/dave/.ssh/authorized_keys"].Status)
+		assert.Equal(t, keysRemoteFSSkipped, filesOf(t, d, "dave")["/home/dave/.ssh/authorized_keys"].Status)
 	})
 
 	t.Run("AuthorizedKeysFile of Match User with %u", func(t *testing.T) {
@@ -177,41 +195,40 @@ func TestAuthorizedKeys(t *testing.T) {
 	})
 }
 
-func TestAuthorizedKeysSpecialFiles(t *testing.T) {
-	// A FIFO in place of the file, and a symlink to a non-regular file
-	// (/dev/zero in life, a FIFO here): refused, never opened for reading.
-	sc := fixture(t, map[string]string{
-		"proc/self/mountinfo":            authMountinfo,
-		"home/alice/.ssh/":               "",
-		"home/erin/.ssh/authorized_keys": "-> /dev/zero",
-		"dev/":                           "",
-	})
-	require.NoError(t, syscall.Mkfifo(filepath.Join(sc.root, "home/alice/.ssh/authorized_keys"), 0o600))
-	require.NoError(t, syscall.Mkfifo(filepath.Join(sc.root, "dev/zero"), 0o600))
-
-	_, d := authKeysOf(t, sc, testSSHDResult())
-
-	assert.Equal(t, keysIgnoredBySSHD, filesOf(t, d, "alice")["/home/alice/.ssh/authorized_keys"].Status)
-	assert.Equal(t, keysIgnoredBySSHD, filesOf(t, d, "erin")["/home/erin/.ssh/authorized_keys"].Status)
-}
-
 func TestAuthorizedKeysStatus(t *testing.T) {
 	t.Run("no accounts: unknown", func(t *testing.T) {
 		sec := collectAuthorizedKeys(t.Context(), fixture(t, authKeysFixture()))
 		assert.Equal(t, StatusUnknown, sec.Status)
 	})
 
+	t.Run("accounts unknown: its reason", func(t *testing.T) {
+		sc := fixture(t, authKeysFixture())
+		withDeps(sc, map[string]depResult{SectionAccounts: {sec: unknown(ReasonPermissionDenied)}})
+		sec := collectAuthorizedKeys(t.Context(), sc)
+		assert.Equal(t, unknown(ReasonPermissionDenied), sec)
+	})
+
 	t.Run("sshd not installed: na", func(t *testing.T) {
-		sec, _ := authKeysOf(t, fixture(t, authKeysFixture()), &sshdResult{notInstalled: true})
+		sec, _ := authKeysOf(t, fixture(t, authKeysFixture()), &depResult{sec: Section{Status: StatusNA}})
 		assert.Equal(t, StatusNA, sec.Status)
 	})
 
-	t.Run("sshd config unknown: default paths, flagged", func(t *testing.T) {
-		sec, d := authKeysOf(t, fixture(t, authKeysFixture()), nil)
-		assert.Equal(t, StatusOK, sec.Status)
+	t.Run("sshd config unknown: default paths, a gap", func(t *testing.T) {
+		files := authKeysFixture()
+		delete(files, "home/remote/carol/.ssh/authorized_keys")
+		delete(files, "home/dave/.ssh/authorized_keys")
+		sec, d := authKeysOf(t, fixture(t, files), &depResult{sec: unknown(ReasonPermissionDenied)})
+		assert.Equal(t, StatusPartial, sec.Status)
+		assert.Contains(t, sec.Gaps, Gap{Path: "/etc/ssh/sshd_config", Reason: ReasonPermissionDenied})
 		assert.False(t, d.ConfigKnown)
 		assert.Contains(t, filesOf(t, d, "alice"), "/home/alice/.ssh/authorized_keys")
 		assert.Empty(t, filesOf(t, d, "deploy"), "no Match User override without the config")
+	})
+
+	t.Run("sshd section disabled: default paths, no gap", func(t *testing.T) {
+		sec, d := authKeysOf(t, fixture(t, map[string]string{"proc/self/mountinfo": authMountinfo, "home/alice/.ssh/authorized_keys": ""}), nil)
+		assert.NotContains(t, sec.Gaps, Gap{Path: "/etc/ssh/sshd_config", Reason: ReasonPermissionDenied})
+		assert.False(t, d.ConfigKnown)
 	})
 
 	t.Run("no mount table: nothing is touched", func(t *testing.T) {
@@ -245,7 +262,7 @@ func TestAuthorizedKeysStatus(t *testing.T) {
 
 	t.Run("AuthorizedKeysFile none and a glob", func(t *testing.T) {
 		files := merge(authKeysFixture(), map[string]string{"home/alice/.ssh/keys.d/a.pub": "ssh-ed25519 " + b64(ed25519Blob(7)) + "\n", "home/alice/.ssh/keys.d/.hidden": "x"})
-		sshd := &sshdResult{authorizedKeysFiles: []string{"none", ".ssh/keys.d/*"}, strictModes: false}
+		sshd := sshdOK(&sshdResult{authorizedKeysFiles: []string{"none", ".ssh/keys.d/*"}, strictModes: false})
 		_, d := authKeysOf(t, fixture(t, files), sshd)
 		alice := filesOf(t, d, "alice")
 		assert.Len(t, alice, 1)

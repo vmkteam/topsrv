@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
-	"maps"
 	"os"
 	"path"
 	"path/filepath"
@@ -41,8 +40,16 @@ type scanCtx struct {
 	procs     []process
 	procsErr  error
 
-	mu      sync.Mutex
-	results map[string]any // section → its typed result, this pass or cached
+	// deps returns what an earlier section gave; nil in tests that need none.
+	deps func(section string) (depResult, bool)
+}
+
+// depResult is how a section came out and the typed result later sections
+// build on (accounts → sshd → authorizedKeys): a dependent tells "absent"
+// from "unknown" by the section, not by a missing result.
+type depResult struct {
+	sec Section
+	res any
 }
 
 // The accessors below are the only way sections touch the filesystem: each
@@ -209,21 +216,28 @@ func (sc *scanCtx) today() int64 {
 	return now.Unix() / int64(24*time.Hour/time.Second)
 }
 
-// result returns the typed result of an earlier section: from this pass, or
-// from the last pass it finished in time.
-func (sc *scanCtx) result(section string) any {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	return sc.results[section]
+// dep returns an earlier section and its result: from this pass, or from
+// the last pass it ran in. ok is false when it never ran (disabled).
+func (sc *scanCtx) dep(section string) (Section, any, bool) {
+	if sc.deps == nil {
+		return Section{}, nil, false
+	}
+	d, ok := sc.deps(section)
+	return d.sec, d.res, ok
 }
 
-func (sc *scanCtx) setResult(section string, r any) {
-	sc.mu.Lock()
-	defer sc.mu.Unlock()
-	if sc.results == nil {
-		sc.results = map[string]any{}
+// readDirNames lists the names in a directory, for the parsers that take
+// names (sshdconf, sudoers).
+func (sc *scanCtx) readDirNames(dir string) ([]string, error) {
+	return entryNames(sc.readDir(dir))
+}
+
+func entryNames(entries []os.DirEntry, err error) ([]string, error) {
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
 	}
-	sc.results[section] = r
+	return names, err
 }
 
 // process is one entry of the /proc walk, shared by the sections of a pass.
@@ -277,10 +291,14 @@ func walkProcesses(sc *scanCtx) ([]process, error) {
 
 func readProcess(sc *scanCtx, pid string) (process, error) {
 	p := process{pid: pid}
-	if exe, err := sc.readlink("/proc/" + pid + "/exe"); err == nil {
+	exe, err := sc.readlink("/proc/" + pid + "/exe")
+	switch {
+	case err == nil:
 		p.exe = strings.TrimSuffix(exe, " (deleted)")
 		p.name = filepath.Base(p.exe)
 		return p, nil
+	case errors.Is(err, fs.ErrNotExist):
+		return p, err // a kernel thread or gone: no argv to read either
 	}
 	head, err := sc.readHead("/proc/"+pid+"/cmdline", argv0Limit)
 	if err != nil {
@@ -348,7 +366,7 @@ type cachedSection struct {
 // rebuilds only its sections.
 func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, results: c.lastResults()}
+	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {
@@ -356,9 +374,6 @@ func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 			continue
 		}
 		sec, res := c.runSection(ctx, def, sc)
-		if res != nil {
-			sc.setResult(def.name, res)
-		}
 		c.store(def.name, sec, res, start)
 	}
 
@@ -472,18 +487,17 @@ func (c *Collector) store(name string, sec Section, res any, at time.Time) {
 	c.recordMetrics(name, sec)
 	c.mu.Lock()
 	c.cache[name] = cachedSection{sec: sec, at: at}
-	if res != nil {
-		c.results[name] = res
-	}
+	c.results[name] = depResult{sec: sec, res: res} // a fresh run replaces a stale result, a failed one too
 	c.mu.Unlock()
 }
 
-// lastResults copies the results of the last passes, for an unscheduled
-// pass that rebuilds a section without the sections it builds on.
-func (c *Collector) lastResults() map[string]any {
+// dep is scanCtx.deps: the last run of a section, for the sections after
+// it and for an unscheduled pass that rebuilds a dependent alone.
+func (c *Collector) dep(name string) (depResult, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return maps.Clone(c.results)
+	d, ok := c.results[name]
+	return d, ok
 }
 
 // cachedSections returns every enabled section from the cache. A section not

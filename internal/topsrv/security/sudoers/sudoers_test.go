@@ -227,3 +227,17 @@ func FuzzParse(f *testing.F) {
 		}
 	})
 }
+
+func TestAliasFanOut(t *testing.T) {
+	// Each level uses the next ten times: 10^16 members without reuse.
+	var b strings.Builder
+	for i := range 16 {
+		fmt.Fprintf(&b, "User_Alias A%d = %s\n", i, strings.TrimSuffix(strings.Repeat(fmt.Sprintf("A%d, ", i+1), 10), ", "))
+	}
+	b.WriteString("User_Alias A16 = alice\nA0 ALL = ALL\n")
+
+	p := parse(map[string]string{"/etc/sudoers": b.String()})
+
+	require.Len(t, p.Rules, 1)
+	assert.Len(t, p.Rules[0].Principals, maxExpanded, "capped, and fast")
+}

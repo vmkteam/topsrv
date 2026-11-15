@@ -84,14 +84,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	var gaps gapList
 	files := sudoers.Files{
 		ReadFile: func(p string) ([]byte, error) { return sc.read(p, sudoFileLimit) },
-		ReadDir: func(dir string) ([]string, error) {
-			entries, err := sc.readDir(dir)
-			names := make([]string, 0, len(entries))
-			for _, e := range entries {
-				names = append(names, e.Name())
-			}
-			return names, err
-		},
+		ReadDir:  sc.readDirNames,
 	}
 	pol := sudoers.Parse(pathSudoers, shortHostname(sc), files)
 	d := sudoData{SudoPresent: true}
@@ -107,7 +100,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	}
 	doas, doasFiles, doasErrs := readDoas(sc, &gaps)
 	if !d.SudoPresent && doas == nil {
-		return Section{Status: StatusNA}
+		return absent(gaps) // doas.conf unreadable is not "no doas"
 	}
 	d.Rules = sudoRules(pol.Rules)
 	d.Defaults = sudoDefaults(pol.Defaults)
@@ -128,11 +121,11 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 // readDoas reads doas.conf and doas.d/*.conf; nil rules without doas.conf.
 func readDoas(sc *scanCtx, gaps *gapList) (rules []doasRule, files []string, errs []lineRef) {
 	paths := []string{pathDoasConf}
-	if entries, err := sc.readDir(pathDoasDir); err == nil {
-		for _, e := range entries {
-			if strings.HasSuffix(e.Name(), ".conf") {
-				paths = append(paths, pathDoasDir+"/"+e.Name())
-			}
+	entries, err := sc.readDir(pathDoasDir)
+	gaps.optional(pathDoasDir, err)
+	for _, e := range entries {
+		if strings.HasSuffix(e.Name(), ".conf") {
+			paths = append(paths, pathDoasDir+"/"+e.Name())
 		}
 	}
 	for _, p := range paths {
@@ -183,9 +176,7 @@ func sudoRules(rules []sudoers.Rule) []sudoRule {
 	for i, r := range rules {
 		sr := sudoRule{Order: i + 1, Source: r.Source, Principals: r.Principals, HostsAll: r.HostsAll,
 			CommandsAll: r.CommandsAll, NopasswdAll: r.NopasswdAll, NopasswdAny: r.NopasswdAny, Setenv: r.Setenv}
-		if r.Runas != nil {
-			sr.Runas = &sudoRunas{Users: r.Runas.Users, Groups: r.Runas.Groups, HasNegation: r.Runas.HasNegation}
-		}
+		sr.Runas = (*sudoRunas)(r.Runas)
 		out = append(out, sr)
 	}
 	return out

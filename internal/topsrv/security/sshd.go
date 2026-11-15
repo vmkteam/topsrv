@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"debug/elf"
 	"encoding/hex"
+	"os"
 	"slices"
 	"strconv"
 	"strings"
@@ -16,9 +18,8 @@ import (
 // sshdFileLimit is sshd's own limit of a configuration file.
 const sshdFileLimit = 1 << 20
 
-// sshdBinaryLimit caps the binaries read for libpam: sshd is about a
-// megabyte.
-const sshdBinaryLimit = 16 << 20
+// procStatLimit caps /proc/stat: a line per CPU.
+const procStatLimit = 1 << 20
 
 // sshdEffectiveKeys are the keywords sent: what posture rules need.
 var sshdEffectiveKeys = []string{
@@ -108,7 +109,6 @@ type sshdListener struct {
 
 // sshdResult is what authorizedKeys builds on.
 type sshdResult struct {
-	notInstalled        bool
 	authorizedKeysFiles []string            // global, with the default when unset
 	userKeysFiles       map[string][]string // AuthorizedKeysFile of "Match User x" blocks, by user
 	strictModes         bool
@@ -124,7 +124,7 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 	flags, listener := sshdFlags(sc, &gaps)
 	socket := sshdSocketActivated(sc)
 	if !listener.Found && !socket && !sc.exists(flags.ConfigFile) && !sc.exists("/usr/sbin/sshd") {
-		return Section{Status: StatusNA}, &sshdResult{notInstalled: true}
+		return Section{Status: StatusNA}, nil
 	}
 
 	hashes := map[string]string{}
@@ -137,16 +137,9 @@ func collectSSHD(_ context.Context, sc *scanCtx) (Section, any) {
 			}
 			return b, err
 		},
-		ReadDir: func(dir string) ([]string, error) {
-			entries, err := sc.readDir(dir)
-			names := make([]string, 0, len(entries))
-			for _, e := range entries {
-				names = append(names, e.Name())
-			}
-			return names, err
-		},
+		ReadDir: sc.readDirNames,
 	}
-	cfg := sshdconf.Parse(flags.ConfigFile, sshdconf.Options{Options: flags.Options, Ports: flags.Ports}, files)
+	cfg := sshdconf.Parse(flags, files)
 	for _, re := range cfg.ReadErrors {
 		if re.Path == flags.ConfigFile {
 			return unknown(reasonOf(re.Err)), nil
@@ -275,32 +268,7 @@ func readEnvFile(sc *scanCtx, file string, env map[string]string) {
 
 // expandEnv replaces $VAR and ${VAR} as systemd does in ExecStart.
 func expandEnv(s string, env map[string]string) string {
-	var b strings.Builder
-	for i := 0; i < len(s); i++ {
-		if s[i] != '$' || i+1 == len(s) {
-			b.WriteByte(s[i])
-			continue
-		}
-		name, rest := "", s[i+1:]
-		if strings.HasPrefix(rest, "{") {
-			if end := strings.IndexByte(rest, '}'); end > 0 {
-				name, i = rest[1:end], i+end+1
-			}
-		} else {
-			end := strings.IndexFunc(rest, func(r rune) bool { return !isNameRune(r) })
-			if end < 0 {
-				end = len(rest)
-			}
-			name, i = rest[:end], i+end
-		}
-		b.WriteString(env[name])
-	}
-	return b.String()
-}
-
-// isNameRune: a letter, digit or underscore of an environment variable name.
-func isNameRune(r rune) bool {
-	return r == '_' || 'A' <= r && r <= 'Z' || 'a' <= r && r <= 'z' || '0' <= r && r <= '9'
+	return os.Expand(s, func(k string) string { return env[k] })
 }
 
 // sshdSocketActivated: ssh.socket is enabled (Ubuntu 24.04): the service
@@ -317,7 +285,7 @@ func processStart(sc *scanCtx, pid string) *time.Time {
 	if err != nil {
 		return nil
 	}
-	_, after, ok := bytesCutLast(stat, ')') // comm may hold spaces and parentheses
+	_, after, ok := bytes.CutLast(stat, []byte(")")) // comm may hold spaces and parentheses
 	f := strings.Fields(string(after))
 	if !ok || len(f) < 20 {
 		return nil
@@ -326,7 +294,7 @@ func processStart(sc *scanCtx, pid string) *time.Time {
 	if err != nil {
 		return nil
 	}
-	b, err := sc.read("/proc/stat", 1<<20)
+	b, err := sc.read("/proc/stat", procStatLimit)
 	if err != nil {
 		return nil
 	}
@@ -343,29 +311,44 @@ func processStart(sc *scanCtx, pid string) *time.Time {
 	return nil
 }
 
-func bytesCutLast(b []byte, sep byte) (before, after []byte, found bool) {
-	if i := bytes.LastIndexByte(b, sep); i >= 0 {
-		return b[:i], b[i+1:], true
-	}
-	return b, nil, false
-}
-
 // sshdPAMCompiled looks for libpam among the libraries the sshd binaries
-// link: Alpine ships openssh-server without PAM, the -pam variant with it.
+// import (ELF DT_NEEDED): Alpine ships openssh-server without PAM, the -pam
+// variant with it. Only the dynamic section is read, not the binary.
 func sshdPAMCompiled(sc *scanCtx) *bool {
 	var found, read bool
 	for _, bin := range sshdBinaries {
-		b, err := sc.read(bin, sshdBinaryLimit)
+		libs, err := importedLibraries(sc, bin)
 		if err != nil {
 			continue
 		}
 		read = true
-		found = found || bytes.Contains(b, []byte("libpam.so"))
+		if slices.ContainsFunc(libs, func(l string) bool { return strings.HasPrefix(l, "libpam.so") }) {
+			found = true
+			break
+		}
 	}
 	if !read {
 		return nil
 	}
 	return &found
+}
+
+// importedLibraries reads DT_NEEDED of an ELF binary, opened as any other
+// file: regular only, no FIFO or device.
+func importedLibraries(sc *scanCtx, bin string) ([]string, error) {
+	if err := sc.local(bin); err != nil {
+		return nil, err
+	}
+	f, err := openFile(sc.root+bin, false)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	e, err := elf.NewFile(f)
+	if err != nil {
+		return nil, err
+	}
+	return e.ImportedLibraries()
 }
 
 func sshdFileMeta(sc *scanCtx, p, sum string) (sshdFile, error) {
@@ -414,7 +397,7 @@ func sshdMatches(blocks []*sshdconf.MatchBlock) []sshdMatch {
 func lineRefs(refs []sshdconf.Ref) []lineRef {
 	out := make([]lineRef, 0, len(refs))
 	for _, r := range refs {
-		out = append(out, lineRef{File: r.File, Line: r.Line, Code: r.Code})
+		out = append(out, lineRef(r))
 	}
 	return out
 }

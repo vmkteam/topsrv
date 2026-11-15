@@ -185,9 +185,7 @@ func sshString(b []byte) (s, rest []byte, ok bool) {
 // the curve of ECDSA; 256 for Ed25519. 0 when unknown.
 func keyBits(blobType string, rest []byte) int {
 	switch {
-	case strings.Contains(blobType, "ed25519"):
-		return 256
-	case strings.Contains(blobType, "nistp256"):
+	case strings.Contains(blobType, "ed25519"), strings.Contains(blobType, "nistp256"):
 		return 256
 	case strings.Contains(blobType, "nistp384"):
 		return 384

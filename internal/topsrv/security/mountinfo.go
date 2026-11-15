@@ -130,7 +130,7 @@ func underMount(path, point string) bool {
 	if point == "/" {
 		return true
 	}
-	return path == point || strings.HasPrefix(path, point+"/")
+	return strings.HasPrefix(path, point) && (len(path) == len(point) || path[len(point)] == '/')
 }
 
 // isRemoteFS: network filesystems, FUSE (often network-backed: sshfs,

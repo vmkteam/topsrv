@@ -99,23 +99,23 @@ func matchClass(pattern string, start int, c byte) (ok bool, next int, valid boo
 	return false, 0, false
 }
 
-// hasMeta reports whether a path component needs matching.
-func hasMeta(s string) bool { return strings.ContainsAny(s, `*?[\`) }
+// HasMeta reports whether a pattern needs matching.
+func HasMeta(s string) bool { return strings.ContainsAny(s, `*?[\`) }
 
-// glob expands an absolute pattern component by component, listing only
-// the directories a pattern component needs. The result is sorted
-// bytewise, as glob(3) sorts; a literal pattern comes back as it is, and
-// whether it exists is up to the reader.
-func (f Files) glob(pattern string) []string {
+// Glob expands an absolute pattern component by component, listing with
+// readDir only the directories a pattern component needs. The result is
+// sorted bytewise, as glob(3) sorts; a literal pattern comes back as it is,
+// and whether it exists is up to the reader.
+func Glob(pattern string, readDir func(dir string) ([]string, error)) []string {
 	matches := []string{"/"}
 	for comp := range strings.SplitSeq(strings.Trim(path.Clean(pattern), "/"), "/") {
 		var next []string
 		for _, dir := range matches {
-			if !hasMeta(comp) {
+			if !HasMeta(comp) {
 				next = append(next, path.Join(dir, comp))
 				continue
 			}
-			names, err := f.ReadDir(dir)
+			names, err := readDir(dir)
 			if err != nil {
 				continue
 			}

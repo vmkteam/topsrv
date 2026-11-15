@@ -98,6 +98,15 @@ func collected(gaps []Gap, data any) Section {
 	return Section{Status: StatusPartial, Gaps: gaps, Data: data}
 }
 
+// absent is the section of a component that is not there: na, unless a
+// source that would have told was unreadable — unknown with its reason then.
+func absent(gaps gapList) Section {
+	if len(gaps) > 0 {
+		return unknown(gaps[0].Reason)
+	}
+	return Section{Status: StatusNA}
+}
+
 // gapList collects the sources a section could not read.
 type gapList []Gap
 
@@ -120,9 +129,18 @@ func (g *gapList) optional(path string, err error) {
 // errParse marks content the collector could not parse.
 var errParse = errors.New("security: parse error")
 
+// reasonError carries the reason of another section as an error, for a gap
+// of a section that depends on it.
+type reasonError Reason
+
+func (r reasonError) Error() string { return string(r) }
+
 // reasonOf maps a read error to the reason reported for it.
 func reasonOf(err error) Reason {
+	var re reasonError
 	switch {
+	case errors.As(err, &re):
+		return Reason(re)
 	case errors.Is(err, fs.ErrPermission):
 		return ReasonPermissionDenied
 	case errors.Is(err, fs.ErrNotExist):

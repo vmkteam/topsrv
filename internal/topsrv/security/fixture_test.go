@@ -1,6 +1,10 @@
 package security
 
 import (
+	"bytes"
+	"io/fs"
+	"debug/elf"
+	"encoding/binary"
 	"encoding/json"
 	"maps"
 	"os"
@@ -28,6 +32,22 @@ func writeTree(t *testing.T, root string, files map[string]string) {
 		}
 		require.NoError(t, os.WriteFile(full, []byte(content), 0o644))
 	}
+}
+
+// noGroupWrite clears the group and other write bits under root, whatever
+// the umask: StrictModes tests must not depend on it (002 under su).
+func noGroupWrite(t *testing.T, root string) {
+	t.Helper()
+	require.NoError(t, filepath.WalkDir(root, func(p string, d fs.DirEntry, err error) error {
+		if err != nil || d.Type()&fs.ModeSymlink != 0 {
+			return err
+		}
+		fi, err := d.Info()
+		if err != nil {
+			return err
+		}
+		return os.Chmod(p, fi.Mode().Perm()&^0o022)
+	}))
 }
 
 // fixture builds a scan root from files.
@@ -77,4 +97,47 @@ func toJSON(t *testing.T, v any) string {
 	b, err := json.Marshal(v)
 	require.NoError(t, err)
 	return string(b)
+}
+
+// elfNeeding is a minimal ELF64 file whose dynamic section lists libs as
+// DT_NEEDED: what ImportedLibraries reads, no code.
+func elfNeeding(libs ...string) string {
+	must := func(err error) {
+		if err != nil {
+			panic(err) // binary.Write into a buffer fails only on a bad type
+		}
+	}
+	dynstr := []byte{0}
+	dyn := make([]elf.Dyn64, 0, len(libs)+1)
+	for _, l := range libs {
+		dyn = append(dyn, elf.Dyn64{Tag: int64(elf.DT_NEEDED), Val: uint64(len(dynstr))})
+		dynstr = append(append(dynstr, l...), 0)
+	}
+	dyn = append(dyn, elf.Dyn64{Tag: int64(elf.DT_NULL)})
+	shstr := []byte("\x00.dynstr\x00.dynamic\x00.shstrtab\x00")
+
+	var dynBuf bytes.Buffer
+	must(binary.Write(&dynBuf, binary.LittleEndian, dyn))
+	const hdr = 64
+	dynstrOff := uint64(hdr)
+	dynOff := dynstrOff + uint64(len(dynstr))
+	shstrOff := dynOff + uint64(dynBuf.Len())
+	shOff := shstrOff + uint64(len(shstr))
+
+	var b bytes.Buffer
+	h := elf.Header64{Type: uint16(elf.ET_DYN), Machine: uint16(elf.EM_X86_64), Version: uint32(elf.EV_CURRENT),
+		Shoff: shOff, Ehsize: hdr, Phentsize: 56, Shentsize: 64, Shnum: 4, Shstrndx: 3}
+	copy(h.Ident[:], []byte{0x7f, 'E', 'L', 'F', byte(elf.ELFCLASS64), byte(elf.ELFDATA2LSB), byte(elf.EV_CURRENT)})
+	must(binary.Write(&b, binary.LittleEndian, h))
+	b.Write(dynstr)
+	b.Write(dynBuf.Bytes())
+	b.Write(shstr)
+	sections := []elf.Section64{
+		{},
+		{Name: 1, Type: uint32(elf.SHT_STRTAB), Off: dynstrOff, Size: uint64(len(dynstr)), Addralign: 1},
+		{Name: 9, Type: uint32(elf.SHT_DYNAMIC), Off: dynOff, Size: uint64(dynBuf.Len()), Link: 1, Entsize: 16, Addralign: 8},
+		{Name: 18, Type: uint32(elf.SHT_STRTAB), Off: shstrOff, Size: uint64(len(shstr)), Addralign: 1},
+	}
+	must(binary.Write(&b, binary.LittleEndian, sections))
+	return b.String()
 }

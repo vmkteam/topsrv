@@ -37,8 +37,8 @@ func sshdFixture() map[string]string {
 		"proc/stat":                       "cpu 1 2 3\nbtime 1794700000\n",
 		"proc/701/exe":                    "-> /usr/lib/openssh/sshd-session",
 		"proc/701/cmdline":                "sshd-session: alice [priv]\x00",
-		"usr/sbin/sshd":                   "\x7fELF...libc.so.6...",
-		"usr/lib/openssh/sshd-session":    "\x7fELF...libpam.so.0...libc.so.6",
+		"usr/sbin/sshd":                   elfNeeding("libc.so.6"),
+		"usr/lib/openssh/sshd-session":    elfNeeding("libpam.so.0", "libc.so.6"),
 		"lib/systemd/system/ssh.service":  "[Service]\nEnvironmentFile=-/etc/default/ssh\nExecStartPre=/usr/sbin/sshd -t\nExecStart=/usr/sbin/sshd -D $SSHD_OPTS\n",
 		"etc/systemd/system/sshd.service": "-> /lib/systemd/system/ssh.service",
 		"etc/default/ssh":                 "SSHD_OPTS=\n",
@@ -159,7 +159,7 @@ func TestSSHDFlags(t *testing.T) {
 		files := map[string]string{
 			"etc/ssh/sshd_config": "PasswordAuthentication yes\n",
 			"etc/conf.d/sshd":     "SSHD_OPTS=\"-o PermitRootLogin=yes\"\n",
-			"usr/sbin/sshd":       "\x7fELF...libc.musl-x86_64.so.1",
+			"usr/sbin/sshd":       elfNeeding("libc.musl-x86_64.so.1"),
 		}
 		_, d, _ := sshdOf(t, merge(hostProc(), files))
 
@@ -173,8 +173,7 @@ func TestSSHDStatus(t *testing.T) {
 	t.Run("not installed: na", func(t *testing.T) {
 		sec, _, res := sshdOf(t, hostProc())
 		assert.Equal(t, StatusNA, sec.Status)
-		require.NotNil(t, res)
-		assert.True(t, res.notInstalled, "authorizedKeys is na too")
+		assert.Nil(t, res, "authorizedKeys reads the na of the section")
 	})
 
 	t.Run("an unreadable main config (RHEL, 0600, no root): unknown, not defaults", func(t *testing.T) {

@@ -9,12 +9,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-// labelInterface is the interface label of the network metrics.
-const labelInterface = "interface"
-
 // pushSourceInterval is how often the source address towards the push
 // endpoint is looked up again; a failed send looks it up at once.
 const pushSourceInterval = 5 * time.Minute
+
+// pushSourceDialTimeout bounds the lookup, name resolution included: it
+// runs on the push loop, and a failed send is when DNS may be down too.
+const pushSourceDialTimeout = 2 * time.Second
 
 // pushSource is the local address the host reaches the push endpoint from.
 // A host that stops pushing is diagnosed by it: replies to one of its
@@ -38,7 +39,7 @@ func newPushSource(endpoint string) *pushSource {
 		desc: prometheus.NewDesc("topsrv_push_source_info",
 			"Local address and interface the host reaches the push endpoint from.", []string{"address", labelInterface}, nil),
 		now:     time.Now,
-		dial:    net.Dial,
+		dial:    (&net.Dialer{Timeout: pushSourceDialTimeout}).Dial,
 		ifaceOf: interfaceOf,
 	}
 	if u, err := url.Parse(endpoint); err == nil && u.Hostname() != "" {
@@ -55,26 +56,43 @@ func newPushSource(endpoint string) *pushSource {
 
 // current returns the source address, looked up again when older than
 // pushSourceInterval or when force is set. A UDP "connection" sends no
-// packet: the kernel only picks the route and the source address.
+// packet: the kernel only picks the route and the source address. The
+// lookup runs outside the lock, so /metrics never waits on DNS; the
+// interface is looked up only when the address changes.
 func (s *pushSource) current(force bool) string {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.target == "" || !force && s.now().Sub(s.checkedAt) < pushSourceInterval {
-		return s.address
+	address, iface := s.address, s.iface
+	due := s.target != "" && (force || s.now().Sub(s.checkedAt) >= pushSourceInterval)
+	if due {
+		s.checkedAt = s.now()
 	}
-	s.checkedAt = s.now()
-	s.address, s.iface = "", ""
+	s.mu.Unlock()
+	if !due {
+		return address
+	}
+	ip := s.lookup()
+	switch {
+	case ip == nil:
+		address, iface = "", ""
+	case ip.String() != address:
+		address, iface = ip.String(), s.ifaceOf(ip)
+	}
+	s.mu.Lock()
+	s.address, s.iface = address, iface
+	s.mu.Unlock()
+	return address
+}
+
+func (s *pushSource) lookup() net.IP {
 	conn, err := s.dial("udp", s.target)
 	if err != nil {
-		return ""
+		return nil
 	}
 	defer conn.Close()
-	la, ok := conn.LocalAddr().(*net.UDPAddr)
-	if !ok {
-		return ""
+	if la, ok := conn.LocalAddr().(*net.UDPAddr); ok {
+		return la.IP
 	}
-	s.address, s.iface = la.IP.String(), s.ifaceOf(la.IP)
-	return s.address
+	return nil
 }
 
 // interfaceOf names the interface that holds ip.

@@ -351,7 +351,8 @@ func TestPassSectionResults(t *testing.T) {
 		}}
 	}
 	consumer := sectionDef{name: "consumer", budget: time.Second, run: func(_ context.Context, sc *scanCtx) (Section, any) {
-		r, _ := sc.result("producer").(string)
+		_, res, _ := sc.dep("producer")
+		r, _ := res.(string)
 		return ok("saw " + r), nil
 	}}
 
@@ -372,6 +373,20 @@ func TestPassSectionResults(t *testing.T) {
 		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: "inotify", Sections: []string{"consumer"}}))
 
 		assert.Equal(t, "saw p1", d.Sections["consumer"].Data)
+	})
+
+	t.Run("a failed run replaces the result of the last pass", func(t *testing.T) {
+		c, _ := newTestCollector(t, hostProc())
+		c.sections = []sectionDef{producer("p1"), consumer}
+		c.pass(t.Context(), Trigger{Cause: triggerStart})
+		failing := sectionDef{name: "producer", budget: time.Second, run: func(context.Context, *scanCtx) (Section, any) {
+			return unknown(ReasonPermissionDenied), nil
+		}}
+		c.sections = []sectionDef{failing, consumer}
+
+		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerInterval}))
+
+		assert.Equal(t, "saw ", d.Sections["consumer"].Data, "no stale result from the pass before")
 	})
 
 	t.Run("the result of a section past its budget is not kept", func(t *testing.T) {
@@ -456,6 +471,7 @@ func TestProcesses(t *testing.T) {
 		sc := fixture(t, map[string]string{
 			"proc/1/exe":      "-> /usr/lib/systemd/systemd",
 			"proc/77/exe":     "-> /usr/sbin/sshd (deleted)",
+			"proc/88/exe":     "", // readlink fails: argv[0] then (EACCES for another user's process)
 			"proc/88/cmdline": "k3s server\x00--token\x00SENTINEL\x00",
 			"proc/99/":        "", // exited during the walk
 			"proc/self":       "-> 1",

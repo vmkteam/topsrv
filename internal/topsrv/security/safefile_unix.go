@@ -32,8 +32,8 @@ func clearNonblock(f *os.File) error {
 
 // privateFile: only the agent's own user owns fi and may read or write it.
 func privateFile(fi os.FileInfo) bool {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	return ok && fi.Mode().Perm()&0o077 == 0 && int(st.Uid) == os.Geteuid()
+	uid, _ := fileOwner(fi)
+	return fi.Mode().Perm()&0o077 == 0 && uid == int64(os.Geteuid())
 }
 
 // fileOwner returns the owner uid and gid of fi.
