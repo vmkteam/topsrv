@@ -312,6 +312,150 @@ func TestKeywordTable(t *testing.T) {
 		assert.Contains(t, keywords, target, alias)
 	}
 	assert.True(t, slices.ContainsFunc([]string{"permitrootlogin", "usepam", "authorizedkeysfile"}, func(n string) bool { _, ok := keywords[n]; return ok }))
+	for _, k := range keywords {
+		if k.enum {
+			assert.Contains(t, valueChecks, k.name, "an enum keyword without the values sshd takes")
+		}
+	}
+	for name := range valueChecks {
+		k, ok := keywords[strings.ToLower(name)]
+		assert.True(t, ok && k.name == name, "a check for an unknown keyword %s", name)
+	}
+}
+
+func TestParseValues(t *testing.T) {
+	cases := []struct {
+		line  string
+		valid bool
+	}{
+		{"PermitRootLogin without-password", true},
+		{"PermitRootLogin FORCED-COMMANDS-ONLY", true},
+		{"PermitRootLogin SENTINELSECRET", false},
+		{"PasswordAuthentication Yes", true},
+		{"PasswordAuthentication true", false},
+		{"IgnoreRhosts shosts-only", true},
+		{"AllowTcpForwarding local", true},
+		{"PermitTunnel point-to-point", true},
+		{"GatewayPorts clientspecified", true},
+		{"AddressFamily inet6", true},
+		{"LogLevel DEBUG3", true},
+		{"LogLevel loud", false},
+		{"SyslogFacility AUTHPRIV", true},
+		{"FingerprintHash sha1", false},
+		{"Port 2222", true},
+		{"Port 0", false},
+		{"Port 65536", false},
+		{"Port ssh", true},
+		{"Port secure-shell", true}, // an alias
+		{"Port https", false},       // udp only
+		{"Port SENTINELSECRET", false},
+		{"MaxAuthTries 3", true},
+		{"MaxAuthTries -1", false},
+		{"MaxAuthTries 3x", false},
+		{"ClientAliveCountMax 0", true},
+		{"LoginGraceTime 1h30m", true},
+		{"LoginGraceTime 90", true},
+		{"LoginGraceTime m", false},
+		{"ClientAliveInterval 5x", false},
+		{"MaxStartups 10:30:100", true},
+		{"MaxStartups 10", true},
+		{"MaxStartups 10:30", false},
+		{"Ciphers aes256-gcm@openssh.com,chacha20-poly1305@openssh.com", true},
+		{"Ciphers -*-cbc", true},
+		{"KexAlgorithms +sntrup761x25519-sha512", true},
+		{"MACs ,hmac-sha2-256", false},
+		{"HostKeyAlgorithms SENTINELSECRET", false},
+		{"AuthenticationMethods publickey,password publickey,keyboard-interactive:pam", true},
+		{"AuthenticationMethods any", true},
+		{"AuthenticationMethods publickey,SENTINEL", false},
+		{"AuthenticationMethods password:pam", true}, // sshd cuts the device off any method
+		{"AuthenticationMethods none", true},
+		{"AuthenticationMethods keyboard-interactive:PAM", false},
+		{"AllowUsers anything@192.0.2.1", true},
+		{"ListenAddress host.test.local:2222", true},
+		{"ListenAddress [2001:db8::1]:22", true},
+		{"ListenAddress [2001:db8::1]", true},
+		{"ListenAddress 2001:db8::1", true},
+		{"ListenAddress 192.0.2.1 rdomain vrf1", true},
+		{"ListenAddress 192.0.2.1:SENTINEL", false},
+		{"ListenAddress [2001:db8::1]:", false},
+		{"ListenAddress [2001:db8::1]x", false},
+	}
+	files := map[string]string{"/etc/services": "ssh\t\t22/tcp\tsecure-shell\t# SSH Remote Login Protocol\nhttps 443/udp\n"}
+	for _, tc := range cases {
+		t.Run(tc.line, func(t *testing.T) {
+			files[DefaultConfig] = tc.line + "\n"
+			cfg := parse(t, files, Flags{})
+
+			assert.Equal(t, tc.valid, cfg.Valid(), "errors: %v", cfg.Errors)
+			if !tc.valid {
+				assert.Equal(t, []Ref{{File: DefaultConfig, Line: 1, Code: CodeBadValue}}, cfg.Errors)
+				assert.Empty(t, cfg.Global, "a refused value is never stored")
+			}
+		})
+	}
+}
+
+func TestParseMatchCriteria(t *testing.T) {
+	cases := []struct {
+		line  string
+		valid bool
+	}{
+		{"Match User alice Address 192.0.2.0/24", true},
+		{"Match group admins host *.test.local", true},
+		{"Match Invalid-User", true},
+		{"Match Invalid-User LocalAddress 192.0.2.1", true},
+		{"Match User invalid-user", true}, // a pattern, not the token
+		{"Match LocalPort 2222", true},
+		{"Match RDomain vrf1 Version OpenSSH_10*", true},
+		{"Match LocalPort SENTINEL", false},
+		{"Match SENTINELSECRET x", false},
+		{"Match User", false},
+		{"Match All User alice", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.line, func(t *testing.T) {
+			cfg := parse(t, map[string]string{DefaultConfig: tc.line + "\n  X11Forwarding no\n"}, Flags{})
+
+			assert.Equal(t, tc.valid, cfg.Valid(), "errors: %v", cfg.Errors)
+			if tc.valid {
+				require.Len(t, cfg.MatchBlocks, 1)
+				assert.Equal(t, strings.Fields(tc.line)[1:], cfg.MatchBlocks[0].Criteria)
+			} else {
+				assert.Equal(t, []Ref{{File: DefaultConfig, Line: 1, Code: CodeBadMatch}}, cfg.Errors)
+				assert.Empty(t, cfg.MatchBlocks, "refused criteria are never stored")
+			}
+		})
+	}
+}
+
+func TestParseBadValueSources(t *testing.T) {
+	t.Run("a refused line does not hide the next one", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "PermitRootLogin SENTINEL\nPermitRootLogin no\n"}, Flags{})
+		assert.Equal(t, "no", cfg.Global["PermitRootLogin"].Values[0])
+		assert.False(t, cfg.Valid())
+	})
+	t.Run("in a Match block", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "Match User deploy\n  X11Forwarding SENTINEL\n"}, Flags{})
+		assert.Empty(t, cfg.MatchBlocks[0].Keys)
+		assert.Equal(t, []Ref{{File: DefaultConfig, Line: 2, Code: CodeBadValue}}, cfg.Errors)
+	})
+	t.Run("-o and -p", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "Port SENTINEL\n"},
+			Flags{Ports: []string{"SENTINEL"}, Options: []string{"MaxAuthTries=SENTINEL"}})
+		assert.Equal(t, []Ref{{File: SourceCmdline, Code: CodeBadValue}, {File: SourceCmdline, Code: CodeBadValue}}, cfg.Errors,
+			"the Port line of the file is skipped unchecked under -p, as sshd does")
+		assert.Empty(t, cfg.Global)
+	})
+	t.Run("a service name without /etc/services", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "Port ssh\n"}, Flags{})
+		assert.False(t, cfg.Valid(), "getservbyname finds nothing")
+	})
+	t.Run("a scalar checks the value it keeps", func(t *testing.T) {
+		cfg := parse(t, map[string]string{DefaultConfig: "MaxAuthTries 3 SENTINEL\n"}, Flags{})
+		assert.Equal(t, []Ref{{File: DefaultConfig, Line: 1, Code: CodeExtraArguments}}, cfg.Errors)
+		assert.Equal(t, []string{"3"}, cfg.Global["MaxAuthTries"].Values)
+	})
 }
 
 func FuzzSplitLine(f *testing.F) {

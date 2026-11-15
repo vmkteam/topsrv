@@ -94,6 +94,7 @@ type parser struct {
 	files     Files
 	cfg       *Config
 	portsFlag bool
+	services  map[string]bool // TCP service names, read on the first Port that is not a number
 }
 
 // Parse reads the configuration flags name: -f, then -o before the files
@@ -198,8 +199,8 @@ func (p *parser) match(args []string, cur *MatchBlock, ref Ref) *MatchBlock {
 	if len(args) == 1 && strings.EqualFold(args[0], "all") {
 		return nil
 	}
-	if len(args)%2 == 1 || slices.ContainsFunc(args, func(a string) bool { return strings.EqualFold(a, "all") }) {
-		p.fail(ref, CodeBadMatch) // sshd wants criterion-value pairs; All stands alone
+	if !p.validCriteria(args) {
+		p.fail(ref, CodeBadMatch) // sshd exits; the criteria are never stored, so never sent
 		return cur
 	}
 	b := &MatchBlock{Criteria: args, Source: ref.Source(), Keys: map[string]Value{}}
@@ -211,6 +212,9 @@ func (p *parser) match(args []string, cur *MatchBlock, ref Ref) *MatchBlock {
 // Match block, by the keyword's class.
 func (p *parser) set(block *MatchBlock, k keyword, args []string, ref Ref) {
 	source := ref.Source()
+	if k.name == "Port" && p.portsFlag && source != SourceCmdline {
+		return // -p overrides the Port lines of the files: sshd skips them unchecked
+	}
 	if len(args) == 0 {
 		p.fail(ref, CodeMissingArgument)
 		return
@@ -219,18 +223,22 @@ func (p *parser) set(block *MatchBlock, k keyword, args []string, ref Ref) {
 	if block != nil {
 		dst = block.Keys
 	}
-	if k.class == scalar && len(args) > 1 {
-		p.fail(ref, CodeExtraArguments)
+	if k.class == scalar {
+		if len(args) > 1 {
+			p.fail(ref, CodeExtraArguments)
+		}
+		args = args[:1]
 	}
 	if k.enum {
 		args = []string{normalizeEnum(k.name, args[0])}
 	}
+	if slices.ContainsFunc(args, func(v string) bool { return !p.validValue(k.name, v) }) {
+		p.fail(ref, CodeBadValue) // sshd exits; the value is never stored, so never sent
+		return
+	}
 	prev, seen := dst[k.name]
 	switch k.class {
 	case accumulate:
-		if k.name == "Port" && p.portsFlag && source != SourceCmdline {
-			return // -p overrides the Port lines of the files
-		}
 		if k.name == "Subsystem" {
 			args = []string{strings.Join(args, " ")}
 		}
@@ -246,7 +254,7 @@ func (p *parser) set(block *MatchBlock, k keyword, args []string, ref Ref) {
 		}
 	case scalar:
 		if !seen {
-			dst[k.name] = Value{Values: args[:1], Source: source}
+			dst[k.name] = Value{Values: args, Source: source}
 		}
 	case ignored, include, match: // not values
 	}
