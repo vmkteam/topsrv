@@ -26,15 +26,28 @@ var roleProcesses = []string{
 	"dockerd", "containerd", "crio", "conmon",
 	// kubernetes
 	"kubelet", "kubelite", "k3s", "rke2", "k0s", "kube-proxy", "kube-apiserver", "etcd",
+	// orchestration
+	"nomad",
 	// cluster networking
-	"cilium-agent", "calico-node", "flanneld", "kube-router", "antrea-agent", "ovs-vswitchd", "nomad",
+	"cilium-agent", "calico-node", "flanneld", "kube-router", "antrea-agent", "ovs-vswitchd",
 	// virtualization
 	"libvirtd", "virtqemud", "lxd", "incus", "incusd", "firecracker", "cloud-hypervisor", "pvedaemon",
 	// VPN
 	"tailscaled", "openvpn", "wireguard-go", "charon", "pluto", "zerotier-one", "nebula", "netbird",
 	// routing and failover
 	"bird", "zebra", "bgpd", "keepalived",
+	// image builds: standalone BuildKit, not the buildx builder container
+	"buildkitd",
 }
+
+// ciRunners, with drone-runner-*, run CI jobs: GitLab, GitHub Actions
+// (Runner.Listener), Azure Pipelines (Agent.Listener), Woodpecker, Gitea,
+// Forgejo, Buildkite. A runner in a container of the host's user namespace
+// (rootful Docker, a Kubernetes pod) runs its jobs on this kernel, mostly
+// through the Docker socket, so it counts in any network namespace; one in
+// an unprivileged LXC, LXD or Proxmox container, with a user namespace of
+// its own, is that container's.
+var ciRunners = []string{"gitlab-runner", "Runner.Listener", "Agent.Listener", "woodpecker-agent", "act_runner", "forgejo-runner", "buildkite-agent"}
 
 // Interfaces reported by name; the backend derives role tags.
 var (
@@ -62,8 +75,8 @@ var roleMarkers = []string{
 	"/proc/net/ip_vs",             // IPVS: kube-proxy in ipvs mode, keepalived LVS
 }
 
-// roleData carries signals for role tags (docker-host, k8s-node, vpn-gw,
-// hypervisor, multi-uplink) that the backend derives.
+// roleData carries signals for role tags (docker-host, k8s-node, nomad-node,
+// ci-runner, vpn-gw, hypervisor, multi-uplink) that the backend derives.
 type roleData struct {
 	Processes     []string      `json:"processes"`
 	Interfaces    ifaceSignals  `json:"interfaces"`
@@ -117,19 +130,20 @@ func collectRoleSignals(_ context.Context, sc *scanCtx) Section {
 // roleProcessesRunning lists the role processes found, sorted; incomplete
 // with fs.ErrPermission under hidepid (see processes). A process in a network
 // namespace other than PID 1's (a VPN client or kubelet in a container) is
-// not a role of the host.
+// not a role of the host; a CI runner is not a network role, see ciRunners.
 func roleProcessesRunning(sc *scanCtx) ([]string, error) {
 	procs, err := sc.processes()
 	if procs == nil && err != nil {
 		return nil, err
 	}
 	hostNet, _ := sc.readlink("/proc/1/ns/net")
+	hostUser, _ := sc.readlink("/proc/1/ns/user")
 	found := map[string]bool{}
 	for _, p := range procs {
-		if !isRoleProcess(p.name) {
-			continue
-		}
-		if !sameNamespace(sc, p.pid, "net", hostNet) {
+		switch {
+		case isRoleProcess(p.name) && sameNamespace(sc, p.pid, "net", hostNet):
+		case isCIRunner(p.name) && (sameNamespace(sc, p.pid, "user", hostUser) || sameNamespace(sc, p.pid, "net", hostNet)):
+		default:
 			continue
 		}
 		found[p.name] = true
@@ -144,6 +158,10 @@ func roleProcessesRunning(sc *scanCtx) ([]string, error) {
 
 func isRoleProcess(name string) bool {
 	return slices.Contains(roleProcesses, name) || strings.HasPrefix(name, "qemu-system-")
+}
+
+func isCIRunner(name string) bool {
+	return slices.Contains(ciRunners, name) || strings.HasPrefix(name, "drone-runner-")
 }
 
 func interfaceSignals(sc *scanCtx) (ifaceSignals, error) {

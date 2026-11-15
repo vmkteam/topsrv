@@ -3,6 +3,9 @@ package security
 import (
 	"cmp"
 	"context"
+	"errors"
+	"io/fs"
+	"os"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -16,6 +19,7 @@ const (
 	pathGroup    = "/etc/group"
 	pathGshadow  = "/etc/gshadow"
 	pathNSSwitch = "/etc/nsswitch.conf"
+	pathHomed    = "/var/lib/systemd/home"
 	codeFields   = "fields" // lineRef.Code: wrong number of fields
 	codeID       = "id"     // lineRef.Code: a uid or gid that is no number
 	algoBcrypt   = "bcrypt"
@@ -77,6 +81,10 @@ type accountsData struct {
 	// not see.
 	NISCompat bool       `json:"nisCompat,omitempty"`
 	NSS       *nssConfig `json:"nss"`
+	// HomedUsers: systemd-homed keeps the record of a home it manages as
+	// /var/lib/systemd/home/NAME.identity; the user is not in /etc/passwd,
+	// nss-systemd serves it. null when the directory is unreadable.
+	HomedUsers *bool `json:"homedUsers"`
 	// LoginDefs are the keys of login.defs the backend checks, as written,
 	// "invalid" in a form shadow-utils refuses; null without the file.
 	LoginDefs map[string]string `json:"loginDefs"`
@@ -211,6 +219,8 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 		gaps.optional(pathNSSwitch, err) // musl has no NSS
 	}
 
+	d.HomedUsers = collectHomed(sc, &gaps)
+
 	all := buildAccounts(sc, users, shadow)
 	if shells := collectShells(sc, &gaps); shells != nil {
 		for i := range all {
@@ -233,6 +243,21 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 	}
 	d.Files = filesMeta(sc, []string{pathPasswd, pathShadow, pathGroup, pathGshadow})
 	return collected(gaps, d), &accountsResult{users: all, groups: groupsByUser(users, groups), groupsByName: groups}
+}
+
+// collectHomed reports whether systemd-homed has a home registered. Only
+// the names are listed: the records hold the user, its groups and password
+// hashes.
+func collectHomed(sc *scanCtx, gaps *gapList) *bool {
+	entries, err := sc.readDir(pathHomed)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return new(false)
+	case err != nil:
+		gaps.add(pathHomed, err)
+		return nil
+	}
+	return new(slices.ContainsFunc(entries, func(e os.DirEntry) bool { return strings.HasSuffix(e.Name(), ".identity") }))
 }
 
 // parsePasswd parses name:pw:uid:gid:gecos:home:shell. GECOS is skipped
