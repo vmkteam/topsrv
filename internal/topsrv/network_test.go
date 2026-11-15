@@ -95,7 +95,7 @@ func TestIfaceAddresses(t *testing.T) {
 		{Addr: "2001:db8::abcd:1/64"}, // a privacy address
 	}, map[netip.Addr]bool{netip.MustParseAddr("2001:db8::abcd:1"): true})
 	assert.Equal(t, []string{"10.0.0.5/24", "203.0.113.7/32", "2001:db8::5/64"}, got, "every address, link-local and temporary left out")
-	assert.Equal(t, []string{""}, ifaceAddresses(nil, nil), "no addresses: one series with an empty address")
+	assert.Empty(t, ifaceAddresses(nil, nil))
 
 	ipvs := make([]net.InterfaceAddr, 0, 500) // kube-ipvs0: a ClusterIP per Service
 	for i := range 500 {
@@ -116,4 +116,48 @@ garbage
 		netip.MustParseAddr("2001:db8::abcd"): true, // temporary
 		netip.MustParseAddr("2001:db8::beef"): true, // deprecated
 	}, got)
+}
+
+func TestNetworkInfoAndAddresses(t *testing.T) {
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewNetworkCollector(embedlog.Logger{}))
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	labels := func(name string) []map[string]string {
+		var out []map[string]string
+		for _, mf := range mfs {
+			if mf.GetName() != name {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				l := map[string]string{}
+				for _, lp := range m.GetLabel() {
+					l[lp.GetName()] = lp.GetValue()
+				}
+				out = append(out, l)
+			}
+		}
+		return out
+	}
+
+	seen := map[string]bool{}
+	for _, l := range labels("topsrv_network_info") {
+		assert.False(t, seen[l["interface"]], "one topsrv_network_info series per interface: the backend reads it so")
+		seen[l["interface"]] = true
+	}
+	require.NotEmpty(t, seen)
+	assert.Contains(t, labels("topsrv_network_address_info"),
+		map[string]string{"interface": loopbackName(t, labels("topsrv_network_info")), "address": "127.0.0.1/8", "family": "ipv4"})
+}
+
+// loopbackName is lo on Linux, lo0 on macOS.
+func loopbackName(t *testing.T, info []map[string]string) string {
+	t.Helper()
+	for _, l := range info {
+		if l["address"] == "127.0.0.1/8" {
+			return l["interface"]
+		}
+	}
+	t.Skip("no 127.0.0.1/8 on this host")
+	return ""
 }

@@ -42,7 +42,7 @@ type pushSource struct {
 func newPushSource(endpoint string) *pushSource {
 	s := &pushSource{
 		desc: prometheus.NewDesc("topsrv_push_source_info",
-			"Local address and interface the host reaches the push endpoint from.", []string{"address", labelInterface}, nil),
+			"Local address and interface the host reaches the push endpoint from.", []string{labelAddress, labelInterface}, nil),
 		now:     time.Now,
 		dial:    (&net.Dialer{Timeout: pushSourceDialTimeout}).Dial,
 		ifaceOf: interfaceOf,

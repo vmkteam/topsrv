@@ -27,6 +27,7 @@ type NetworkCollector struct {
 	netDrops   *prometheus.Desc
 	netSpeed   *prometheus.Desc
 	ifaceInfo  *prometheus.Desc
+	addrInfo   *prometheus.Desc
 }
 
 func NewNetworkCollector(logger embedlog.Logger) *NetworkCollector {
@@ -37,7 +38,10 @@ func NewNetworkCollector(logger embedlog.Logger) *NetworkCollector {
 		netErrors:  prometheus.NewDesc("topsrv_network_errors_total", "Total network errors.", []string{labelInterface, "direction"}, nil),
 		netDrops:   prometheus.NewDesc("topsrv_network_drops_total", "Total dropped packets.", []string{labelInterface, "direction"}, nil),
 		netSpeed:   prometheus.NewDesc("topsrv_network_speed_bytes", "Network interface link speed in bytes per second.", []string{labelInterface}, nil),
-		ifaceInfo:  prometheus.NewDesc("topsrv_network_info", "Network interface information.", []string{labelInterface, "mac", "address", "mtu", "operstate"}, nil),
+		ifaceInfo:  prometheus.NewDesc("topsrv_network_info", "Network interface information.", []string{labelInterface, "mac", labelAddress, "mtu", "operstate"}, nil),
+		addrInfo: prometheus.NewDesc("topsrv_network_address_info",
+			"Addresses of a network interface, one series each: IPv4 and IPv6, link-local and temporary left out.",
+			[]string{labelInterface, labelAddress, "family"}, nil),
 	}
 }
 
@@ -52,6 +56,7 @@ func (c *NetworkCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.netDrops
 	ch <- c.netSpeed
 	ch <- c.ifaceInfo
+	ch <- c.addrInfo
 }
 
 func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
@@ -60,8 +65,11 @@ func (c *NetworkCollector) Collect(ch chan<- prometheus.Metric) {
 	c.collectSpeed(ch)
 }
 
-// labelInterface is the interface label of the network metrics.
-const labelInterface = "interface"
+// Labels of the network metrics.
+const (
+	labelInterface = "interface"
+	labelAddress   = "address"
+)
 
 func (c *NetworkCollector) collectIO(ch chan<- prometheus.Metric) {
 	counters, err := net.IOCounters(true)
@@ -89,13 +97,29 @@ func (c *NetworkCollector) collectInterfaces(ch chan<- prometheus.Metric) {
 	}
 	transient := transientIPv6()
 	for _, iface := range ifaces {
+		// first IPv4 address: one series per interface, what the backend
+		// reads; every address is in topsrv_network_address_info
+		addr := ""
+		for _, a := range iface.Addrs {
+			if strings.Contains(a.Addr, ".") {
+				addr = a.Addr
+				break
+			}
+		}
+
 		operstate := "down"
 		if slices.Contains(iface.Flags, "up") {
 			operstate = "up"
 		}
-		for _, addr := range ifaceAddresses(iface.Addrs, transient) {
-			ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,
-				iface.Name, iface.HardwareAddr, addr, strconv.Itoa(iface.MTU), operstate)
+
+		ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,
+			iface.Name, iface.HardwareAddr, addr, strconv.Itoa(iface.MTU), operstate)
+		for _, a := range ifaceAddresses(iface.Addrs, transient) {
+			family := "ipv4"
+			if strings.Contains(a, ":") {
+				family = "ipv6"
+			}
+			ch <- prometheus.MustNewConstMetric(c.addrInfo, prometheus.GaugeValue, 1, iface.Name, a, family)
 		}
 	}
 }
@@ -142,10 +166,9 @@ func parseIfInet6(b []byte) map[netip.Addr]bool {
 const maxIfaceAddrs = 16
 
 // ifaceAddresses lists the addresses of an interface as reported ("10.0.0.5/24"),
-// IPv4 and IPv6, link-local left out, at most maxIfaceAddrs: a series per
-// address, since the first address is often a floating IP and not where
-// traffic goes from. An interface without addresses gets one series with an
-// empty address.
+// IPv4 and IPv6, link-local and transient IPv6 left out, at most
+// maxIfaceAddrs: the first address is often a floating IP and not where
+// traffic goes from.
 func ifaceAddresses(addrs []net.InterfaceAddr, transient map[netip.Addr]bool) []string {
 	var out []string
 	for _, a := range addrs {
@@ -155,9 +178,6 @@ func ifaceAddresses(addrs []net.InterfaceAddr, transient map[netip.Addr]bool) []
 		if p, err := netip.ParsePrefix(a.Addr); err == nil && !p.Addr().IsLinkLocalUnicast() && !transient[p.Addr()] {
 			out = append(out, a.Addr)
 		}
-	}
-	if out == nil {
-		out = []string{""}
 	}
 	return out
 }
