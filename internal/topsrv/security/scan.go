@@ -284,6 +284,42 @@ func entryNames(entries []os.DirEntry, err error) ([]string, error) {
 	return names, err
 }
 
+// readDirFiles lists the regular files of a drop-in directory, symlinks
+// followed, by name — what apt, sudo, dnf and run-parts read from one. A
+// subdirectory, FIFO, device or dangling link is skipped, as those tools skip
+// it. The FileInfo is the target's, under the name in the directory.
+func (sc *scanCtx) readDirFiles(dir string) ([]fs.FileInfo, error) {
+	entries, err := sc.readDir(dir)
+	out := make([]fs.FileInfo, 0, len(entries))
+	for _, e := range entries {
+		var (
+			fi   fs.FileInfo
+			ierr error
+		)
+		switch t := e.Type(); {
+		case t.IsRegular():
+			fi, ierr = e.Info()
+		case t&fs.ModeSymlink != 0:
+			fi, ierr = sc.stat(dir + "/" + e.Name())
+		default:
+			continue
+		}
+		if ierr == nil && fi.Mode().IsRegular() { // gone since the listing, or a link to anything else
+			out = append(out, fi)
+		}
+	}
+	return out, err
+}
+
+// infoNames are the names of readDirFiles, for the parsers that take names.
+func infoNames(infos []fs.FileInfo, err error) ([]string, error) {
+	names := make([]string, 0, len(infos))
+	for _, fi := range infos {
+		names = append(names, fi.Name())
+	}
+	return names, err
+}
+
 // process is one entry of the /proc walk, shared by the sections of a pass.
 type process struct {
 	pid  string

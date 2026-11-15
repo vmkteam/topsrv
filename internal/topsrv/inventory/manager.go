@@ -1,9 +1,6 @@
 package inventory
 
-import (
-	"os"
-	"slices"
-)
+import "os"
 
 // Package database paths. A manager is present on the host when its database
 // exists; the packages collector reads the same files.
@@ -25,15 +22,19 @@ var rpmDBPaths = []string{
 	"/usr/lib/sysimage/rpm/Packages",
 }
 
-// RpmDBPaths returns the rpm database paths in priority order, for callers
-// that read through their own accessors.
-func RpmDBPaths() []string { return slices.Clone(rpmDBPaths) }
-
 // RpmDB returns root + the first existing rpm database path, or "" if none.
 func RpmDB(root string) string {
+	if p := rpmDB(root); p != "" {
+		return root + p
+	}
+	return ""
+}
+
+// rpmDB returns the first existing rpm database path as the host sees it.
+func rpmDB(root string) string {
 	for _, p := range rpmDBPaths {
 		if fileExists(root + p) {
-			return root + p
+			return p
 		}
 	}
 	return ""
@@ -60,10 +61,23 @@ func Managers(root string) []string {
 // no known package database. Snapshots not tied to one manager use it for
 // HostMeta.PackageManager.
 func PrimaryManager(root string) string {
-	if m := Managers(root); len(m) > 0 {
-		return m[0]
+	m, _ := PrimaryDB(root)
+	return m
+}
+
+// PrimaryDB returns PrimaryManager and the path of its database as the host
+// sees it, without root; both "" without a known package database.
+func PrimaryDB(root string) (manager, path string) {
+	if fileExists(root + DpkgStatusPath) {
+		return ManagerDpkg, DpkgStatusPath
 	}
-	return ""
+	if p := rpmDB(root); p != "" {
+		return ManagerRpm, p
+	}
+	if fileExists(root + ApkInstalledPath) {
+		return ManagerApk, ApkInstalledPath
+	}
+	return "", ""
 }
 
 // fileExists hides the err-ignoring intent of Stat. Marker-file probes

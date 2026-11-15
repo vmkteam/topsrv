@@ -23,6 +23,18 @@ func statFile(sc *scanCtx, path string) (fileMeta, error) {
 	return metaOf(path, fi), nil
 }
 
+// filesMeta returns the metadata of the files a section read; one gone
+// since is left out.
+func filesMeta(sc *scanCtx, paths []string) []fileMeta {
+	out := []fileMeta{}
+	for _, p := range paths {
+		if m, err := statFile(sc, p); err == nil {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
 func metaOf(path string, fi fs.FileInfo) fileMeta {
 	uid, gid := fileOwner(fi)
 	return fileMeta{Path: path, Mode: modeString(fi.Mode()), UID: uid, GID: gid}

@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"io/fs"
-	"os"
 	"slices"
 	"strings"
 
@@ -87,7 +86,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	var gaps gapList
 	files := sudoers.Files{
 		ReadFile: func(p string) ([]byte, error) { return sc.read(p, sudoFileLimit) },
-		ReadDir:  func(dir string) ([]string, error) { return fileNames(sc.readDir(dir)) }, // sudo skips subdirectories
+		ReadDir:  func(dir string) ([]string, error) { return infoNames(sc.readDirFiles(dir)) }, // sudo reads regular files only
 	}
 	pol := sudoers.Parse(pathSudoers, shortHostname(sc), files)
 	d := sudoData{SudoPresent: true}
@@ -112,12 +111,7 @@ func collectSudoers(_ context.Context, sc *scanCtx) Section {
 	d.ExternalSources = sudoExternalSources(sc)
 	d.ParseErrors = append(sudoRefs(pol.Errors), doasErrs...)
 	d.DoasRules = doas
-	d.Files = []fileMeta{}
-	for _, p := range slices.Concat(pol.Files, doasFiles) {
-		if m, err := statFile(sc, p); err == nil {
-			d.Files = append(d.Files, m)
-		}
-	}
+	d.Files = filesMeta(sc, slices.Concat(pol.Files, doasFiles))
 	return collected(gaps, d)
 }
 
@@ -148,17 +142,6 @@ func readDoas(sc *scanCtx, gaps *gapList) (rules []doasRule, files []string, err
 		errs = append(errs, sudoRefs(refs)...)
 	}
 	return rules, files, errs
-}
-
-// fileNames lists the entries of a directory that are not directories.
-func fileNames(entries []os.DirEntry, err error) ([]string, error) {
-	names := make([]string, 0, len(entries))
-	for _, e := range entries {
-		if !e.IsDir() {
-			names = append(names, e.Name())
-		}
-	}
-	return names, err
 }
 
 // shortHostname is the host name up to the first dot, for %h in include

@@ -27,10 +27,7 @@ func ubuntuUpdates(t *testing.T) map[string]string {
 		"var/lib/apt/periodic/update-stamp":                              "",
 		"var/lib/apt/periodic/download-upgradeable-stamp":                "",
 	}
-	for p, content := range testdataTree(t, "apt/ubuntu-24.04") {
-		files[strings.TrimPrefix(p, "/")] = content
-	}
-	return files
+	return merge(files, testdataTree(t, "apt/ubuntu-24.04")) // writeTree joins "/etc/..." under the root
 }
 
 func updatesOf(t *testing.T, files map[string]string) (Section, updatesData) {
@@ -73,11 +70,7 @@ func TestUpdatesAPT(t *testing.T) {
 
 func TestUpdatesAPTEdges(t *testing.T) {
 	t.Run("Debian lists Origins-Pattern", func(t *testing.T) {
-		files := map[string]string{"var/lib/dpkg/status": ""}
-		for p, content := range testdataTree(t, "apt/debian-12") {
-			files[strings.TrimPrefix(p, "/")] = content
-		}
-		_, d := updatesOf(t, files)
+		_, d := updatesOf(t, merge(map[string]string{"var/lib/dpkg/status": ""}, testdataTree(t, "apt/debian-12")))
 		assert.Len(t, d.APT.Unattended.OriginsPatterns, 3)
 		assert.Empty(t, d.APT.Unattended.AllowedOrigins)
 		assert.False(t, d.APT.Unattended.Installed)
@@ -124,6 +117,17 @@ func TestUpdatesAPTEdges(t *testing.T) {
 		_, d := updatesOf(t, files)
 		assert.True(t, d.Timers[0].Masked)
 	})
+	t.Run("entries apt does not read", func(t *testing.T) {
+		files := ubuntuUpdates(t)
+		files["etc/apt/apt.conf.d/backup/"] = ""
+		files["etc/apt/apt.conf.d/60gone"] = "-> ../removed.conf"
+		files["etc/apt/apt.conf.d/70local"] = "-> ../local.conf"
+		files["etc/apt/local.conf"] = "Unattended-Upgrade::Automatic-Reboot \"true\";\n"
+		sec, d := updatesOf(t, files)
+		require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+		assert.True(t, d.APT.ConfigValid, "a directory and a dangling link are skipped, as apt skips them")
+		assert.Equal(t, "true", *d.APT.Unattended.AutoReboot, "a link to a file is read")
+	})
 	t.Run("an include that is not there", func(t *testing.T) {
 		sec, d := updatesOf(t, map[string]string{
 			"var/lib/dpkg/status":       "",
@@ -136,7 +140,6 @@ func TestUpdatesAPTEdges(t *testing.T) {
 	t.Run("an unreadable apt.conf.d", func(t *testing.T) {
 		sc := fixture(t, map[string]string{"var/lib/dpkg/status": "", "etc/apt/apt.conf.d/20auto-upgrades": ""})
 		unreadable(t, sc, "etc/apt/apt.conf.d")
-		t.Cleanup(func() { require.NoError(t, os.Chmod(filepath.Join(sc.root, "etc/apt/apt.conf.d"), 0o755)) }) // TempDir removes it
 		sec := collectUpdates(t.Context(), sc)
 		assert.Equal(t, StatusPartial, sec.Status)
 		assert.False(t, sec.Data.(updatesData).APT.ConfigValid)
@@ -162,20 +165,45 @@ func TestUpdatesDNF(t *testing.T) {
 			UpgradeType: new("default"), Reboot: new("never"), Files: d.DNFAutomatic.Files}, d.DNFAutomatic)
 		assert.Equal(t, []timerState{{Name: "dnf-automatic.timer"}, {Name: "dnf-automatic-install.timer", Enabled: true}}, d.Timers)
 	})
-	t.Run("Fedora: dnf5, /etc overrides /usr/share", func(t *testing.T) {
+	t.Run("Fedora: dnf5 reads five sources, later keys win", func(t *testing.T) {
 		_, d := updatesOf(t, map[string]string{
-			"usr/lib/sysimage/rpm/rpmdb.sqlite":           "",
-			"usr/share/dnf5/dnf5-plugins/automatic.conf":  "[commands]\napply_updates = no\nupgrade_type = default\n",
-			"etc/dnf/dnf5-plugins/automatic.conf":         "[commands]\napply_updates = yes\nupgrade_type = SENTINEL\n",
-			"usr/lib/systemd/system/dnf5-automatic.timer": "",
-			"usr/lib/systemd/system/dnf-automatic.timer":  "-> dnf5-automatic.timer", // systemctl: alias
-			"run/systemd/system/":                         "",
+			"usr/lib/sysimage/rpm/rpmdb.sqlite": "",
+			"usr/share/dnf5/dnf5-plugins/automatic.conf": "[commands]\napply_updates = no\nupgrade_type = default\n" +
+				"reboot = never\ndownload_updates = no\n",
+			"usr/share/dnf5/dnf5-plugins/automatic.conf.d/10-vendor.conf": "[commands]\ndownload_updates = yes\n",
+			"etc/dnf/dnf5-plugins/automatic.conf":                         "[commands]\nupgrade_type = SENTINEL\n",
+			"etc/dnf/automatic.conf":                                      "[commands]\napply_updates = yes\n",
+			"etc/dnf/automatic.conf.d/90-local.conf":                      "[commands]\nreboot = when-needed\n",
+			"etc/dnf/automatic.conf.d/README":                             "[commands]\nreboot = never\n", // not *.conf
+			"usr/lib/systemd/system/dnf5-automatic.timer":                 "",
+			"usr/lib/systemd/system/dnf-automatic.timer":                  "-> dnf5-automatic.timer", // systemctl: alias
+			"run/systemd/system/":                                         "",
 		})
-		assert.True(t, d.DNFAutomatic.DNF5)
-		assert.Equal(t, "yes", *d.DNFAutomatic.ApplyUpdates)
-		assert.Equal(t, valueInvalid, *d.DNFAutomatic.UpgradeType)
-		assert.Len(t, d.DNFAutomatic.Files, 2)
+		a := d.DNFAutomatic
+		assert.True(t, a.DNF5)
+		assert.Equal(t, "yes", *a.ApplyUpdates, "/etc/dnf/automatic.conf, read by dnf5 since 5.2.7")
+		assert.Equal(t, "yes", *a.DownloadUpdates)
+		assert.Equal(t, valueInvalid, *a.UpgradeType)
+		assert.Equal(t, "when-needed", *a.Reboot)
+		assert.Equal(t, []string{
+			"/usr/share/dnf5/dnf5-plugins/automatic.conf", "/usr/share/dnf5/dnf5-plugins/automatic.conf.d/10-vendor.conf",
+			"/etc/dnf/dnf5-plugins/automatic.conf", "/etc/dnf/automatic.conf", "/etc/dnf/automatic.conf.d/90-local.conf",
+		}, pathsOf(a.Files))
 		assert.Equal(t, []timerState{{Name: "dnf5-automatic.timer"}}, d.Timers, "the alias is left out")
+	})
+	t.Run("an ostree host updates by rpm-ostreed or bootc", func(t *testing.T) {
+		_, d := updatesOf(t, map[string]string{
+			"usr/lib/sysimage/rpm/rpmdb.sqlite":                                          "",
+			"run/ostree-booted":                                                          "",
+			"run/systemd/system/":                                                        "",
+			"usr/lib/systemd/system/dnf5-automatic.timer":                                "",
+			"usr/lib/systemd/system/rpm-ostreed-automatic.timer":                         "",
+			"usr/lib/systemd/system/bootc-fetch-apply-updates.timer":                     "",
+			"usr/lib/systemd/system/timers.target.wants/bootc-fetch-apply-updates.timer": "-> ../bootc-fetch-apply-updates.timer",
+		})
+		assert.True(t, d.OSTreeBooted, "dnf-automatic timers do not run there")
+		assert.Equal(t, []timerState{{Name: "dnf5-automatic.timer"}, {Name: "rpm-ostreed-automatic.timer"},
+			{Name: "bootc-fetch-apply-updates.timer", Enabled: true}}, d.Timers)
 	})
 	t.Run("no dnf-automatic", func(t *testing.T) {
 		_, d := updatesOf(t, map[string]string{"var/lib/rpm/rpmdb.sqlite": ""})
@@ -184,18 +212,29 @@ func TestUpdatesDNF(t *testing.T) {
 }
 
 func TestUpdatesAPK(t *testing.T) {
-	sec, d := updatesOf(t, map[string]string{
-		"lib/apk/db/installed":           "",
-		"etc/crontabs/root":              "# min hour day month weekday command\n*/15 * * * * run-parts /etc/periodic/15min\n",
-		"etc/periodic/daily/apk-upgrade": "#!/bin/sh\napk update && apk upgrade --available\n",
-		"etc/periodic/weekly/commented":  "#!/bin/sh\n# apk upgrade\n",
-		"etc/periodic/monthly/apk-fix":   "#!/bin/sh\napk fix\n",
-		"etc/periodic/daily/old/":        "", // run-parts skips it
-		"etc/periodic/README":            "not a directory",
+	const job = "#!/bin/sh\napk update && apk upgrade --available\n"
+	sc := fixture(t, map[string]string{
+		"lib/apk/db/installed":              "",
+		"etc/crontabs/root":                 "# min hour day month weekday command\n*/15 * * * * run-parts /etc/periodic/15min\n",
+		"etc/periodic/daily/apk-upgrade":    job,
+		"etc/periodic/daily/apk-upgrade.sh": job, // busybox 1.36 runs a name with a dot
+		"etc/periodic/daily/apk-upgrade~":   job, // run-parts skips the name
+		"etc/periodic/daily/.apk-upgrade":   job, // and a leading dot
+		"etc/periodic/weekly/no-exec-bit":   job, // and a file it may not execute
+		"etc/periodic/weekly/commented":     "#!/bin/sh\n# apk upgrade\n",
+		"etc/periodic/monthly/apk-fix":      "#!/bin/sh\napk fix\n",
+		"etc/periodic/daily/old/":           "", // and a subdirectory
+		"etc/periodic/README":               "not a directory",
 	})
+	for _, p := range []string{"daily/apk-upgrade", "daily/apk-upgrade.sh", "daily/apk-upgrade~", "daily/.apk-upgrade",
+		"weekly/commented", "monthly/apk-fix"} {
+		require.NoError(t, os.Chmod(filepath.Join(sc.root, "etc/periodic", p), 0o755))
+	}
+	sec := collectUpdates(t.Context(), sc)
+	d := sec.Data.(updatesData)
 	assert.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
 	assert.Equal(t, "apk", d.Manager)
-	assert.Equal(t, []string{"/etc/periodic/daily/apk-upgrade"}, d.APK.UpgradeJobs)
+	assert.Equal(t, []string{"/etc/periodic/daily/apk-upgrade", "/etc/periodic/daily/apk-upgrade.sh"}, d.APK.UpgradeJobs)
 }
 
 func TestUpdatesNoManager(t *testing.T) {
@@ -209,4 +248,12 @@ func TestUpdatesStampTimes(t *testing.T) {
 	require.NoError(t, os.Chtimes(filepath.Join(sc.root, "var/lib/apt/periodic/upgrade-stamp"), at, at))
 	d := collectUpdates(t.Context(), sc).Data.(updatesData)
 	assert.Equal(t, at, *d.APT.Stamps.Upgrade)
+}
+
+func pathsOf(files []fileMeta) []string {
+	out := make([]string, 0, len(files))
+	for _, f := range files {
+		out = append(out, f.Path)
+	}
+	return out
 }

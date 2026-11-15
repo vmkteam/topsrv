@@ -65,7 +65,9 @@ func unreadable(t *testing.T, sc *scanCtx, path string) {
 	if os.Geteuid() == 0 {
 		t.Skip("root reads a 0000 file")
 	}
-	require.NoError(t, os.Chmod(filepath.Join(sc.root, path), 0))
+	full := filepath.Join(sc.root, path)
+	require.NoError(t, os.Chmod(full, 0))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(full, 0o755)) }) // TempDir removes a directory only with its bits back
 }
 
 // hostProc is the /proc of an agent on the host: host pid and net

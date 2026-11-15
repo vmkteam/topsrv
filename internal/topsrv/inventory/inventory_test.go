@@ -122,11 +122,15 @@ func TestManagers(t *testing.T) {
 
 			assert.Equal(t, tc.want, Managers(root))
 
-			wantPrimary := ""
+			wantPrimary, wantDB := "", ""
 			if len(tc.want) > 0 {
 				wantPrimary = tc.want[0]
+				wantDB = tc.markers[len(tc.markers)-1] // the last marker is the primary database
 			}
 			assert.Equal(t, wantPrimary, PrimaryManager(root))
+			gotManager, gotDB := PrimaryDB(root)
+			assert.Equal(t, wantPrimary, gotManager)
+			assert.Equal(t, wantDB, gotDB, "as the host sees it, without root")
 		})
 	}
 }

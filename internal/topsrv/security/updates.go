@@ -2,10 +2,7 @@ package security
 
 import (
 	"context"
-	"errors"
-	"io/fs"
 	"maps"
-	"path"
 	"regexp"
 	"slices"
 	"strings"
@@ -24,7 +21,18 @@ const (
 	pathDNF5AutomaticEtc  = "/etc/dnf/dnf5-plugins/automatic.conf"
 	pathAlpineCrontab     = "/etc/crontabs/root"
 	pathAlpinePeriodic    = "/etc/periodic"
+	pathOSTreeBooted      = "/run/ostree-booted"
 )
+
+// dnf5AutomaticFiles in the order dnf5-automatic reads them, later keys
+// winning (5.2.10+; /etc/dnf/automatic.conf since 5.2.7, the .conf.d
+// directories after the file they extend since 5.4). A name ending in "/"
+// is a directory of *.conf. dnf4 reads /etc/dnf/automatic.conf alone.
+var dnf5AutomaticFiles = []string{
+	pathDNF5AutomaticUsr, pathDNF5AutomaticUsr + ".d/",
+	pathDNF5AutomaticEtc, // deprecated
+	pathDNFAutomatic, pathDNFAutomatic + ".d/",
+}
 
 // Limits of the updates section.
 const (
@@ -43,6 +51,10 @@ type updatesData struct {
 	// installed; empty without systemd.
 	Timers            []timerState `json:"timers"`
 	LastPkgDBChangeAt *time.Time   `json:"lastPkgDbChangeAt"`
+	// OSTreeBooted: an image-based host (CoreOS, Silverblue, bootc). The
+	// dnf-automatic timers do not run there (ConditionPathExists=
+	// !/run/ostree-booted); rpm-ostreed or bootc update the image.
+	OSTreeBooted bool `json:"ostreeBooted,omitempty"`
 }
 
 type aptUpdates struct {
@@ -114,24 +126,23 @@ type timerState struct {
 var updateTimers = map[string][]string{
 	inventory.ManagerDpkg: {"apt-daily.timer", "apt-daily-upgrade.timer"},
 	inventory.ManagerRpm: {"dnf-automatic.timer", "dnf-automatic-download.timer", "dnf-automatic-install.timer",
-		"dnf-automatic-notifyonly.timer", "dnf5-automatic.timer"},
+		"dnf-automatic-notifyonly.timer", "dnf5-automatic.timer",
+		"rpm-ostreed-automatic.timer", "bootc-fetch-apply-updates.timer"},
 }
 
-// maskDirs are where a unit is masked: a mask in /usr is a packaging bug.
-var maskDirs = []string{"/etc/systemd/system", "/run/systemd/system"}
-
-func collectUpdates(_ context.Context, sc *scanCtx) Section {
+func collectUpdates(ctx context.Context, sc *scanCtx) Section {
 	var gaps gapList
-	manager, db := packageDB(sc)
+	manager, db := inventory.PrimaryDB(sc.root)
 	if manager == "" {
 		return Section{Status: StatusNA}
 	}
 	d := updatesData{Manager: manager, Timers: []timerState{}}
 	switch manager {
 	case inventory.ManagerDpkg:
-		d.APT = collectAPT(sc, &gaps)
+		d.APT = collectAPT(ctx, sc, &gaps)
 	case inventory.ManagerRpm:
 		d.DNFAutomatic = collectDNFAutomatic(sc, &gaps)
+		d.OSTreeBooted = sc.exists(pathOSTreeBooted)
 	case inventory.ManagerApk:
 		d.APK = collectAPK(sc, &gaps)
 	}
@@ -142,50 +153,24 @@ func collectUpdates(_ context.Context, sc *scanCtx) Section {
 	return collected(gaps, d)
 }
 
-// packageDB is the manager of the host and its database, in the order of
-// inventory.Managers.
-func packageDB(sc *scanCtx) (manager, path string) {
-	if sc.exists(inventory.DpkgStatusPath) {
-		return inventory.ManagerDpkg, inventory.DpkgStatusPath
-	}
-	for _, p := range inventory.RpmDBPaths() {
-		if sc.exists(p) {
-			return inventory.ManagerRpm, p
-		}
-	}
-	if sc.exists(inventory.ApkInstalledPath) {
-		return inventory.ManagerApk, inventory.ApkInstalledPath
-	}
-	return "", ""
-}
-
-func collectAPT(sc *scanCtx, gaps *gapList) *aptUpdates {
-	cfg := readAPTConfig(aptFiles{
+func collectAPT(ctx context.Context, sc *scanCtx, gaps *gapList) *aptUpdates {
+	cfg := readAPTConfig(ctx, aptFiles{
 		readFile: func(p string) ([]byte, error) { return sc.read(p, updatesFileLimit) },
-		readDir:  sc.readDirNames,
+		readDir:  func(dir string) ([]string, error) { return infoNames(sc.readDirFiles(dir)) },
 	})
-	for _, re := range cfg.readErrs {
-		gaps.add(re.path, re.err)
-	}
-	a := &aptUpdates{ConfigValid: cfg.err == nil && len(cfg.readErrs) == 0, Files: []fileMeta{}, ParseErrors: []lineRef{}}
-	if cfg.err != nil {
-		a.ParseErrors = append(a.ParseErrors, *cfg.err)
-	}
-	for _, p := range cfg.files {
-		if m, err := statFile(sc, p); err == nil {
-			a.Files = append(a.Files, m)
-		}
-	}
+	*gaps = append(*gaps, cfg.gaps...)
+	a := &aptUpdates{ConfigValid: cfg.valid(), Files: filesMeta(sc, cfg.files), ParseErrors: append([]lineRef{}, cfg.errs...)}
+	isInterval := aptIntervalRe.MatchString
 	a.Periodic = aptPeriodic{
-		Enable:                      checked(cfg.value("APT::Periodic::Enable"), isAPTInterval),
-		UpdatePackageLists:          checked(cfg.value("APT::Periodic::Update-Package-Lists"), isAPTInterval),
-		DownloadUpgradeablePackages: checked(cfg.value("APT::Periodic::Download-Upgradeable-Packages"), isAPTInterval),
-		UnattendedUpgrade:           checked(cfg.value("APT::Periodic::Unattended-Upgrade"), isAPTInterval),
+		Enable:                      checked(cfg.value("APT::Periodic::Enable"), isInterval),
+		UpdatePackageLists:          checked(cfg.value("APT::Periodic::Update-Package-Lists"), isInterval),
+		DownloadUpgradeablePackages: checked(cfg.value("APT::Periodic::Download-Upgradeable-Packages"), isInterval),
+		UnattendedUpgrade:           checked(cfg.value("APT::Periodic::Unattended-Upgrade"), isInterval),
 	}
 	u := &a.Unattended
 	u.Installed = sc.exists(pathUnattendedUpgrade)
-	u.OriginsPatterns, u.Truncated = capOrigins(cfg.list("Unattended-Upgrade::Origins-Pattern"), u.Truncated)
-	u.AllowedOrigins, u.Truncated = capOrigins(cfg.list("Unattended-Upgrade::Allowed-Origins"), u.Truncated)
+	u.OriginsPatterns = u.capped(cfg.list("Unattended-Upgrade::Origins-Pattern"))
+	u.AllowedOrigins = u.capped(cfg.list("Unattended-Upgrade::Allowed-Origins"))
 	u.AutoReboot = checked(cfg.value("Unattended-Upgrade::Automatic-Reboot"), isAPTBool)
 	a.Stamps = aptStamps{
 		Update:              mtimeOf(sc, pathAPTPeriodic+"/update-stamp", gaps),
@@ -196,32 +181,22 @@ func collectAPT(sc *scanCtx, gaps *gapList) *aptUpdates {
 	return a
 }
 
-func capOrigins(list []string, truncated bool) ([]string, bool) {
+// capped keeps at most maxOrigins patterns of maxOriginLen bytes, and
+// marks the cut.
+func (u *aptUnattended) capped(list []string) []string {
 	if len(list) > maxOrigins {
-		list, truncated = list[:maxOrigins], true
+		list, u.Truncated = list[:maxOrigins], true
 	}
 	for i, o := range list {
 		if len(o) > maxOriginLen {
-			list[i], truncated = o[:maxOriginLen], true
+			list[i], u.Truncated = strings.ToValidUTF8(o[:maxOriginLen], ""), true // not a rune cut in half
 		}
 	}
-	return list, truncated
+	return list
 }
 
-// checked returns v when valid accepts it, valueInvalid otherwise: the text
-// of a configuration line is never sent, only a value the tool accepts.
-func checked(v *string, valid func(string) bool) *string {
-	if v == nil || valid(*v) {
-		return v
-	}
-	s := valueInvalid
-	return &s
-}
-
+// aptIntervalRe is what apt.systemd.daily takes as an interval.
 var aptIntervalRe = regexp.MustCompile(`^(always|[0-9]{1,9}[smhd]?)$`)
-
-// isAPTInterval is what apt.systemd.daily takes as an interval.
-func isAPTInterval(v string) bool { return aptIntervalRe.MatchString(v) }
 
 // boolWords are the booleans libdnf takes; apt takes these and more.
 var (
@@ -229,28 +204,31 @@ var (
 	aptBoolWords = slices.Concat(boolWords, []string{"without", "with", "disable", "enable"})
 )
 
-// isAPTBool is StringToBool of strutl.cc.
-func isAPTBool(v string) bool { return slices.Contains(aptBoolWords, strings.ToLower(v)) }
+// isAPTBool is StringToBool of strutl.cc, isDNFBool a boolean of the dnf
+// configuration.
+var (
+	isAPTBool = oneOfFold(aptBoolWords...)
+	isDNFBool = oneOfFold(boolWords...)
+)
 
 func collectDNFAutomatic(sc *scanCtx, gaps *gapList) *dnfAutomatic {
-	d := &dnfAutomatic{Files: []fileMeta{}}
+	d := &dnfAutomatic{}
 	paths := []string{pathDNFAutomatic}
 	if sc.exists(pathDNF5AutomaticUsr) || sc.exists(pathDNF5AutomaticEtc) {
-		d.DNF5, paths = true, []string{pathDNF5AutomaticUsr, pathDNF5AutomaticEtc} // the second overrides
+		d.DNF5, paths = true, dnfConfFiles(sc, dnf5AutomaticFiles, gaps)
 	}
 	commands := map[string]string{}
+	var read []string
 	for _, p := range paths {
 		b, err := sc.read(p, updatesFileLimit)
 		if err != nil {
 			gaps.optional(p, err)
 			continue
 		}
-		d.Installed = true
-		if m, err := statFile(sc, p); err == nil {
-			d.Files = append(d.Files, m)
-		}
+		read = append(read, p)
 		maps.Copy(commands, iniSection(string(b), "commands"))
 	}
+	d.Installed, d.Files = len(read) > 0, filesMeta(sc, read)
 	get := func(k string, valid func(string) bool) *string {
 		v, ok := commands[k]
 		if !ok {
@@ -265,8 +243,26 @@ func collectDNFAutomatic(sc *scanCtx, gaps *gapList) *dnfAutomatic {
 	return d
 }
 
-// isDNFBool is a boolean of the dnf configuration.
-func isDNFBool(v string) bool { return slices.Contains(boolWords, strings.ToLower(v)) }
+// dnfConfFiles expands the directories of paths (a name ending in "/") into
+// their *.conf files, by name.
+func dnfConfFiles(sc *scanCtx, paths []string, gaps *gapList) []string {
+	var out []string
+	for _, p := range paths {
+		dir, isDir := strings.CutSuffix(p, "/")
+		if !isDir {
+			out = append(out, p)
+			continue
+		}
+		files, err := sc.readDirFiles(dir)
+		gaps.optional(dir, err)
+		for _, fi := range files {
+			if strings.HasSuffix(fi.Name(), ".conf") {
+				out = append(out, dir+"/"+fi.Name())
+			}
+		}
+	}
+	return out
+}
 
 func oneOfFold(values ...string) func(string) bool {
 	return func(v string) bool { return slices.Contains(values, strings.ToLower(v)) }
@@ -295,6 +291,10 @@ func iniSection(text, section string) map[string]string {
 // apkUpgradeRe is a cron line or script line that runs apk upgrade.
 var apkUpgradeRe = regexp.MustCompile(`(^|[\s;&|/])apk\s([^#\n]*\s)?upgrade(\s|$)`)
 
+// runPartsNameRe is a name busybox run-parts runs (1.36+): letters, digits,
+// "_", "-" and ".", no leading dot.
+var runPartsNameRe = regexp.MustCompile(`^[A-Za-z0-9_-][A-Za-z0-9_.-]*$`)
+
 func collectAPK(sc *scanCtx, gaps *gapList) *apkUpdates {
 	a := &apkUpdates{UpgradeJobs: []string{}}
 	files := []string{pathAlpineCrontab}
@@ -304,10 +304,13 @@ func collectAPK(sc *scanCtx, gaps *gapList) *apkUpdates {
 		if !dir.IsDir() {
 			continue
 		}
-		names, err := fileNames(sc.readDir(pathAlpinePeriodic + "/" + dir.Name())) // run-parts skips subdirectories
-		gaps.optional(pathAlpinePeriodic+"/"+dir.Name(), err)
-		for _, n := range names {
-			files = append(files, pathAlpinePeriodic+"/"+dir.Name()+"/"+n)
+		sub := pathAlpinePeriodic + "/" + dir.Name()
+		jobs, err := sc.readDirFiles(sub)
+		gaps.optional(sub, err)
+		for _, fi := range jobs {
+			if runPartsNameRe.MatchString(fi.Name()) && fi.Mode()&0o111 != 0 { // what run-parts executes
+				files = append(files, sub+"/"+fi.Name())
+			}
 		}
 	}
 	for _, p := range files {
@@ -337,41 +340,23 @@ func collectTimers(sc *scanCtx, names []string, gaps *gapList) []timerState {
 		t := timerState{Name: name}
 		installed, alias := false, false
 		for _, dir := range unitDirs {
-			if !installed && sc.exists(dir+"/"+name) {
+			if sc.exists(dir + "/" + name) {
 				installed, alias = true, unitAlias(sc, dir+"/"+name)
+				break
 			}
 		}
 		if alias {
 			continue // its target is in the list itself (dnf-automatic → dnf5-automatic on Fedora)
 		}
-		for _, dir := range maskDirs {
-			t.Masked = t.Masked || unitMasked(sc, dir+"/"+name)
-		}
+		t.Masked = slices.ContainsFunc(maskDirs, func(dir string) bool { return unitMasked(sc, dir+"/"+name) })
 		if !installed && !t.Masked {
 			continue
 		}
-		for _, dir := range unitDirs {
-			t.Enabled = t.Enabled || sc.exists(dir+"/timers.target.wants/"+name)
-		}
+		t.Enabled = slices.ContainsFunc(unitDirs, func(dir string) bool { return sc.exists(dir + "/timers.target.wants/" + name) })
 		t.LastTriggerAt = mtimeOf(sc, pathTimerStamps+"/stamp-"+name, gaps)
 		out = append(out, t)
 	}
 	return out
-}
-
-// unitAlias: the unit file is a link to a unit of another name, as
-// systemctl's "alias" state.
-func unitAlias(sc *scanCtx, unit string) bool {
-	target, err := sc.readlink(unit)
-	return err == nil && target != "/dev/null" && path.Base(target) != path.Base(unit)
-}
-
-func unitMasked(sc *scanCtx, path string) bool {
-	if target, err := sc.readlink(path); err == nil {
-		return target == "/dev/null"
-	}
-	fi, err := sc.stat(path)
-	return err == nil && fi.Mode().IsRegular() && fi.Size() == 0
 }
 
 // mtimeOf is the mtime of path; nil when it does not exist, a gap when it
@@ -379,9 +364,7 @@ func unitMasked(sc *scanCtx, path string) bool {
 func mtimeOf(sc *scanCtx, path string, gaps *gapList) *time.Time {
 	fi, err := sc.stat(path)
 	if err != nil {
-		if !errors.Is(err, fs.ErrNotExist) {
-			gaps.add(path, err)
-		}
+		gaps.optional(path, err)
 		return nil
 	}
 	t := fi.ModTime().UTC()

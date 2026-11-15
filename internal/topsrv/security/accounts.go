@@ -178,12 +178,7 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 	if groups != nil {
 		d.PrivilegedGroups = privilegedMembers(users, groups)
 	}
-	d.Files = []fileMeta{}
-	for _, path := range []string{pathPasswd, pathShadow, pathGroup, pathGshadow} {
-		if m, err := statFile(sc, path); err == nil {
-			d.Files = append(d.Files, m)
-		}
-	}
+	d.Files = filesMeta(sc, []string{pathPasswd, pathShadow, pathGroup, pathGshadow})
 	return collected(gaps, d), &accountsResult{users: all}
 }
 

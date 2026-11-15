@@ -48,9 +48,6 @@ var sshdPresenceKeys = []string{"AuthorizedKeysCommand", "TrustedUserCAKeys", "B
 // sshdUnits are the service units sshd runs as, Debian and RHEL names.
 var sshdUnits = []string{"ssh.service", "sshd.service"}
 
-// unitDirs in systemd's order of precedence.
-var unitDirs = []string{"/etc/systemd/system", "/run/systemd/system", "/usr/local/lib/systemd/system", "/usr/lib/systemd/system", "/lib/systemd/system"}
-
 // sshdBinaries may hold the PAM code: sshd-session since OpenSSH 9.8,
 // sshd-auth since 10.0.
 var sshdBinaries = []string{
@@ -245,33 +242,6 @@ func sshdUnitArgs(sc *scanCtx) []string {
 		args = append(args, "-f", cfg)
 	}
 	return args
-}
-
-// unitLines returns the lines of the first unit file found in unitDirs and
-// of its drop-ins in /etc/systemd/system/<unit>.d, in order; nil without a
-// unit file.
-func unitLines(sc *scanCtx, unit string) []string {
-	var out []string
-	for _, dir := range unitDirs {
-		if b, err := sc.read(dir+"/"+unit, smallFileLimit); err == nil {
-			out = strings.Split(string(b), "\n")
-			break
-		}
-	}
-	if out == nil {
-		return nil
-	}
-	for _, dir := range slices.Backward(unitDirs) { // the lowest precedence first: /etc is read last and wins
-		dropins, _ := sc.readDir(dir + "/" + unit + ".d")
-		for _, e := range dropins {
-			if strings.HasSuffix(e.Name(), ".conf") {
-				if b, err := sc.read(dir+"/"+unit+".d/"+e.Name(), smallFileLimit); err == nil {
-					out = append(out, strings.Split(string(b), "\n")...)
-				}
-			}
-		}
-	}
-	return out
 }
 
 // readEnvFile adds the KEY=value lines of an environment file to env.

@@ -17,6 +17,16 @@ const valueUnknown = "unknown"
 // odd value is not sent as it is.
 const valueInvalid = "invalid"
 
+// checked returns v when valid accepts it, valueInvalid otherwise: the text
+// of a configuration line is never sent, only a value the tool accepts.
+func checked(v *string, valid func(string) bool) *string {
+	if v == nil || valid(*v) {
+		return v
+	}
+	s := valueInvalid
+	return &s
+}
+
 // Kind is the /v1/inventory discriminator of the security snapshot.
 const Kind = "security"
 

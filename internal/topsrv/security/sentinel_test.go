@@ -5,6 +5,7 @@ import (
 	"errors"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -162,4 +163,37 @@ func requireMarkersRead(t *testing.T, d Data) {
 	require.NotNil(t, apt)
 	assert.Equal(t, valueInvalid, *apt.Periodic.UnattendedUpgrade, "the value read and replaced")
 	assert.Len(t, apt.ParseErrors, 1, "the line apt refuses")
+}
+
+// TestNoSecretsLeakUpdates covers the updates sources of the hosts the
+// Debian fixture of TestNoSecretsLeak does not read: dnf-automatic and
+// Alpine cron jobs. updates logs nothing, so its data is what is checked.
+func TestNoSecretsLeakUpdates(t *testing.T) {
+	cases := []struct {
+		name  string
+		files map[string]string
+		read  func(t *testing.T, d updatesData)
+	}{
+		{"rpm", map[string]string{
+			"var/lib/rpm/rpmdb.sqlite": "",
+			"etc/dnf/automatic.conf": "[commands]\nupgrade_type = SENTINELSECRET\nreboot_command = \"/usr/bin/SENTINEL --token SENTINELSECRET\"\n" +
+				"[email]\nemail_from = SENTINEL@example.com\nemail_host = SENTINELSECRET.example.com\n",
+		}, func(t *testing.T, d updatesData) {
+			assert.Equal(t, valueInvalid, *d.DNFAutomatic.UpgradeType, "the value read and replaced")
+		}},
+		{"apk", map[string]string{
+			"lib/apk/db/installed": "",
+			"etc/crontabs/root":    "0 4 * * * apk upgrade --repository http://u:SENTINELSECRET@192.0.2.1/alpine\n",
+		}, func(t *testing.T, d updatesData) {
+			assert.Equal(t, []string{"/etc/crontabs/root"}, d.APK.UpgradeJobs, "the job line read")
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sec := collectUpdates(t.Context(), fixture(t, tc.files))
+			require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+			tc.read(t, sec.Data.(updatesData))
+			assert.NotContains(t, strings.ToUpper(toJSON(t, sec)), "SENTINEL")
+		})
+	}
 }

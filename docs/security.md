@@ -236,7 +236,7 @@ Who may run what as whom, parsed by sudoers(5) without sudo or visudo: `/etc/sud
 | `defaults` | object | Global Defaults after the whole policy: `authenticate` (`false` — no password for anyone), `rootpw`, `usePty` — each `null` when not set — and `envKeepLD`: some `LD_*` name is in `env_keep` after every `=`, `+=` and `-=` |
 | `scopedDefaults[]` | object | Bound Defaults (`Defaults:user`, `@host`, `!command`, `>runas`) that switch `authenticate` off, set `rootpw` or keep `LD_*`: `{source, binding, list, noAuthenticate, rootpw, envKeepLD}`. `binding` is `user`, `host`, `command` or `runas`; `list` is the binding, aliases expanded, `null` for a command binding (commands are never sent). `noAuthenticate` is the opposite sense of the global `authenticate` |
 | `files[]` | object | `{path, mode, uid, gid}` of the files read |
-| `ignoredFiles` | []string | includedir entries sudo skips: `sudoers.d/admin.conf` is never read. A subdirectory is skipped silently, as sudo does; an includedir that cannot be listed is a gap |
+| `ignoredFiles` | []string | includedir entries sudo skips: `sudoers.d/admin.conf` is never read. Only regular files are read, links followed: a subdirectory, FIFO or dangling link is skipped silently, as sudo does; an includedir that cannot be listed is a gap |
 | `externalSources` | []string | Sources of `sudoers:` in nsswitch.conf other than `files` (`sss`, `ldap`): rules from them are not here |
 | `parseErrors[]` | object | `{file, line, code}`: `syntax`, `include_depth`, `include_loop`, `too_many_files`. Never the text |
 | `doasRules[]` | object | `{source, permit, principal, nopass, persist, keepenv, asRoot, cmd}`: `principal` a user or `:group`, `asRoot` without `as` or `as root`, `cmd` when restricted to one command. `null` without doas.conf |
@@ -250,22 +250,23 @@ Whether the host installs updates by itself, read from files without running apt
 | `manager` | string | `dpkg`, `rpm` or `apk`, by the package database found first |
 | `apt` | object | Debian/Ubuntu, `null` otherwise. Below |
 | `dnfAutomatic` | object | RHEL/Fedora, `null` otherwise. Below |
-| `apk` | object | Alpine: `{upgradeJobs}` — the files of `/etc/crontabs/root` and `/etc/periodic/*/*` with an `apk … upgrade` line not commented out; Alpine has no update service of its own. `null` otherwise |
-| `timers[]` | object | The update timers installed, without D-Bus: `{name, enabled, masked, lastTriggerAt}` for `apt-daily`, `apt-daily-upgrade`, `dnf-automatic`, `dnf-automatic-{download,install,notifyonly}`, `dnf5-automatic`. `enabled` — a link in `timers.target.wants/` of a unit directory; `masked` — a link to `/dev/null` or an empty file in `/etc` or `/run` (a mask wins over the link); `lastTriggerAt` — mtime of the stamp a `Persistent` timer keeps in `/var/lib/systemd/timers`, `null` before the first run. An alias — a unit file linking to a unit of another name, Fedora's `dnf-automatic.timer` → `dnf5-automatic.timer` — is left out: its target is listed. Empty without systemd |
+| `apk` | object | Alpine: `{upgradeJobs}` — the files of `/etc/crontabs/root` and `/etc/periodic/*/*` with an `apk … upgrade` line not commented out; Alpine has no update service of its own. Of `/etc/periodic` only what busybox `run-parts` runs counts: an executable regular file (or a link to one) named with letters, digits, `_`, `-` and `.`, no leading dot — a script without the execute bit or `job~` never runs. `null` otherwise |
+| `timers[]` | object | The update timers installed, without D-Bus: `{name, enabled, masked, lastTriggerAt}` for `apt-daily`, `apt-daily-upgrade`, `dnf-automatic`, `dnf-automatic-{download,install,notifyonly}`, `dnf5-automatic`, `rpm-ostreed-automatic`, `bootc-fetch-apply-updates`. `enabled` — a link in `timers.target.wants/` of a unit directory; `masked` — a link to `/dev/null` or an empty file in `/etc` or `/run` (a mask wins over the link); `lastTriggerAt` — mtime of the stamp a `Persistent` timer keeps in `/var/lib/systemd/timers`, `null` before the first run. An alias — a unit file linking to a unit of another name, Fedora's `dnf-automatic.timer` → `dnf5-automatic.timer` — is left out: its target is listed. Empty without systemd |
 | `lastPkgDbChangeAt` | time | mtime of the package database: when packages last changed |
+| `ostreeBooted` | bool | An image-based rpm host (`/run/ostree-booted`: CoreOS, Silverblue, bootc). The dnf-automatic timers do not run there (`ConditionPathExists=!/run/ostree-booted`); `rpm-ostreed-automatic` or `bootc-fetch-apply-updates` update the image. Absent when `false` |
 
-`apt` — the configuration merged as apt merges it (`apt-pkg` `configuration.cc`): `/etc/apt/apt.conf.d/*` in byte order of names apt takes (letters, digits, `_-:.`, no extension or `.conf` — `50unattended-upgrades.dpkg-old` is skipped), then `/etc/apt/apt.conf`; blocks, `::` lists, `#clear`, `#include`, `//`, `#` and `/* */` comments; tags case-insensitive. Checked against `apt-config dump` of Debian 12 and Ubuntu 24.04.
+`apt` — the configuration merged as apt merges it (`apt-pkg` `configuration.cc`): `/etc/apt/apt.conf.d/*` in byte order of names apt takes (letters, digits, `_-:.`, no extension or `.conf` — `50unattended-upgrades.dpkg-old` is skipped; regular files and links to them only — a subdirectory or a dangling link is skipped, as apt skips it), then `/etc/apt/apt.conf`; every file is read even after one apt refuses, as apt reads them; blocks, `::` lists, `#clear`, `#include`, `//`, `#` and `/* */` comments; tags case-insensitive. Checked against `apt-config dump` of Debian 12 and Ubuntu 24.04.
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `configValid` | bool | apt accepts the files and every one was read. A line apt refuses stops apt — every apt command, unattended-upgrade included, fails until it is fixed |
+| `configValid` | bool | apt accepts the files and every one was read. A line apt refuses stops apt — every apt command, unattended-upgrade included, fails until it is fixed. Past the agent's limits (128 files, 20 000 nodes) or the section's time the rest is not read: a `budget_exceeded` or `timeout` gap, and `false` |
 | `periodic` | object | `APT::Periodic::` `{enable, updatePackageLists, downloadUpgradeablePackages, unattendedUpgrade}` as written: days, with an `s`/`m`/`h`/`d` suffix, or `always`; `"0"` is off; `null` when not set. `enable` `"0"` switches all of them off |
 | `unattended` | object | `{installed, originsPatterns, allowedOrigins, autoReboot}`: `/usr/bin/unattended-upgrade` exists; `Unattended-Upgrade::Origins-Pattern` (Debian) and `::Allowed-Origins` (Ubuntu), at most 64 each, as written — `${distro_codename}` is not expanded; `Automatic-Reboot` (`true`/`false` and the other spellings apt takes). `truncated` when a list was cut |
 | `stamps` | object | mtimes of `/var/lib/apt/periodic/{update,update-success,download-upgradeable,upgrade}-stamp`: when apt.systemd.daily last ran each step. `updateSuccess` — the lists were fetched without an error; `upgrade` — unattended-upgrade ran |
 | `files[]` | object | `{path, mode, uid, gid}` of the files read: apt runs hooks from them as root |
-| `parseErrors[]` | object | The line apt stopped at, `{file, line, code}`: `block_without_name`, `malformed_tag`, `extra_junk`, `directive_not_top_level`, `unsupported_directive`, `clear_without_tree`, `junk_at_end`, `include_depth`, `too_many_files`, `too_many_nodes` |
+| `parseErrors[]` | object | Lines apt refuses, `{file, line, code}`, one per file at most: apt stops reading a file at such a line, and the files including it, and goes on with the next file. Codes: `block_without_name`, `malformed_tag`, `extra_junk`, `directive_not_top_level`, `unsupported_directive`, `clear_without_tree`, `junk_at_end`, `include_depth` (an include in a file nested deeper than 10). Agents before 0.2.0-rc.4 stopped at the first such line and also sent `too_many_files` and `too_many_nodes` for their own limits |
 
-`dnfAutomatic` — `[commands]` of `/etc/dnf/automatic.conf`, or for dnf5 of `/usr/share/dnf5/dnf5-plugins/automatic.conf` overridden by `/etc/dnf/dnf5-plugins/automatic.conf`.
+`dnfAutomatic` — `[commands]` of `/etc/dnf/automatic.conf` (dnf4); for dnf5, merged in the order dnf5-automatic reads them, later keys winning: `/usr/share/dnf5/dnf5-plugins/automatic.conf`, `/usr/share/dnf5/dnf5-plugins/automatic.conf.d/*.conf`, `/etc/dnf/dnf5-plugins/automatic.conf` (deprecated), `/etc/dnf/automatic.conf` (read by dnf5 since 5.2.7), `/etc/dnf/automatic.conf.d/*.conf` (since 5.4). dnf5 before 5.2.10 read only the first of `/etc/dnf/dnf5-plugins/automatic.conf` and the `/usr/share` file.
 
 | Field | Type | Description |
 |-------|------|-------------|
@@ -274,7 +275,7 @@ Whether the host installs updates by itself, read from files without running apt
 | `applyUpdates`, `downloadUpdates` | string | As written (`yes`, `no`, `1`, `true`, …), `null` when not set. `dnf-automatic-install.timer` installs whatever `apply_updates` says |
 | `upgradeType` | string | `default` or `security` |
 | `reboot` | string | `never`, `when-changed`, `when-needed` |
-| `files[]` | object | `{path, mode, uid, gid}` |
+| `files[]` | object | `{path, mode, uid, gid}` of the files read, in order |
 
 ## `roleSignals`
 
