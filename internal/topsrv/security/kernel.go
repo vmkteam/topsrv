@@ -121,8 +121,7 @@ func collectKernel(_ context.Context, sc *scanCtx) Section {
 		gaps.add("/sys/module", err)
 	}
 
-	d.CPUVulnerabilities, err = readVulnerabilities(sc)
-	gaps.add("/sys/devices/system/cpu/vulnerabilities", err)
+	d.CPUVulnerabilities = readVulnerabilities(sc, &gaps)
 
 	d.LSM = readLSM(sc, &gaps)
 	d.Livepatch, err = readLivepatch(sc)
@@ -222,22 +221,28 @@ func sysModulesNotIn(sc *scanCtx, loaded []module) ([]string, error) {
 	return out, nil
 }
 
-func readVulnerabilities(sc *scanCtx) (map[string]cpuVuln, error) {
-	const dir = "/sys/devices/system/cpu/vulnerabilities/"
+// readVulnerabilities reads every file of the vulnerabilities directory. A
+// file that fails is a gap of its own and the rest are kept; nil when the
+// directory is unreadable.
+func readVulnerabilities(sc *scanCtx, gaps *gapList) map[string]cpuVuln {
+	const dir = "/sys/devices/system/cpu/vulnerabilities"
 	entries, err := sc.readDir(dir)
 	if err != nil {
-		return nil, err
+		gaps.add(dir, err)
+		return nil
 	}
 	out := make(map[string]cpuVuln, len(entries))
 	for _, e := range entries {
-		b, err := sc.read(dir+e.Name(), smallFileLimit)
+		path := dir + "/" + e.Name()
+		b, err := sc.read(path, smallFileLimit)
 		if err != nil {
-			return nil, err
+			gaps.add(path, err)
+			continue
 		}
 		raw := strings.TrimSpace(string(b))
 		out[e.Name()] = cpuVuln{Raw: raw, Class: vulnClass(e.Name(), raw)}
 	}
-	return out, nil
+	return out
 }
 
 // vulnClass classifies a vulnerabilities/* line. The raw line is reported as

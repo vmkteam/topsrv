@@ -131,6 +131,18 @@ func TestKernelGaps(t *testing.T) {
 		assert.Nil(t, d.LSM.AppArmor.Profiles, "unreadable, not zero profiles")
 	})
 
+	t.Run("one unreadable vulnerability file is a gap, the others are kept", func(t *testing.T) {
+		sc := fixture(t, merge(kernelFixture(), map[string]string{"sys/devices/system/cpu/vulnerabilities/retbleed/": ""}))
+
+		sec := collectKernel(t.Context(), sc)
+
+		assert.Equal(t, StatusPartial, sec.Status)
+		assert.Equal(t, []Gap{{Path: "/sys/devices/system/cpu/vulnerabilities/retbleed", Reason: ReasonNotRegular}}, sec.Gaps)
+		d := sec.Data.(kernelData)
+		assert.NotContains(t, d.CPUVulnerabilities, "retbleed")
+		assert.Contains(t, d.CPUVulnerabilities, "mds")
+	})
+
 	t.Run("in a container: AppArmor on, no securityfs", func(t *testing.T) {
 		files := kernelFixture()
 		for _, p := range []string{"sys/kernel/security/lsm", "sys/kernel/security/lockdown", "sys/kernel/security/apparmor/profiles"} {

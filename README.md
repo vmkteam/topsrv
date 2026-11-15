@@ -422,17 +422,18 @@ section carries a `status` — `ok`, `partial` (with `gaps`), `unknown` (with a
 
 | Section | What it reports |
 |---------|-----------------|
-| `environment` | Host or container (docker, podman, k8s, lxc, nspawn), pid/net namespaces, libc, init. In an app container the host sections come out `unknown/container_env` |
-| `kernel` | Taint flags, loaded modules, modules hidden from `/proc/modules`, CPU vulnerabilities, active LSMs, lockdown, AppArmor/SELinux mode, livepatches, clock sync (adjtimex), whitelisted `/proc/cmdline` tokens only |
-| `sysctl` | Raw hardening values (KSPP set, user namespaces, core_pattern, forwarding), `rp_filter`/redirects for `all` and per interface |
-| `roleSignals` | Role processes (dockerd, kubelet, libvirtd, tailscaled, …), interface types (bridge, wireguard, tun), default route count |
+| `environment` | Host or container (docker, podman, k8s, lxc, nspawn, openvz), hypervisor (kvm, vmware, …, or none), pid/net/user namespaces, libc, init. In an app container the host sections come out `unknown/container_env` |
+| `kernel` | Taint flags, loaded modules, modules hidden from `/proc/modules`, CPU vulnerabilities, active LSMs, lockdown, AppArmor/SELinux mode, livepatches, clock sync (adjtimex), module signature enforcement, Secure Boot, kexec, SMT, microcode, whitelisted `/proc/cmdline` tokens only |
+| `sysctl` | Raw hardening values (KSPP and CIS keys, user namespaces, `core_pattern`/`modprobe`/`hotplug`, forwarding), `rp_filter`, redirects, forwarding and `accept_ra` for `all` and per interface |
+| `roleSignals` | Role processes in the host network namespace (dockerd, kubelet, libvirtd, tailscaled, …), interface and tunnel types (bridge, wireguard, tun, gre), interfaces with a default route, role marker files (`/dev/kvm`, kubelet config) |
 
 Untrusted files are read without following FIFOs or devices and with size
 limits; each section has a time budget, and a section stuck in a blocking
 read is reported as `timeout` and not restarted until it returns. Tokens that
 change when a secret changes are keyed with a random per-host key kept in
 `<state dir>/security.key` (0600), the parent of `[Push].SpoolDir` or
-`/var/lib/topsrv`; only the key id is sent.
+`/var/lib/topsrv`; only the key id is sent. A key file that others can
+read or another user owns is replaced.
 
 See exactly what leaves the host — nothing is sent and nothing is written:
 

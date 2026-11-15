@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"io/fs"
 	"path/filepath"
 
@@ -27,25 +28,60 @@ type tokenKey struct {
 	id     string
 }
 
+// Why loadOrCreateKey made a new key.
+const (
+	keyMissing   = "missing"
+	keyInvalid   = "invalid"   // not a regular file, or the wrong size
+	keyUntrusted = "untrusted" // others could read it, or another user owns it
+)
+
+// errUntrustedKey: a key someone else may know lets them check guessed
+// secrets against the tokens.
+var errUntrustedKey = errors.New("key file is readable by others or owned by another user")
+
 // loadOrCreateKey reads <stateDir>/security.key, creating it on first use or
-// when the path holds no usable key (missing, not a regular file, wrong
-// size). Any other read error is returned: a key that is there but
+// when the path holds no usable key; created says why, "" when the key was
+// loaded. Any other read error is returned: a key that is there but
 // unreadable right now must not be replaced.
-func loadOrCreateKey(stateDir string) (tokenKey, error) {
-	b, err := readFileNoFollow(filepath.Join(stateDir, keyFile), keySize)
+func loadOrCreateKey(stateDir string) (k tokenKey, created string, err error) {
+	b, err := readKey(filepath.Join(stateDir, keyFile))
 	switch {
 	case err == nil && len(b) == keySize:
-		return tokenKey{secret: b, id: keyID(b)}, nil
-	case err != nil && !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, errNotRegular) && !errors.Is(err, errTooLarge):
-		return tokenKey{}, err
+		return tokenKey{secret: b, id: keyID(b)}, "", nil
+	case errors.Is(err, fs.ErrNotExist):
+		created = keyMissing
+	case errors.Is(err, errUntrustedKey):
+		created = keyUntrusted
+	case err == nil, errors.Is(err, errNotRegular):
+		created = keyInvalid
+	default:
+		return tokenKey{}, "", err
 	}
-	k := randomKey()
+	k = randomKey()
 	// An exclusive 0600 temp file and a rename, which replaces whatever is at
 	// the path (a symlink included) without writing through it.
 	if err := (spool.Dir{Path: stateDir}).Write(keyFile, k.secret); err != nil {
-		return tokenKey{}, err
+		return tokenKey{}, "", err
 	}
-	return k, nil
+	return k, created, nil
+}
+
+// readKey reads up to keySize+1 bytes of the key file without following a
+// symlink, and refuses a file that is not private to the agent's user.
+func readKey(path string) ([]byte, error) {
+	f, err := openFile(path, true)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return nil, err
+	}
+	if !privateFile(st) {
+		return nil, &fs.PathError{Op: opOpen, Path: path, Err: errUntrustedKey}
+	}
+	return io.ReadAll(io.LimitReader(f, keySize+1))
 }
 
 // randomKey is a new key with its real id: when it cannot be stored, a key
@@ -57,9 +93,10 @@ func randomKey() tokenKey {
 }
 
 // existingOrEphemeralKey is for dry-run, which must not write: the existing
-// key, or a random one with id "ephemeral".
+// key, or a random one with id "ephemeral" where the agent would make a new
+// one.
 func existingOrEphemeralKey(stateDir string) tokenKey {
-	if b, err := readFileNoFollow(filepath.Join(stateDir, keyFile), keySize); err == nil && len(b) == keySize {
+	if b, err := readKey(filepath.Join(stateDir, keyFile)); err == nil && len(b) == keySize {
 		return tokenKey{secret: b, id: keyID(b)}
 	}
 	k := randomKey()

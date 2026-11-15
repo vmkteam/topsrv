@@ -8,6 +8,9 @@ import (
 	"os"
 )
 
+// opOpen is the Op of the errors openFile returns for a file it refuses.
+const opOpen = "open"
+
 var (
 	errNotRegular = errors.New("not a regular file")
 	errTooLarge   = errors.New("file exceeds the size limit")
@@ -32,7 +35,7 @@ func openFile(path string, noFollow bool) (*os.File, error) {
 		return nil, err
 	}
 	if !before.Mode().IsRegular() {
-		return nil, &fs.PathError{Op: "open", Path: path, Err: errNotRegular}
+		return nil, &fs.PathError{Op: opOpen, Path: path, Err: errNotRegular}
 	}
 	afterStat(path)
 
@@ -47,7 +50,7 @@ func openFile(path string, noFollow bool) (*os.File, error) {
 	}
 	if !os.SameFile(before, after) {
 		f.Close()
-		return nil, &fs.PathError{Op: "open", Path: path, Err: errNotRegular}
+		return nil, &fs.PathError{Op: opOpen, Path: path, Err: errNotRegular}
 	}
 	return f, nil
 }

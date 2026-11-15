@@ -14,17 +14,19 @@ func TestTokenKey(t *testing.T) {
 	t.Run("created once with 0600, then reused", func(t *testing.T) {
 		dir := filepath.Join(t.TempDir(), "state")
 
-		k, err := loadOrCreateKey(dir)
+		k, created, err := loadOrCreateKey(dir)
 		require.NoError(t, err)
 		assert.Regexp(t, `^[0-9a-f]{8}$`, k.id)
+		assert.Equal(t, keyMissing, created)
 
 		st, err := os.Stat(filepath.Join(dir, keyFile))
 		require.NoError(t, err)
 		assert.Equal(t, os.FileMode(0o600), st.Mode().Perm())
 		assert.EqualValues(t, keySize, st.Size())
 
-		again, err := loadOrCreateKey(dir)
+		again, created, err := loadOrCreateKey(dir)
 		require.NoError(t, err)
+		assert.Empty(t, created, "loaded, not created")
 		assert.Equal(t, k.id, again.id)
 		assert.Equal(t, k.token("alice", "shadow"), again.token("alice", "shadow"))
 	})
@@ -33,8 +35,9 @@ func TestTokenKey(t *testing.T) {
 		dir := t.TempDir()
 		require.NoError(t, os.WriteFile(filepath.Join(dir, keyFile), []byte("short"), 0o600))
 
-		k, err := loadOrCreateKey(dir)
+		k, created, err := loadOrCreateKey(dir)
 		require.NoError(t, err)
+		assert.Equal(t, keyInvalid, created)
 		b, err := os.ReadFile(filepath.Join(dir, keyFile))
 		require.NoError(t, err)
 		assert.Len(t, b, keySize)
@@ -47,8 +50,9 @@ func TestTokenKey(t *testing.T) {
 		require.NoError(t, os.WriteFile(target, make([]byte, keySize), 0o600))
 		require.NoError(t, os.Symlink(target, filepath.Join(dir, keyFile)))
 
-		k, err := loadOrCreateKey(dir)
+		k, created, err := loadOrCreateKey(dir)
 		require.NoError(t, err)
+		assert.Equal(t, keyInvalid, created)
 		assert.NotEqual(t, keyID(make([]byte, keySize)), k.id, "the link target is not used as the key")
 		st, err := os.Lstat(filepath.Join(dir, keyFile))
 		require.NoError(t, err)
@@ -66,7 +70,7 @@ func TestTokenKey(t *testing.T) {
 		path := filepath.Join(dir, keyFile)
 		require.NoError(t, os.WriteFile(path, make([]byte, keySize), 0))
 
-		_, err := loadOrCreateKey(dir)
+		_, _, err := loadOrCreateKey(dir)
 
 		require.ErrorIs(t, err, fs.ErrPermission)
 		require.NoError(t, os.Chmod(path, 0o600))
@@ -86,10 +90,66 @@ func TestTokenKey(t *testing.T) {
 
 	t.Run("dry-run uses the existing key", func(t *testing.T) {
 		dir := t.TempDir()
-		k, err := loadOrCreateKey(dir)
+		k, _, err := loadOrCreateKey(dir)
 		require.NoError(t, err)
 
 		assert.Equal(t, k.id, existingOrEphemeralKey(dir).id)
+	})
+
+	t.Run("a key others can read is replaced with a private one", func(t *testing.T) {
+		for _, mode := range []os.FileMode{0o644, 0o640, 0o604, 0o660} {
+			t.Run(mode.String(), func(t *testing.T) {
+				dir := t.TempDir()
+				path := filepath.Join(dir, keyFile)
+				old := make([]byte, keySize)
+				require.NoError(t, os.WriteFile(path, old, 0o600))
+				require.NoError(t, os.Chmod(path, mode))
+
+				k, created, err := loadOrCreateKey(dir)
+
+				require.NoError(t, err)
+				assert.Equal(t, keyUntrusted, created)
+				assert.NotEqual(t, keyID(old), k.id, "a key others know is not used")
+				st, err := os.Stat(path)
+				require.NoError(t, err)
+				assert.Equal(t, os.FileMode(0o600), st.Mode().Perm())
+				b, err := os.ReadFile(path)
+				require.NoError(t, err)
+				assert.Equal(t, keyID(b), k.id)
+			})
+		}
+	})
+
+	t.Run("a key owned by another user is replaced", func(t *testing.T) {
+		if os.Geteuid() != 0 {
+			t.Skip("chown needs root")
+		}
+		dir := t.TempDir()
+		path := filepath.Join(dir, keyFile)
+		old := make([]byte, keySize)
+		require.NoError(t, os.WriteFile(path, old, 0o600))
+		require.NoError(t, os.Chown(path, 65534, 65534))
+
+		k, created, err := loadOrCreateKey(dir)
+
+		require.NoError(t, err)
+		assert.Equal(t, keyUntrusted, created)
+		assert.NotEqual(t, keyID(old), k.id)
+	})
+
+	t.Run("dry-run does not use a key others can read, and leaves it", func(t *testing.T) {
+		dir := t.TempDir()
+		path := filepath.Join(dir, keyFile)
+		old := make([]byte, keySize)
+		require.NoError(t, os.WriteFile(path, old, 0o600))
+		require.NoError(t, os.Chmod(path, 0o644))
+
+		k := existingOrEphemeralKey(dir)
+
+		assert.Equal(t, ephemeralKeyID, k.id)
+		b, err := os.ReadFile(path)
+		require.NoError(t, err)
+		assert.Equal(t, old, b, "dry-run writes nothing")
 	})
 }
 

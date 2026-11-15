@@ -20,6 +20,11 @@ func TestEnvironment(t *testing.T) {
 			want:  envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Libc: "glibc", Init: "systemd"},
 		},
 		{
+			name:  "KVM guest: the hypervisor name is sent, the DMI strings are not",
+			files: merge(hostProc(), cpu(cpuinfoGuest, kvmClock), dmi("SENTINEL-1234", "QEMU"), map[string]string{"run/systemd/system/": ""}),
+			want:  envData{UserNsHost: true, PidNsHost: true, RootIsHostRoot: true, NetNsHost: true, ContainerKind: containerNone, Virt: virtKVM, Libc: "unknown", Init: "systemd"},
+		},
+		{
 			name: "Alpine host with openrc and musl",
 			files: merge(hostProc(), map[string]string{
 				"proc/1/comm":             "init\n",
@@ -156,6 +161,9 @@ func TestEnvironment(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			if tc.want.Virt == "" {
+				tc.want.Virt = virtNone // no DMI or cpuinfo in these fixtures
+			}
 			sec, env := collectEnvironment(fixture(t, tc.files))
 
 			assert.Equal(t, tc.want, env)

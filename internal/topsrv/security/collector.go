@@ -235,10 +235,15 @@ func (c *Collector) finish(ctx context.Context, p inventory.Payload) {
 // this run keeps the collector going; its new id tells the backend the
 // tokens changed with the key, not the secrets.
 func (c *Collector) loadKey(ctx context.Context) tokenKey {
-	k, err := loadOrCreateKey(c.stateDir)
-	if err != nil {
+	k, created, err := loadOrCreateKey(c.stateDir)
+	switch {
+	case err != nil:
 		c.Error(ctx, "security: token key unavailable, using one for this run", "dir", c.stateDir, "error", err)
 		return randomKey()
+	case created == keyUntrusted:
+		c.Error(ctx, "security: token key was readable by others or owned by another user, replaced", "dir", c.stateDir, "keyId", k.id)
+	case created != "":
+		c.Print(ctx, "security: new token key", "dir", c.stateDir, "reason", created, "keyId", k.id)
 	}
 	return k
 }

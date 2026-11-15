@@ -52,8 +52,11 @@ type envData struct {
 	// rootless podman) uid 0 and a full capEff are not root of the host.
 	UserNsHost    bool   `json:"userNsHost"`
 	ContainerKind string `json:"containerKind"`
-	Libc          string `json:"libc"`
-	Init          string `json:"init"`
+	// Virt is the hypervisor, as systemd-detect-virt names it, or "none" on
+	// bare metal. Kernel-wide, so in a container too.
+	Virt string `json:"virt"`
+	Libc string `json:"libc"`
+	Init string `json:"init"`
 }
 
 // appContainer: docker, podman or k8s without the host root in view, or an
@@ -108,6 +111,7 @@ func collectEnvironment(sc *scanCtx) (Section, envData) {
 	}
 	env.NetNsHost = err1 == nil && err2 == nil && selfNet == initNet
 
+	env.Virt = detectVirt(sc, &gaps)
 	env.Libc = detectLibc(sc)
 	env.Init = detectInit(sc)
 	return collected(gaps, env), env
