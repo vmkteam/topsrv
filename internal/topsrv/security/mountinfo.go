@@ -152,10 +152,17 @@ func underMount(path, point string) bool {
 	return strings.HasPrefix(path, point) && (len(path) == len(point) || path[len(point)] == '/')
 }
 
+// localFUSE are FUSE drivers of local data: snap images where squashfs
+// cannot be mounted (LXC, LXD), and lxcfs, which serves /proc of system
+// containers.
+var localFUSE = []string{"fuse.snapfuse", "fuse.squashfuse", "fuse.squashfuse_ll", "fuse.lxcfs"}
+
 // isRemoteFS: network filesystems, FUSE (often network-backed: sshfs,
-// s3fs) and autofs, which mounts on access.
+// s3fs) but the local drivers above, and autofs, which mounts on access.
 func isRemoteFS(fsType string) bool {
 	switch {
+	case slices.Contains(localFUSE, fsType):
+		return false
 	case strings.HasPrefix(fsType, "nfs") && fsType != "nfsd", // nfsd is the local server's control fs
 		fsType == "fuse", strings.HasPrefix(fsType, "fuse."):
 		return true
