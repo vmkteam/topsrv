@@ -36,6 +36,33 @@ func TestScanManagerMarksKernelsBeforeTruncation(t *testing.T) {
 	}
 }
 
+// /var/run/reboot-required sets rebootRequired on dpkg without a newer
+// kernel; other managers go by the kernel alone.
+func TestScanManagerRebootRequiredFile(t *testing.T) {
+	c := NewCollector(embedlog.Logger{}, Config{})
+	rebootFilesRoot = rebootRoot(t, true, "libc6\n")
+	t.Cleanup(func() { rebootFilesRoot = "" })
+	host := inventory.HostMeta{KernelRelease: "6.8.0-90-generic"}
+	scan := func(manager string) Snapshot {
+		m := managerFunc{name: manager, scan: func(context.Context) (Snapshot, error) {
+			return Snapshot{Manager: manager, Packages: []Package{deb("linux-image-6.8.0-90-generic", "6.8.0-90.91")}}, nil
+		}}
+		snap, _, ok := c.scanManager(t.Context(), m, host, 100, time.Now())
+		if !ok {
+			t.Fatal("scanManager failed")
+		}
+		return snap
+	}
+
+	dpkg := scan(inventory.ManagerDpkg)
+	if !dpkg.RebootRequired || len(dpkg.RebootRequiredPackages) != 1 || dpkg.RebootRequiredPackages[0] != "libc6" {
+		t.Errorf("dpkg: got %v %q, want a reboot for libc6", dpkg.RebootRequired, dpkg.RebootRequiredPackages)
+	}
+	if rpm := scan(inventory.ManagerRpm); rpm.RebootRequired || rpm.RebootRequiredPackages != nil {
+		t.Errorf("rpm: got %v %q, want the kernel rule only", rpm.RebootRequired, rpm.RebootRequiredPackages)
+	}
+}
+
 func TestBuildPendingPayloadsRebootRequired(t *testing.T) {
 	host := inventory.HostMeta{OsID: "ubuntu", KernelRelease: "6.8.0-90-generic"}
 	snaps := []Snapshot{
@@ -56,5 +83,16 @@ func TestBuildPendingPayloadsRebootRequired(t *testing.T) {
 
 	if got := buildPendingPayloads(host, snaps, time.Now(), false); got != nil {
 		t.Errorf("push disabled: got %d payloads, want none", len(got))
+	}
+}
+
+func TestBuildPendingPayloadsRebootPackages(t *testing.T) {
+	host := inventory.HostMeta{OsID: "ubuntu"}
+	snaps := []Snapshot{{Manager: inventory.ManagerDpkg, RebootRequired: true, RebootRequiredPackages: []string{"libc6"}}}
+
+	out := buildPendingPayloads(host, snaps, time.Now(), true)
+
+	if got := out[0].Host.RebootRequiredPackages; len(got) != 1 || got[0] != "libc6" {
+		t.Errorf("host packages = %q, want libc6", got)
 	}
 }

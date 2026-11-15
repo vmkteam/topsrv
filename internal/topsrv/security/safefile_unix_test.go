@@ -9,7 +9,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 func TestReadFileSpecialFiles(t *testing.T) {
@@ -78,4 +80,53 @@ func TestReadFileSwappedForSpecialFile(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestOpenFileClearsNonblock(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "file")
+	require.NoError(t, os.WriteFile(path, []byte("ok"), 0o600))
+
+	f, err := openFile(path, false)
+	require.NoError(t, err)
+	t.Cleanup(func() { f.Close() })
+
+	flags, err := unix.FcntlInt(f.Fd(), unix.F_GETFL, 0)
+	require.NoError(t, err)
+	assert.Zero(t, flags&unix.O_NONBLOCK, "reads block again once the file is checked")
+}
+
+func TestReadDirSpecialFiles(t *testing.T) {
+	t.Run("FIFO in place of a directory is refused without blocking", func(t *testing.T) {
+		fifo := filepath.Join(t.TempDir(), "dir")
+		require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+
+		done := make(chan error, 1)
+		go func() {
+			_, err := readDir(fifo)
+			done <- err
+		}()
+		select {
+		case err := <-done:
+			require.Error(t, err)
+			assert.Equal(t, ReasonNotRegular, reasonOf(err))
+		case <-time.After(2 * time.Second):
+			t.Fatal("listing a FIFO blocked")
+		}
+	})
+
+	t.Run("a symlink to a directory: followed by readDir, refused by openNoSymlinks", func(t *testing.T) {
+		dir := t.TempDir()
+		target := filepath.Join(dir, "target")
+		require.NoError(t, os.Mkdir(target, 0o700))
+		require.NoError(t, os.WriteFile(filepath.Join(target, "f"), nil, 0o600))
+		require.NoError(t, os.Symlink(target, filepath.Join(dir, "link")))
+
+		entries, err := readDir(filepath.Join(dir, "link"))
+		require.NoError(t, err)
+		require.Len(t, entries, 1)
+
+		_, err = openNoSymlinks(dir, "/link", true)
+		require.Error(t, err)
+		assert.Equal(t, ReasonNotRegular, reasonOf(err))
+	})
 }

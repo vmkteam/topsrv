@@ -30,7 +30,7 @@ For example PromQL queries and alert recipes, see [promql-recipes.md](promql-rec
 | `topsrv_disk_write_time_seconds_total` | counter | device | Write time |
 | `topsrv_disk_io_time_seconds_total` | counter | device | Total I/O time |
 | `topsrv_disk_io_time_weighted_seconds_total` | counter | device | Weighted I/O time (queue depth) |
-| `topsrv_filesystem_bytes` | gauge | mountpoint, device, fstype, type | Filesystem space (total/used/free) |
+| `topsrv_filesystem_bytes` | gauge | mountpoint, device, fstype, type | Filesystem space (total/used/free). Block-backed filesystems and ZFS datasets; pseudo, FUSE and network filesystems (tmpfs, overlay, sshfs, NFS, CIFS), bind mounts, mounted ZFS snapshots and Docker zfs-driver layers are left out. A filesystem mounted at several places (btrfs subvolumes) is reported once, at its first mountpoint |
 | `topsrv_filesystem_inodes` | gauge | mountpoint, type | Filesystem inodes (total/used/free) |
 
 ## Network (`topsrv_network_*`)
@@ -42,7 +42,9 @@ For example PromQL queries and alert recipes, see [promql-recipes.md](promql-rec
 | `topsrv_network_errors_total` | counter | interface, direction | Errors (rx/tx) |
 | `topsrv_network_drops_total` | counter | interface, direction | Drops (rx/tx) |
 | `topsrv_network_speed_bytes` | gauge | interface | Link speed in bytes/sec (from `/sys/class/net/*/speed`) |
-| `topsrv_network_info` | gauge | interface, mac, address, mtu, operstate | Interface metadata |
+| `topsrv_network_info` | gauge | interface, mac, address, mtu, operstate | Interface metadata, one series per interface; `address` is its first IPv4 (often a floating IP — every address is in `topsrv_network_address_info`) |
+| `topsrv_network_address_info` | gauge | interface, address, family | One series per address of an interface (`10.0.0.5/24`, `family` `ipv4` or `ipv6`); link-local, temporary and deprecated IPv6 are left out — they change daily — and at most 16 per interface (kube-ipvs0 holds every ClusterIP) |
+| `topsrv_push_source_info` | gauge | address, interface | The local address (no prefix) and interface the host reaches the push endpoint from, as the kernel routes it towards the IP the HTTP transport connected to or tried (a UDP socket, no packet sent, no DNS). Looked up every 5 minutes and after a retryable failed send, which also logs it as `src`: the first address of an interface is often a floating IP, not the source. Only with `[Push]` set |
 
 ## Netstat (`topsrv_netstat_*`)
 

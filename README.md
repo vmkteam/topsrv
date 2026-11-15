@@ -61,8 +61,8 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **SSL Certificates** | Certificate expiry monitoring (auto-discovered from nginx/angie config) | — |
 | **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
 | **Web-logs** *(opt-in)* | Ships the full HTTP stream from the access logs you name, with the UA match carried as a signal rather than a gate — the scraper on a plain browser UA the bot stream cannot see. Local filters (reached-a-backend, upstream allowlist, path prefixes) keep the volume in hand; log_formats carrying request bodies, cookies or credentials are refused at startup | — |
-| **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching | apt-prom-exporter / pkg-exporter |
-| **Security** | Security facts about the host — where the agent runs (container detection), kernel taint, loaded and hidden modules, CPU vulnerabilities, LSM, sysctl hardening, role signals — pushed to `/v1/inventory` as `kind="security"`. Facts only: no exec, no secrets, rules are evaluated by the backend. See [Security snapshot](#security-snapshot) | Lynis / osquery checks |
+| **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching, with `rebootRequired` (a newer kernel image installed, or Debian/Ubuntu `/var/run/reboot-required`) and the packages that asked for the reboot | apt-prom-exporter / pkg-exporter |
+| **Security** | Security facts about the host — where the agent runs (container detection), kernel taint, loaded and hidden modules, CPU vulnerabilities, LSM, sysctl hardening, users and password classes, effective sshd config, authorized keys, sudo rules, role signals — pushed to `/v1/inventory` as `kind="security"`. Facts only: no exec, no secrets, rules are evaluated by the backend. See [Security snapshot](#security-snapshot) | Lynis / osquery checks |
 
 ## Auto-discovery
 
@@ -225,7 +225,7 @@ Channel  = "stable"         # stable / beta
 | `Security.Disabled` | `false` | Disable the security collector |
 | `Security.Interval` | `6h` | Full snapshot period (±10% jitter), minimum `15m` |
 | `Security.DisablePush` | `false` | Collect for `/metrics` and dry-run only, send nothing |
-| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `roleSignals` (and the names of later sections) |
+| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `roleSignals` (and the names of later sections) |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
@@ -425,6 +425,10 @@ section carries a `status` — `ok`, `partial` (with `gaps`), `unknown` (with a
 | `environment` | Host or container (docker, podman, k8s, lxc, nspawn, openvz), hypervisor (kvm, vmware, …, or none), pid/net/user namespaces, libc, init. In an app container the host sections come out `unknown/container_env` |
 | `kernel` | Taint flags, loaded modules, modules hidden from `/proc/modules`, CPU vulnerabilities, active LSMs, lockdown, AppArmor/SELinux mode, livepatches, clock sync (adjtimex), module signature enforcement, Secure Boot, kexec, SMT, microcode, whitelisted `/proc/cmdline` tokens only |
 | `sysctl` | Raw hardening values (KSPP and CIS keys, user namespaces, `core_pattern`/`modprobe`/`hotplug`, forwarding), `rp_filter`, redirects, forwarding and `accept_ra` for `all` and per interface |
+| `accounts` | Users from passwd/shadow/group read as files: password field class (`empty`, a lock marker, a hash and its algorithm) and a keyed token that changes with the password — never the hash or GECOS; uid 0 and duplicate users, members of privileged groups (sudo, wheel, docker, lxd), NSS sources |
+| `sshd` | Effective sshd configuration parsed as sshd does (Include, Match, first value wins, `-o` of the running listener), each value with the `file:line` it came from; Match blocks, config validity, PAM support, files and their hashes. No `sshd -T`, defaults left to the backend |
+| `authorizedKeys` | Keys sshd would accept per user, from the paths of the effective config: fingerprint, type, size, which options (never their values or the comment); files sshd ignores under StrictModes; NFS and autofs homes are never touched |
+| `sudoers` | sudo rules in file order (who, as whom, NOPASSWD, ALL), global and bound Defaults, files sudo skips in `sudoers.d`, rules from LDAP/SSSD flagged; doas on Alpine. Never the commands |
 | `roleSignals` | Role processes in the host network namespace (dockerd, kubelet, libvirtd, tailscaled, …), interface and tunnel types (bridge, wireguard, tun, gre), interfaces with a default route, role marker files (`/dev/kvm`, kubelet config) |
 
 Untrusted files are read without following FIFOs or devices and with size

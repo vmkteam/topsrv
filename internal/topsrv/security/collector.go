@@ -44,6 +44,7 @@ type Collector struct {
 
 	mu            sync.Mutex
 	cache         map[string]cachedSection
+	results       map[string]depResult // section → its last run, for the sections after it
 	inflight      map[string]bool
 	queued        triggerSet          // triggers not yet taken by Run
 	pending       []inventory.Payload // one-shot, drained by Inventory
@@ -67,6 +68,7 @@ func NewCollector(logger embedlog.Logger, cfg Config, stateDir string) *Collecto
 		delay:     startDelay(),
 		wakeup:    make(chan struct{}, 1),
 		cache:     map[string]cachedSection{},
+		results:   map[string]depResult{},
 		inflight:  map[string]bool{},
 		durations: map[string]float64{},
 		errCounts: map[[2]string]int{},

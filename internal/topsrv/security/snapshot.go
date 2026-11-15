@@ -7,10 +7,15 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"syscall"
 )
 
 // valueUnknown is the enum value for a fact that could not be read.
 const valueUnknown = "unknown"
+
+// valueInvalid replaces a token from a file that does not look like one: an
+// odd value is not sent as it is.
+const valueInvalid = "invalid"
 
 // Kind is the /v1/inventory discriminator of the security snapshot.
 const Kind = "security"
@@ -93,6 +98,15 @@ func collected(gaps []Gap, data any) Section {
 	return Section{Status: StatusPartial, Gaps: gaps, Data: data}
 }
 
+// absent is the section of a component that is not there: na, unless a
+// source that would have told was unreadable — unknown with its reason then.
+func absent(gaps gapList) Section {
+	if len(gaps) > 0 {
+		return unknown(gaps[0].Reason)
+	}
+	return Section{Status: StatusNA}
+}
+
 // gapList collects the sources a section could not read.
 type gapList []Gap
 
@@ -115,9 +129,18 @@ func (g *gapList) optional(path string, err error) {
 // errParse marks content the collector could not parse.
 var errParse = errors.New("security: parse error")
 
+// reasonError carries the reason of another section as an error, for a gap
+// of a section that depends on it.
+type reasonError Reason
+
+func (r reasonError) Error() string { return string(r) }
+
 // reasonOf maps a read error to the reason reported for it.
 func reasonOf(err error) Reason {
+	var re reasonError
 	switch {
+	case errors.As(err, &re):
+		return Reason(re)
 	case errors.Is(err, fs.ErrPermission):
 		return ReasonPermissionDenied
 	case errors.Is(err, fs.ErrNotExist):
@@ -126,8 +149,12 @@ func reasonOf(err error) Reason {
 		return ReasonBudgetExceeded
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return ReasonTimeout
-	case errors.Is(err, errNotRegular):
+	case errors.Is(err, errNotRegular), errors.Is(err, errPseudoFS),
+		errors.Is(err, syscall.ENOTDIR), // O_DIRECTORY on a FIFO or a file
+		errors.Is(err, syscall.ELOOP):   // O_NOFOLLOW on a symlink
 		return ReasonNotRegular
+	case errors.Is(err, errRemoteFS):
+		return ReasonRemoteFSSkipped
 	case errors.Is(err, errParse):
 		return ReasonParseError
 	default:

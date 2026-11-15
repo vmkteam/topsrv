@@ -41,7 +41,7 @@ func TestSysctl(t *testing.T) {
 
 	require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
 	d := sec.Data.(sysctlData)
-	assert.Equal(t, map[string]string{
+	assert.Equal(t, strPtrs(map[string]string{
 		"kernel.kptr_restrict":               "1",
 		"kernel.yama.ptrace_scope":           "1",
 		"kernel.randomize_va_space":          "2",
@@ -52,17 +52,17 @@ func TestSysctl(t *testing.T) {
 		"net.ipv6.conf.all.forwarding":       "0",
 		"kernel.modprobe":                    "/sbin/modprobe",
 		"dev.tty.legacy_tiocsti":             "0",
-	}, d.Values, "keys the kernel does not have are absent, not empty")
-	assert.Equal(t, map[string]map[string]string{
+	}), d.Values, "keys the kernel does not have are absent, not empty")
+	assert.Equal(t, confPtrs(map[string]map[string]string{
 		"all":      {"rp_filter": "0", "accept_redirects": "0"},
 		"default":  {"rp_filter": "2"},
 		"eth0":     {"rp_filter": "1", "accept_redirects": "1", "forwarding": "1"},
 		"eth0.100": {"rp_filter": "2"},
-	}, d.IPv4Conf, "container-side veth interfaces are skipped")
-	assert.Equal(t, map[string]map[string]string{
+	}), d.IPv4Conf, "container-side veth interfaces are skipped")
+	assert.Equal(t, confPtrs(map[string]map[string]string{
 		"all":  {"accept_redirects": "1", "forwarding": "0"},
 		"eth0": {"accept_redirects": "0", "accept_ra": "1"},
-	}, d.IPv6Conf)
+	}), d.IPv6Conf)
 	assert.False(t, d.ConfTruncated)
 }
 
@@ -89,13 +89,47 @@ func TestSysctlConfLimit(t *testing.T) {
 }
 
 func TestSysctlUnreadable(t *testing.T) {
-	sc := fixture(t, sysctlFixture())
-	unreadable(t, sc, "proc/sys/kernel/kptr_restrict")
+	t.Run("permission denied (bpf_jit_harden is 0600): null with a gap", func(t *testing.T) {
+		sc := fixture(t, sysctlFixture())
+		unreadable(t, sc, "proc/sys/kernel/kptr_restrict")
 
-	sec := collectSysctl(t.Context(), sc)
+		sec := collectSysctl(t.Context(), sc)
 
-	assert.Equal(t, StatusPartial, sec.Status)
-	assert.Equal(t, []Gap{{Path: "/proc/sys/kernel/kptr_restrict", Reason: ReasonPermissionDenied}}, sec.Gaps)
+		assert.Equal(t, StatusPartial, sec.Status)
+		assert.Equal(t, []Gap{{Path: "/proc/sys/kernel/kptr_restrict", Reason: ReasonPermissionDenied}}, sec.Gaps)
+		v, present := sec.Data.(sysctlData).Values["kernel.kptr_restrict"]
+		assert.True(t, present, "the kernel has the key")
+		assert.Nil(t, v, "not read")
+	})
+
+	t.Run("a read error of a conf key: null too", func(t *testing.T) {
+		sc := fixture(t, merge(sysctlFixture(), map[string]string{"proc/sys/net/ipv4/conf/eth0/send_redirects/": ""}))
+
+		sec := collectSysctl(t.Context(), sc)
+
+		assert.Equal(t, StatusPartial, sec.Status)
+		eth0 := sec.Data.(sysctlData).IPv4Conf["eth0"]
+		v, present := eth0["send_redirects"]
+		assert.True(t, present)
+		assert.Nil(t, v)
+		assert.Contains(t, toJSON(t, sec), `"send_redirects":null`)
+	})
+}
+
+func strPtrs(m map[string]string) map[string]*string {
+	out := make(map[string]*string, len(m))
+	for k, v := range m {
+		out[k] = &v
+	}
+	return out
+}
+
+func confPtrs(m map[string]map[string]string) map[string]map[string]*string {
+	out := make(map[string]map[string]*string, len(m))
+	for k, v := range m {
+		out[k] = strPtrs(v)
+	}
+	return out
 }
 
 func TestSysctlNoProcSys(t *testing.T) {

@@ -39,11 +39,36 @@ func TestParseMountinfo(t *testing.T) {
 		{"/srv/data/key", false},
 		{"/home/alice/../local/bob", false},
 	}
+	remote := m.riskyOnly()
 	for _, tc := range cases {
 		t.Run(tc.path, func(t *testing.T) {
 			assert.Equal(t, tc.remote, m.isRemote(tc.path))
+			assert.Equal(t, tc.remote, remote.isRemote(tc.path), "the filtered table answers the same")
 		})
 	}
+}
+
+func TestRiskyOnly(t *testing.T) {
+	t.Run("keeps remote mounts and the mounts under them", func(t *testing.T) {
+		m, err := parseMountinfo([]byte(testMountinfo))
+		require.NoError(t, err)
+
+		remote := m.riskyOnly()
+		points := make([]string, 0, len(remote))
+		for _, mt := range remote {
+			points = append(points, mt.point)
+		}
+
+		assert.Equal(t, []string{"/proc", "/home", "/home/local", "/mnt/my share", "/media", "/srv/sshfs", "/srv/data", "/srv/data"}, points,
+			"pseudo mounts too: user paths must not lead there")
+	})
+
+	t.Run("only the pseudo mounts without remote ones", func(t *testing.T) {
+		m, err := parseMountinfo([]byte("22 1 8:1 / / rw - ext4 /dev/sda1 rw\n23 22 0:21 / /proc rw - proc proc rw\n"))
+		require.NoError(t, err)
+
+		assert.Equal(t, mounts{{point: "/proc", fsType: "proc"}}, m.riskyOnly())
+	})
 }
 
 func TestParseMountinfoErrors(t *testing.T) {

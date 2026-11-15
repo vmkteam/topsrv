@@ -61,3 +61,31 @@ func TestReadFile(t *testing.T) {
 		require.ErrorIs(t, err, errNotRegular)
 	})
 }
+
+func TestReadDir(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"b", "a", "c"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), nil, 0o600))
+	}
+
+	t.Run("sorted by name", func(t *testing.T) {
+		entries, err := readDir(dir)
+		require.NoError(t, err)
+		names := make([]string, 0, len(entries))
+		for _, e := range entries {
+			names = append(names, e.Name())
+		}
+		assert.Equal(t, []string{"a", "b", "c"}, names)
+	})
+
+	t.Run("a file is not a directory", func(t *testing.T) {
+		_, err := readDir(filepath.Join(dir, "a"))
+		require.Error(t, err)
+		assert.Equal(t, ReasonNotRegular, reasonOf(err))
+	})
+
+	t.Run("missing", func(t *testing.T) {
+		_, err := readDir(filepath.Join(dir, "missing"))
+		assert.Equal(t, ReasonNotFound, reasonOf(err))
+	})
+}
