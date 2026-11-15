@@ -1,8 +1,11 @@
 package topsrv
 
 import (
+	"net"
+	"strconv"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	psnet "github.com/shirou/gopsutil/v4/net"
@@ -136,6 +139,10 @@ func TestClassifyAddr(t *testing.T) {
 		// Private: link-local IPv4 (169.254.0.0/16) and IPv6 (fe80::/10).
 		{"169.254.1.1", familyIPv4, scopePrivate},
 		{"fe80::1", familyIPv6, scopePrivate},
+
+		// Private: multicast groups (SSDP, mDNS) — not reachable from the internet.
+		{"239.255.255.250", familyIPv4, scopePrivate},
+		{"ff02::fb", familyIPv6, scopePrivate},
 
 		// Private: ULA (fc00::/7).
 		{"fc00::1", familyIPv6, scopePrivate},
@@ -286,4 +293,112 @@ func TestNetstatCollectorListenPorts(t *testing.T) {
 		return
 	}
 	t.Log("topsrv_netstat_listening_ports not found (may require elevated permissions)")
+}
+
+// TestUDPListening: Linux peers 0.0.0.0:0 and [::]:0, macOS none.
+func TestUDPListening(t *testing.T) {
+	cases := []struct {
+		name  string
+		raddr psnet.Addr
+		want  bool
+	}{
+		{"linux ipv4: 0.0.0.0:0", psnet.Addr{IP: "0.0.0.0", Port: 0}, true},
+		{"linux ipv6: [::]:0", psnet.Addr{IP: "::", Port: 0}, true},
+		{"macOS: no peer", psnet.Addr{}, true},
+		{"connected ipv4", psnet.Addr{IP: "10.0.0.1", Port: 53}, false},
+		{"connected ipv6", psnet.Addr{IP: "2001:db8::1", Port: 443}, false},
+		{"a peer address without a port", psnet.Addr{IP: "10.0.0.1", Port: 0}, false},
+		{"a port without a peer address", psnet.Addr{IP: "0.0.0.0", Port: 53}, false},
+		{"unparseable peer", psnet.Addr{IP: "garbage", Port: 0}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, udpListening(tc.raddr))
+		})
+	}
+}
+
+// TestNetstatStableUDP: a UDP listener is emitted once every collection
+// has seen it for udpMinAge — a socket a resolver opens for one query never
+// is, however often the collector runs.
+func TestNetstatStableUDP(t *testing.T) {
+	c := NewNetstatCollector(embedlog.Logger{})
+	now := time.Date(2026, 11, 15, 12, 0, 0, 0, time.UTC)
+	c.now = func() time.Time { return now }
+	at := func(d time.Duration) { now = now.Add(d) }
+	wg := listenKey{proto: protoUDP, port: 51820, family: familyIPv4, scope: scopePublic, process: "docker-proxy"}
+	dns := listenKey{proto: protoUDP, port: 53, family: familyIPv4, scope: scopeLoopback, process: "systemd-resolve"}
+	query := func(port uint32) listenKey {
+		return listenKey{proto: protoUDP, port: port, family: familyIPv4, scope: scopePublic, process: "unbound"}
+	}
+	set := func(keys ...listenKey) map[listenKey]struct{} {
+		m := map[listenKey]struct{}{}
+		for _, k := range keys {
+			m[k] = struct{}{}
+		}
+		return m
+	}
+
+	assert.Empty(t, c.stableUDP(set(wg, dns, query(40001))), "first collection: nothing seen before")
+	at(time.Second)
+	assert.Empty(t, c.stableUDP(set(wg, dns, query(40002))), "a /metrics scrape right after a push: too young")
+	at(udpMinAge - 11*time.Second)
+	assert.Empty(t, c.stableUDP(set(wg, dns, query(40002))), "a query socket alive for 10s: too young")
+	at(10 * time.Second)
+	assert.Equal(t, []listenKey{dns, wg}, c.stableUDP(set(wg, dns, query(40002), query(40003))),
+		"the stable ones, sorted by port; the query socket of 20s ago is gone")
+	at(30 * time.Second)
+	assert.Equal(t, []listenKey{wg}, c.stableUDP(set(wg)), "a closed socket is gone at once")
+	at(30 * time.Second)
+	assert.Equal(t, []listenKey{wg}, c.stableUDP(set(wg, dns)), "dns, back after a gap, waits udpMinAge again")
+}
+
+// TestNetstatCollectorUDPListeners runs the collector against real sockets:
+// an unconnected one is a listener once udpMinAge old, a connected one
+// never is.
+func TestNetstatCollectorUDPListeners(t *testing.T) {
+	ln, err := net.ListenUDP("udp4", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1)})
+	require.NoError(t, err)
+	defer ln.Close()
+	conn, err := net.DialUDP("udp4", nil, ln.LocalAddr().(*net.UDPAddr))
+	require.NoError(t, err)
+	defer conn.Close()
+	lnPort := strconv.Itoa(ln.LocalAddr().(*net.UDPAddr).Port)
+	connPort := strconv.Itoa(conn.LocalAddr().(*net.UDPAddr).Port)
+
+	c := NewNetstatCollector(embedlog.Logger{})
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(c)
+
+	assert.NotContains(t, udpListenPorts(t, reg), lnPort, "first collection: not seen before")
+	now = now.Add(udpMinAge)
+	ports := udpListenPorts(t, reg)
+	assert.Equal(t, scopeLoopback, ports[lnPort], "udpMinAge later: the unconnected socket, on loopback")
+	assert.NotContains(t, ports, connPort, "a connected socket is no listener")
+}
+
+// udpListenPorts gathers reg once and returns the ports of the UDP
+// listening_ports series with their scope.
+func udpListenPorts(t *testing.T, reg *prometheus.Registry) map[string]string {
+	t.Helper()
+	mfs, err := reg.Gather()
+	require.NoError(t, err)
+	out := map[string]string{}
+	for _, mf := range mfs {
+		if mf.GetName() != "topsrv_netstat_listening_ports" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			labels := map[string]string{}
+			for _, l := range m.GetLabel() {
+				labels[l.GetName()] = l.GetValue()
+			}
+			if labels["proto"] == protoUDP {
+				out[labels["port"]] = labels["scope"]
+			}
+		}
+	}
+	return out
 }

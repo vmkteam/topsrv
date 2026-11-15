@@ -1,9 +1,13 @@
 package topsrv
 
 import (
+	"cmp"
 	"context"
 	"net"
+	"slices"
 	"strconv"
+	"sync"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	psnet "github.com/shirou/gopsutil/v4/net"
@@ -14,6 +18,12 @@ import (
 // NetstatCollector collects TCP/UDP/IP protocol metrics and TCP connections.
 type NetstatCollector struct {
 	embedlog.Logger
+	now func() time.Time
+
+	// When each UDP listener of the last collection was first seen, see
+	// stableUDP. Replaced wholesale each time; nil is a valid start.
+	udpMu        sync.Mutex
+	udpFirstSeen map[listenKey]time.Time
 
 	tcpConns       *prometheus.Desc
 	tcpConnsByPort *prometheus.Desc
@@ -34,9 +44,10 @@ type NetstatCollector struct {
 func NewNetstatCollector(logger embedlog.Logger) *NetstatCollector {
 	return &NetstatCollector{
 		Logger:            logger,
+		now:               time.Now,
 		tcpConns:          prometheus.NewDesc("topsrv_netstat_tcp_connections", "TCP connections by state, direction, and remote-peer scope. remote_scope=none for LISTEN sockets; otherwise loopback/private/public per the same taxonomy as listening_ports. Lets an operator alert on e.g. unexpected public inbound (scan exposure) or private→public outbound chatter (exfil signal).", []string{"state", "direction", "remote_scope"}, nil),
 		tcpConnsByPort:    prometheus.NewDesc("topsrv_netstat_tcp_connections_by_port", "TCP connections per listen port.", []string{"port"}, nil),
-		listenPorts:       prometheus.NewDesc("topsrv_netstat_listening_ports", "Active listening sockets. value=1 per (proto, port, family, scope, process) tuple. proto ∈ {tcp, udp}; UDP \"listening\" means a bound socket with no connected peer (Raddr empty). scope=loopback bound only to 127.0.0.0/8 or ::1; scope=private bound to an RFC1918/ULA/CGNAT/link-local address (reachable only on the private/carrier network); scope=public bound to a routable address or to the 0.0.0.0/:: wildcard (potentially reachable from anywhere). process is the owning binary name (empty when the PID is hidden by kernel ACL — root needed on Linux to read /proc/<pid>/comm of other users).", []string{"proto", "port", "family", "scope", "process"}, nil),
+		listenPorts:       prometheus.NewDesc("topsrv_netstat_listening_ports", "Active listening sockets. value=1 per (proto, port, family, scope, process) tuple. proto ∈ {tcp, udp}; UDP \"listening\" means a bound socket with no connected peer, listed once it has existed for 20s — a socket a DNS resolver opens for one query creates no series. scope=loopback bound only to 127.0.0.0/8 or ::1; scope=private bound to an RFC1918/ULA/CGNAT/link-local or multicast address (reachable only on the private/carrier network); scope=public bound to a routable address or to the 0.0.0.0/:: wildcard (potentially reachable from anywhere). process is the owning binary name (empty when the PID is hidden by kernel ACL — root needed on Linux to read /proc/<pid>/comm of other users).", []string{"proto", "port", "family", "scope", "process"}, nil),
 		tcpInSegs:         prometheus.NewDesc("topsrv_netstat_tcp_in_segs_total", "Total TCP segments received. Denominator for the share of segments received in error (tcp_in_errs_total).", nil, nil),
 		tcpOutSegs:        prometheus.NewDesc("topsrv_netstat_tcp_out_segs_total", "Total TCP segments sent, retransmits included. Denominator for the retransmit ratio — unlike network_packets_total{direction=\"tx\"} it counts TCP only, so the ratio against tcp_retransmits_total is comparable to the 1-2% industry threshold.", nil, nil),
 		tcpRetrans:        prometheus.NewDesc("topsrv_netstat_tcp_retransmits_total", "Total TCP retransmitted segments.", nil, nil),
@@ -69,7 +80,7 @@ func (c *NetstatCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *NetstatCollector) Collect(ch chan<- prometheus.Metric) {
-	c.collectTCP(ch)
+	c.collectSockets(ch)
 	c.collectProtoCounters(ch)
 }
 
@@ -87,10 +98,13 @@ const (
 	scopePublic   = "public"   // routable internet IP, or wildcard (0.0.0.0 / ::) — treat as worst case
 
 	// maxListenSeries caps how many distinct LISTEN tuples we emit per
-	// scrape. Realistic hosts sit at 10-50; the cap exists so a misbehaving
-	// (or compromised) box with thousands of listening sockets cannot blow
-	// up Prometheus cardinality budgets.
+	// scrape, TCP first, then UDP. Realistic hosts sit at 10-50; the cap
+	// exists so a misbehaving (or compromised) box with thousands of
+	// listening sockets cannot blow up Prometheus cardinality budgets.
 	maxListenSeries = 256
+
+	// udpMinAge: a UDP listener is emitted once it has existed this long.
+	udpMinAge = 20 * time.Second
 )
 
 // listenKey is the label-tuple identity of a listening socket. Two sockets
@@ -105,7 +119,7 @@ type listenKey struct {
 	process string // owning binary name; "" if PID resolution failed
 }
 
-func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
+func (c *NetstatCollector) collectSockets(ch chan<- prometheus.Metric) {
 	tcpConns, err := psnet.Connections("tcp")
 	if err != nil {
 		c.Print(context.Background(), "netstat: Connections failed", "error", err)
@@ -113,48 +127,43 @@ func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 	}
 
 	listenPorts := make(map[uint32]bool, 32)
-	listenSet := make(map[listenKey]struct{}, 32)
 	procCache := make(map[int32]string, 32)
-	var truncated int
-
-	addListener := func(conn psnet.ConnectionStat, proto string) {
-		if len(listenSet) >= maxListenSeries {
-			truncated++
-			return
-		}
-		family, scope := classifyAddr(conn.Laddr.IP)
-		listenSet[listenKey{
-			proto:   proto,
-			port:    conn.Laddr.Port,
-			family:  family,
-			scope:   scope,
-			process: c.resolveProcName(conn.Pid, procCache),
-		}] = struct{}{}
-	}
-
+	keys := make([]listenKey, 0, 32)
 	for _, conn := range tcpConns {
 		if conn.Status != tcpStateListen {
 			continue
 		}
 		listenPorts[conn.Laddr.Port] = true
-		addListener(conn, protoTCP)
+		keys = append(keys, c.listenKeyOf(conn, protoTCP, procCache))
 	}
 
-	// UDP listeners — a UDP socket is "listening" when it's bound but has
-	// no connected peer (Raddr empty). Connected UDP (client-side, after
-	// connect()) carries a non-zero Raddr — those are not listeners. UDP
-	// failure is non-fatal: TCP listeners are still worth emitting.
-	udpConns, udpErr := psnet.Connections("udp")
-	if udpErr != nil {
-		c.Print(context.Background(), "netstat: UDP Connections failed", "error", udpErr)
+	// UDP listeners: bound sockets without a connected peer. UDP failure is
+	// non-fatal — TCP listeners are still worth emitting — and keeps the
+	// first-seen times, so one failed read does not delay them.
+	if udpConns, err := psnet.Connections("udp"); err != nil {
+		c.Print(context.Background(), "netstat: UDP Connections failed", "error", err)
+	} else {
+		cur := map[listenKey]struct{}{}
+		for _, conn := range udpConns {
+			if udpListening(conn.Raddr) {
+				cur[c.listenKeyOf(conn, protoUDP, procCache)] = struct{}{}
+			}
+		}
+		keys = append(keys, c.stableUDP(cur)...)
 	}
-	for _, conn := range udpConns {
-		if conn.Raddr.IP != "" || conn.Raddr.Port != 0 {
+
+	listenSet := make(map[listenKey]struct{}, len(keys))
+	var truncated int
+	for _, k := range keys {
+		if _, dup := listenSet[k]; dup {
 			continue
 		}
-		addListener(conn, protoUDP)
+		if len(listenSet) >= maxListenSeries {
+			truncated++
+			continue
+		}
+		listenSet[k] = struct{}{}
 	}
-
 	if truncated > 0 {
 		c.Print(context.Background(), "netstat: listening_ports truncated",
 			"emitted", len(listenSet), "dropped", truncated, "cap", maxListenSeries)
@@ -198,6 +207,57 @@ func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 	}
 }
 
+// udpListening reports whether a UDP socket has no connected peer: a
+// server's socket, or a client's that sends with sendto. Linux reports the
+// peer of such a socket as 0.0.0.0:0 or [::]:0 (gopsutil formats the
+// address with net.IP.String), lsof on macOS as none.
+func udpListening(raddr psnet.Addr) bool {
+	return raddr.Port == 0 && (raddr.IP == "" || net.ParseIP(raddr.IP).IsUnspecified())
+}
+
+// stableUDP returns the UDP listeners of cur seen by every collection for
+// udpMinAge, sorted so that past maxListenSeries the same ones are dropped,
+// and remembers cur. dnsmasq (and unbound with udp-connect: no) sends each
+// query from a socket without a peer on a random port: emitted, each would
+// be a series in the per-day TSDB index. Age, not a count of collections — pushes and
+// /metrics scrapes both collect; not the ephemeral port range — WireGuard's
+// 51820 is inside it.
+func (c *NetstatCollector) stableUDP(cur map[listenKey]struct{}) []listenKey {
+	now := c.now()
+	c.udpMu.Lock()
+	defer c.udpMu.Unlock()
+	seen := make(map[listenKey]time.Time, len(cur))
+	var out []listenKey
+	for k := range cur {
+		first, ok := c.udpFirstSeen[k]
+		if !ok {
+			first = now
+		}
+		seen[k] = first
+		if now.Sub(first) >= udpMinAge {
+			out = append(out, k)
+		}
+	}
+	c.udpFirstSeen = seen
+	slices.SortFunc(out, func(a, b listenKey) int {
+		return cmp.Or(cmp.Compare(a.port, b.port), cmp.Compare(a.family, b.family),
+			cmp.Compare(a.scope, b.scope), cmp.Compare(a.process, b.process))
+	})
+	return out
+}
+
+// listenKeyOf labels a listening socket.
+func (c *NetstatCollector) listenKeyOf(conn psnet.ConnectionStat, proto string, procCache map[int32]string) listenKey {
+	family, scope := classifyAddr(conn.Laddr.IP)
+	return listenKey{
+		proto:   proto,
+		port:    conn.Laddr.Port,
+		family:  family,
+		scope:   scope,
+		process: c.resolveProcName(conn.Pid, procCache),
+	}
+}
+
 // classifyAddr extracts both the family and reachability scope of a bind
 // address in one net.ParseIP pass.
 //
@@ -207,9 +267,10 @@ func (c *NetstatCollector) collectTCP(ch chan<- prometheus.Metric) {
 // scope:
 //   - loopback: 127.0.0.0/8 or ::1 — host-only, never reachable off-box.
 //   - private:  RFC1918 (10/8, 172.16/12, 192.168/16), RFC4193 ULA
-//     (fc00::/7), RFC6598 CGNAT (100.64/10), and link-local
-//     (169.254/16, fe80::/10). Reachable only on the private/carrier
-//     network the host sits on.
+//     (fc00::/7), RFC6598 CGNAT (100.64/10), link-local (169.254/16,
+//     fe80::/10), and multicast (224/4, ff00::/8: a socket bound to a
+//     group takes only its datagrams, SSDP, mDNS). Reachable only on the
+//     private/carrier network the host sits on.
 //   - public:   any routable address, plus 0.0.0.0 / :: wildcards (treated
 //     as worst case so a missing public interface doesn't hide an exposed
 //     listener), plus unparseable garbage.
@@ -227,7 +288,7 @@ func classifyAddr(ip string) (family, scope string) {
 	switch {
 	case parsed.IsLoopback():
 		scope = scopeLoopback
-	case parsed.IsPrivate(), parsed.IsLinkLocalUnicast(), isCGNAT(ip4):
+	case parsed.IsPrivate(), parsed.IsLinkLocalUnicast(), parsed.IsMulticast(), isCGNAT(ip4):
 		scope = scopePrivate
 	default:
 		scope = scopePublic
