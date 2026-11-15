@@ -81,6 +81,70 @@ func TestRoleSignals(t *testing.T) {
 	assert.NotContains(t, toJSON(t, sec), "SENTINEL")
 }
 
+func TestRoleSignalsCIRunners(t *testing.T) {
+	sc := fixture(t, map[string]string{
+		"proc/1/exe":       "-> /usr/lib/systemd/systemd",
+		"proc/200/exe":     "-> /usr/bin/gitlab-runner",
+		"proc/201/exe":     "-> /home/runner/actions-runner/bin/Runner.Listener",
+		"proc/202/exe":     "-> /home/vsts/agent/bin/Agent.Listener",
+		"proc/203/exe":     "-> /bin/woodpecker-agent",
+		"proc/204/exe":     "-> /bin/drone-runner-docker",
+		"proc/205/exe":     "",
+		"proc/205/cmdline": "/usr/local/bin/act_runner\x00daemon\x00",
+		"proc/206/exe":     "-> /usr/local/bin/forgejo-runner",
+		"proc/207/exe":     "-> /usr/bin/buildkite-agent",
+		"proc/208/exe":     "-> /usr/bin/buildkitd",
+		"proc/209/exe":     "-> /usr/bin/nomad",
+		"proc/210/exe":     "-> /usr/bin/drone-runner", // Drone ships drone-runner-<type> only
+	})
+
+	sec := collectRoleSignals(t.Context(), sc)
+
+	d := sec.Data.(roleData)
+	assert.Equal(t, []string{"Agent.Listener", "Runner.Listener", "act_runner", "buildkitd", "buildkite-agent",
+		"drone-runner-docker", "forgejo-runner", "gitlab-runner", "nomad", "woodpecker-agent"}, d.Processes)
+}
+
+func TestRoleSignalsNamespaces(t *testing.T) {
+	const (
+		hostNet   = "-> net:[4026531840]"
+		hostUser  = "-> user:[4026531837]"
+		otherNet  = "-> net:[4026532900]"
+		otherUser = "-> user:[4026532901]"
+	)
+	cases := []struct {
+		name, exe, net, user string
+		counted              bool
+	}{
+		{"a runner in a container of the host user namespace (rootful Docker, a pod)", "woodpecker-agent", otherNet, hostUser, true},
+		{"a runner in an unprivileged LXC container", "gitlab-runner", otherNet, otherUser, false},
+		{"a runner with a user namespace of its own in the host netns (PrivateUsers=)", "forgejo-runner", hostNet, otherUser, true},
+		{"buildkitd on the host", "buildkitd", hostNet, hostUser, true},
+		{"buildkitd in the buildx builder container", "buildkitd", otherNet, hostUser, false},
+		{"kubelet in a container (kind)", "kubelet", otherNet, hostUser, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			sc := fixture(t, map[string]string{
+				"proc/1/exe":       "-> /usr/lib/systemd/systemd",
+				"proc/1/ns/net":    hostNet,
+				"proc/1/ns/user":   hostUser,
+				"proc/300/exe":     "-> /usr/bin/" + tc.exe,
+				"proc/300/ns/net":  tc.net,
+				"proc/300/ns/user": tc.user,
+			})
+
+			d := collectRoleSignals(t.Context(), sc).Data.(roleData)
+
+			if tc.counted {
+				assert.Equal(t, []string{tc.exe}, d.Processes)
+			} else {
+				assert.Empty(t, d.Processes)
+			}
+		})
+	}
+}
+
 func TestRoleSignalsNameLimit(t *testing.T) {
 	files := map[string]string{"proc/net/route": "", "proc/net/ipv6_route": ""}
 	for i := range maxRoleIfaceNames + 3 {

@@ -102,16 +102,83 @@ func TestNetstatCollectorConnectionsByPort(t *testing.T) {
 		}
 		require.NotEmpty(t, mf.GetMetric())
 
-		// Check port label exists.
 		labels := mf.GetMetric()[0].GetLabel()
 		labelNames := make([]string, len(labels))
 		for i, l := range labels {
 			labelNames[i] = l.GetName()
 		}
-		assert.Contains(t, labelNames, "port")
+		assert.ElementsMatch(t, []string{"port", "remote_scope"}, labelNames)
 		return
 	}
 	t.Log("topsrv_netstat_tcp_connections_by_port not found (may require elevated permissions)")
+}
+
+func TestCountTCP(t *testing.T) {
+	conn := func(status string, lport uint32, raddr string) psnet.ConnectionStat {
+		return psnet.ConnectionStat{Status: status, Laddr: psnet.Addr{Port: lport}, Raddr: psnet.Addr{IP: raddr}}
+	}
+	conns := []psnet.ConnectionStat{
+		conn("LISTEN", 5432, "0.0.0.0"),
+		conn("LISTEN", 6000, "0.0.0.0"),
+		conn("ESTABLISHED", 5432, "203.0.113.5"),
+		conn("TIME_WAIT", 5432, "198.51.100.7"),
+		conn("ESTABLISHED", 5432, "::ffff:198.51.100.8"), // IPv4-mapped
+		conn("ESTABLISHED", 5432, "10.0.0.2"),
+		conn("ESTABLISHED", 5432, "127.0.0.1"),
+		conn("ESTABLISHED", 6000, "203.0.113.9"), // listening, but no listening_ports series
+		conn("ESTABLISHED", 45000, "203.0.113.20"),
+	}
+
+	byState, byPort := countTCP(conns, map[uint32]bool{5432: true, 6000: true}, map[uint32]bool{5432: true})
+
+	assert.Equal(t, map[connKey]int{
+		{"LISTEN", "inbound", "none"}:             2,
+		{"ESTABLISHED", "inbound", scopePublic}:   3,
+		{"TIME_WAIT", "inbound", scopePublic}:     1,
+		{"ESTABLISHED", "inbound", scopePrivate}:  1,
+		{"ESTABLISHED", "inbound", scopeLoopback}: 1,
+		{"ESTABLISHED", "outbound", scopePublic}:  1,
+	}, byState, "a listen port makes a connection inbound, listed or not")
+	assert.Equal(t, map[portKey]int{
+		{5432, scopePublic}:   3,
+		{5432, scopePrivate}:  1,
+		{5432, scopeLoopback}: 1,
+	}, byPort, "any state but LISTEN; only listed ports: the cap of listening_ports caps by_port")
+}
+
+func TestAdmitListeners(t *testing.T) {
+	t.Run("past the cap: TCP first, by_port follows the admitted TCP ports", func(t *testing.T) {
+		keys := make([]listenKey, 0, maxListenSeries+55)
+		for port := range uint32(maxListenSeries + 44) {
+			keys = append(keys, listenKey{proto: protoTCP, port: port + 1, family: familyIPv4, scope: scopePublic})
+		}
+		keys = append(keys, keys[0]) // a duplicate is not truncation
+		for port := range uint32(10) {
+			keys = append(keys, listenKey{proto: protoUDP, port: port + 1, family: familyIPv4, scope: scopePublic})
+		}
+
+		set, listed, truncated := admitListeners(keys)
+
+		assert.Len(t, set, maxListenSeries)
+		assert.Len(t, listed, maxListenSeries)
+		assert.True(t, listed[1])
+		assert.True(t, listed[maxListenSeries])
+		assert.False(t, listed[maxListenSeries+1], "a dropped listener gets no by_port series")
+		assert.Equal(t, 44+10, truncated)
+	})
+
+	t.Run("a UDP listener does not list its port for by_port", func(t *testing.T) {
+		keys := []listenKey{
+			{proto: protoTCP, port: 22, family: familyIPv4, scope: scopePublic},
+			{proto: protoUDP, port: 53, family: familyIPv4, scope: scopeLoopback},
+		}
+
+		set, listed, truncated := admitListeners(keys)
+
+		assert.Len(t, set, 2)
+		assert.Equal(t, map[uint32]bool{22: true}, listed)
+		assert.Zero(t, truncated)
+	})
 }
 
 func TestClassifyAddr(t *testing.T) {

@@ -254,6 +254,42 @@ func TestAccountsGaps(t *testing.T) {
 	})
 }
 
+func TestAccountsHomed(t *testing.T) {
+	t.Run("no homed: false", func(t *testing.T) {
+		_, d, _ := accountsOf(t, accountsFixture())
+		require.NotNil(t, d.HomedUsers)
+		assert.False(t, *d.HomedUsers)
+	})
+
+	t.Run("no home registered: false", func(t *testing.T) {
+		_, d, _ := accountsOf(t, merge(accountsFixture(), map[string]string{
+			"var/lib/systemd/home/local.public":  "-----BEGIN PUBLIC KEY-----\n", // homed's signing keys
+			"var/lib/systemd/home/local.private": "-----BEGIN PRIVATE KEY-----\n",
+		}))
+		require.NotNil(t, d.HomedUsers)
+		assert.False(t, *d.HomedUsers)
+	})
+
+	t.Run("a home registered: true, no name or record sent", func(t *testing.T) {
+		sec, d, _ := accountsOf(t, merge(accountsFixture(), map[string]string{
+			"var/lib/systemd/home/SENTINELUSER.identity": `{"userName":"SENTINELUSER","privileged":{"hashedPassword":["SENTINELHASH"]}}`,
+		}))
+		require.NotNil(t, d.HomedUsers)
+		assert.True(t, *d.HomedUsers)
+		assert.NotContains(t, toJSON(t, sec), "SENTINEL")
+	})
+
+	t.Run("unreadable: null and a gap", func(t *testing.T) {
+		sc := fixture(t, merge(accountsFixture(), map[string]string{"var/lib/systemd/home/": ""}))
+		unreadable(t, sc, "var/lib/systemd/home")
+		sec, _ := collectAccounts(t.Context(), sc)
+
+		assert.Equal(t, StatusPartial, sec.Status)
+		assert.Equal(t, []Gap{{Path: "/var/lib/systemd/home", Reason: ReasonPermissionDenied}}, sec.Gaps)
+		assert.Nil(t, sec.Data.(accountsData).HomedUsers)
+	})
+}
+
 func TestAccountsTruncated(t *testing.T) {
 	var passwd strings.Builder
 	for i := range maxUsers + 5 {

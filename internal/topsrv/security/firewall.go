@@ -50,7 +50,8 @@ var (
 )
 
 // ebpfDataplanes filter in eBPF (tc, XDP, cgroup hooks), which the ruleset
-// does not show.
+// does not show. Role processes, not CI runners: roleProcessesRunning lists
+// those in PID 1's network namespace only.
 var ebpfDataplanes = []string{"cilium-agent", "calico-node"}
 
 // iptablesTables and iptablesChains are what iptables-nft creates: a table
