@@ -202,7 +202,7 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 	gaps.add("/proc", err)
 	hostMnt, _ := sc.readlink("/proc/1/ns/mnt")
 	for _, p := range procs {
-		if p.name != "sshd" || !trustedListener(sc, p) {
+		if p.name != "sshd" || !trustedProcess(sc, p) {
 			continue
 		}
 		if mnt, err := sc.readlink("/proc/" + p.pid + "/ns/mnt"); err == nil && hostMnt != "" && mnt != hostMnt {
@@ -222,10 +222,11 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 	return sshdconf.ParseFlags(sshdUnitArgs(sc)), sshdListener{}
 }
 
-// trustedListener: a process named sshd that runs as root from a binary
-// only root can change. Any user can start ~/bin/sshd -f ~/evil, whose -f
-// and Include would otherwise make the agent read files of its choosing.
-func trustedListener(sc *scanCtx, p process) bool {
+// trustedProcess: a process that runs as root from a binary only root can
+// change. Any user can start ~/bin/sshd -f ~/evil, whose -f and Include
+// would otherwise make the agent read files of its choosing — or
+// ~/bin/dockerd naming a socket and a daemon.json.
+func trustedProcess(sc *scanCtx, p process) bool {
 	proc, err := sc.stat("/proc/" + p.pid)
 	if err != nil {
 		return false

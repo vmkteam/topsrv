@@ -49,6 +49,7 @@ func newTestCollector(t *testing.T, files map[string]string) (*Collector, *time.
 	require.NoError(t, cfg.Validate())
 	c := NewCollector(embedlog.Logger{}, cfg, t.TempDir())
 	c.root, c.supported, c.timeSync = root, true, nil
+	c.trustedUID = int64(os.Geteuid()) // fixture files stand for root's
 	c.key = tokenKey{secret: make([]byte, keySize), id: "0a1b2c3d"}
 	now := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
 	c.now = func() time.Time { return now }
@@ -79,7 +80,11 @@ func TestPass(t *testing.T) {
 	assert.Equal(t, StatusOK, d.Environment.Status)
 	require.Len(t, d.Sections, len(allSections))
 	for name, sec := range d.Sections {
-		assert.Equal(t, StatusOK, sec.Status, "%s: %v", name, sec.Gaps)
+		want := StatusOK
+		if name == SectionDocker {
+			want = StatusNA // no dockerd in the fixture
+		}
+		assert.Equal(t, want, sec.Status, "%s: %v", name, sec.Gaps)
 	}
 
 	var wire map[string]any

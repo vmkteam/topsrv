@@ -17,6 +17,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/dockerapi"
 	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 )
 
@@ -46,6 +47,11 @@ type scanCtx struct {
 
 	// deps returns what an earlier section gave; nil in tests that need none.
 	deps func(section string) (depResult, bool)
+
+	// dockerClient talks to the socket at a path; nil is dockerapi.New. A
+	// test serves a socket at a short path: the fixture's would pass the
+	// 104 bytes a socket address takes on macOS.
+	dockerClient func(path string) *dockerapi.Client
 }
 
 // depResult is how a section came out and the typed result later sections
@@ -95,6 +101,13 @@ func (sc *scanCtx) stat(path string) (os.FileInfo, error) {
 		return nil, err
 	}
 	return os.Stat(sc.root + path)
+}
+
+func (sc *scanCtx) lstat(path string) (os.FileInfo, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
+	return os.Lstat(sc.root + path)
 }
 
 // exists is a presence probe; any error, permission included, means absent.
@@ -429,6 +442,7 @@ var allSections = []sectionDef{
 	{name: SectionAuthorizedKeys, budget: 10 * time.Second, host: true, run: noResult(collectAuthorizedKeys)},
 	{name: SectionSudoers, budget: 3 * time.Second, host: true, run: noResult(collectSudoers)},
 	{name: SectionUpdates, budget: 2 * time.Second, host: true, run: noResult(collectUpdates)},
+	{name: SectionDocker, budget: dockerAPIBudget + 3*time.Second, host: true, run: noResult(collectDocker)},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
 
@@ -447,7 +461,7 @@ type cachedSection struct {
 // rebuilds only its sections.
 func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep}
+	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep, trustedUID: c.trustedUID}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {

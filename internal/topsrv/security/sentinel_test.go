@@ -60,6 +60,14 @@ func sentinelFiles() map[string]string {
 			"SENTINELLINE is not sudoers\n",
 		"etc/doas.conf": "permit nopass alice as root cmd /usr/bin/SENTINEL args SENTINELSECRET\n",
 
+		// docker: the roles fixture's dockerd (pid 100) with secrets on its
+		// command line, and in daemon.json; no socket, so the
+		// configuration is what is read
+		"proc/100/cmdline": "/usr/bin/dockerd\x00-H\x00unix:///run/docker.sock\x00--tlskey\x00/etc/SENTINEL.key\x00--registry-mirror\x00https://u:SENTINELSECRET@example.com\x00",
+		"usr/bin/dockerd":  "",
+		"etc/docker/daemon.json": `{"iptables": false, "firewall-backend": "SENTINELSECRET", "userns-remap": "SENTINEL",
+			"registry-mirrors": ["https://u:SENTINELSECRET@example.com"], "hosts": ["tcp://u:SENTINELSECRET@0.0.0.0:2375"]}`,
+
 		// accounts: login.defs keys of a form shadow refuses and keys not sent,
 		// PAM arguments; authorizedKeys: a .netrc with a password
 		"etc/login.defs":     "ENCRYPT_METHOD SENTINELSECRET\nMAIL_DIR /var/SENTINEL\nPASS_MAX_DAYS 90\n",
@@ -136,7 +144,7 @@ func TestNoSecretsLeak(t *testing.T) {
 // nothing.
 func requireMarkersRead(t *testing.T, d Data) {
 	t.Helper()
-	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers, SectionUpdates} {
+	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers, SectionUpdates, SectionDocker} {
 		require.Contains(t, []Status{StatusOK, StatusPartial}, d.Sections[name].Status, "%s: %+v", name, d.Sections[name])
 	}
 
@@ -170,6 +178,11 @@ func requireMarkersRead(t *testing.T, d Data) {
 	assert.Len(t, sudo.DoasRules, 1)
 	assert.True(t, *sudo.Defaults.Logfile, "the logfile read, its path dropped")
 	assert.Equal(t, valueInvalid, *sudo.Defaults.Timeout)
+
+	dk := d.Sections[SectionDocker].Data.(dockerData)
+	assert.False(t, *dk.Config.IPTables, "daemon.json read")
+	assert.Equal(t, valueInvalid, *dk.Config.FirewallBackend)
+	assert.Equal(t, []dockerHost{{Proto: "unix", Addr: "/run/docker.sock", Source: hostFromCmdline}}, dk.Hosts, "the flags read")
 
 	apt := d.Sections[SectionUpdates].Data.(updatesData).APT
 	require.NotNil(t, apt)

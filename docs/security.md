@@ -89,7 +89,7 @@ Where the agent runs. Without it every other section could give a false pass: in
 | `libc` | string | `glibc`, `musl` or `unknown`. With both loaders present (the musl package on Debian, gcompat on Alpine) the distribution decides |
 | `init` | string | `systemd`, `openrc` or `other` |
 
-In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
+In an app container (`docker`, `podman`, `k8s`, or an unidentified one) without the host root, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `updates`, `docker` and `roleSignals` are `unknown/container_env`; `kernel` is collected, its facts are kernel-wide. A manager name the agent does not know (`container=oci` in UBI images) does not end the detection: the file markers are checked next, as in systemd.
 
 ## `kernel`
 
@@ -286,6 +286,40 @@ Whether the host installs updates by itself, read from files without running apt
 | `reboot` | string | `never`, `when-changed`, `when-needed` |
 | `files[]` | object | `{path, mode, uid, gid}` of the files read, in order |
 
+## `docker`
+
+The rootful Docker Engine of the host: how dockerd is configured and which container ports it publishes on the host — what decides whether a port bypasses the host firewall. Nothing is executed and no Docker SDK is used.
+
+The daemon is found first, and only a running one is talked to: `docker.socket` starts dockerd on the first connection, so with no dockerd process the section is `na` and the socket is never touched (`unknown` when `/proc` is mounted with `hidepid` and dockerd cannot be seen). Only a dockerd that runs as root from a binary only root can change, in the mount and network namespaces of PID 1, counts: a user's `~/bin/dockerd` would choose the files and the socket read, and a dockerd in a container (docker-in-docker) or a rootless one publishes nothing on the host's firewall. Podman is not covered yet.
+
+Its options come from its command line (`/proc/PID/cmdline`: only the flags below are kept) and `daemon.json` (`--config-file`, else `/etc/docker/daemon.json`); dockerd refuses to start when both set the same option. The addresses it listens on are `-H`, else `hosts` of daemon.json, else the default — `unix:///var/run/docker.sock`, or `tcp://localhost:2376` with `--tls` — normalized as dockerd does (`tcp://:2375` is `localhost:2375`, a bare `host:port` is TCP, a user part of a TCP address is dropped); `fd://` takes the `ListenStream=` of `docker.socket` with its drop-ins, or `/run/docker.sock` without the unit. The first unix socket is checked with `lstat` (a socket, its owner) and read over HTTP: `GET /_ping` for the API version, then `/v{version}/info` and `/v{version}/containers/json` — GET only, one connection per request, no proxy, no redirect, 1 s to connect, 5 s for all three, at most 16 MiB an answer, every field parsed on its own so one odd field costs only itself. What dockerd answers is sent only in the form expected, `invalid` otherwise; labels, commands, images, environment and mounts are never read into the snapshot. A failed request is a gap on the socket path (`timeout`, `permission_denied` for an authorization plugin's 401/403, `budget_exceeded`, `not_found`, `io_error`); what came before it is kept.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `engine` | string | `docker` |
+| `daemonStartedAt` | time | When dockerd started: daemon.json is read at start (and on SIGHUP for some keys), so a `config.file.mtime` after it may not be in force |
+| `version` | string | `ServerVersion` of `/info` (`29.9.3`). `null` when the API did not answer |
+| `apiVersion` | string | `Api-Version` of `/_ping` (`1.56`) |
+| `firewallBackend` | string | `FirewallBackend.Driver` of `/info`: `iptables` or `nftables` (Docker 29 can use nftables, which has no `DOCKER-USER` chain). `null` before API 1.49 (Docker < 28.2): iptables |
+| `securityOptions` | []string | Names of `/info` `SecurityOptions`: `seccomp`, `apparmor`, `selinux`, `userns`, `rootless`, `cgroupns`, `no-new-privileges` |
+| `containersRunning` | int | From `/info` |
+| `config` | object | What flags and daemon.json set, below; a `null` field is set by neither and the engine version's default applies |
+| `hosts[]` | object | `{proto, addr, source}`: `proto` is `unix`, `tcp`, `fd` or `npipe` (`invalid` for an address dockerd refuses: it would not restart), `addr` the socket path or `host:port` (`[::]:2375` from a `ListenStream=` port alone), `source` `cmdline`, `config`, `socketUnit` or `default`. A `tcp` host is the Docker API on the network — root for anyone who reaches it without TLS client verification (`config.tlsVerify`) |
+| `socket` | object | `{path, mode, uid, gid}` of the unix socket read: members of its group are root in all but name. `null` without one |
+| `published[]` | object | Ports of running containers bound on the host, `{container, ip, publicPort, privatePort, type}`, sorted, at most 1000 (`publishedTruncated`). `ip` as dockerd sends it — `0.0.0.0` and `::` are every address, `""` when it sends none; a port only exposed (`EXPOSE` without `-p`) is not listed. `container` is the first name without `/`. `null` when the API did not answer |
+
+`config`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `file` | object | daemon.json: `{path, mode, uid, gid, mtime, valid}`; `valid` — JSON, and the keys read have the type dockerd expects (a wrong type stops the next start). `null` without the file |
+| `userlandProxy`, `iptables`, `ip6tables`, `allowDirectRouting`, `icc`, `noNewPrivileges`, `liveRestore`, `tls`, `tlsVerify` | bool | `--userland-proxy`, `--iptables`, … or the daemon.json key of the same name. With `iptables: false` dockerd writes no rules and published ports depend on the host firewall alone |
+| `firewallBackend` | string | `--firewall-backend` as set: `iptables`, `nftables`, else `invalid` |
+| `defaultBindIp` | string | `--ip`: where `-p` binds without an address (`127.0.0.1` keeps them local), `invalid` when not an IP |
+| `usernsRemap` | bool | `userns-remap` is set; the user is not sent |
+
+For the backend: a port published on `0.0.0.0` or `::` while ufw is active bypasses ufw (DNAT in PREROUTING, then FORWARD; ufw guards INPUT). Before Docker 28 a port on `127.0.0.1` is reachable from hosts on the same L2 segment. Docker before 28.3.3 with firewalld is CVE-2025-54388.
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -317,6 +351,10 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | `authorized_keys` | Fingerprint, type, size and which options a key has; never the comment or the values of `from=`, `command=`, `environment=` |
 | sudoers, doas.conf | Principals, host and runas lists, flags of the rules; never the commands |
 | APT configuration, dnf-automatic configuration, Alpine cron jobs | The keys of `updates` in a form the tool accepts, origin patterns as written; never proxies, hooks or other keys, never the job lines — only which file runs `apk upgrade` |
+| Command line of dockerd, daemon.json | The options of `config` and the hosts, in the form dockerd takes; never other keys (registry mirrors, TLS key paths, credentials) |
+| Docker API answers | Version, API version, firewall backend, security option names, the count of running containers, published ports with the container name; never labels, commands, images, environment or mounts |
+| `login.defs`, PAM service files | The keys of `loginDefs`; which PAM files take `nullok` — never their arguments |
+| `.rhosts`, `.shosts`, `.netrc`, `.forward` | That they exist, owner and mode (`lstat`); never opened |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |
