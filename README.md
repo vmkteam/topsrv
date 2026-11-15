@@ -62,6 +62,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
 | **Web-logs** *(opt-in)* | Ships the full HTTP stream from the access logs you name, with the UA match carried as a signal rather than a gate — the scraper on a plain browser UA the bot stream cannot see. Local filters (reached-a-backend, upstream allowlist, path prefixes) keep the volume in hand; log_formats carrying request bodies, cookies or credentials are refused at startup | — |
 | **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching | apt-prom-exporter / pkg-exporter |
+| **Security** | Security facts about the host — where the agent runs (container detection), kernel taint, loaded and hidden modules, CPU vulnerabilities, LSM, sysctl hardening, role signals — pushed to `/v1/inventory` as `kind="security"`. Facts only: no exec, no secrets, rules are evaluated by the backend. See [Security snapshot](#security-snapshot) | Lynis / osquery checks |
 
 ## Auto-discovery
 
@@ -155,6 +156,14 @@ Channel  = "stable"         # stable / beta
 # DisablePush   = false      # set to skip POSTing snapshots to /v1/inventory (keep /metrics only)
 # MaxPackages   = 10000      # safety cap; logs a warning and truncates if exceeded
 
+# Security snapshot (enabled by default). Pushed to /v1/inventory with kind="security".
+# Preview what would be sent: topsrv -config <cfg> -security-dry-run
+# [Security]
+# Disabled         = false   # set to fully skip the collector
+# Interval         = "6h"    # full snapshot period (±10% jitter), minimum 15m
+# DisablePush      = false   # collect for /metrics and dry-run only
+# DisabledSections = []      # e.g. ["roleSignals"]
+
 # Bot-logs (optional — ships UA-classified bot events to topsrv.io for analytics)
 # [BotLogs]
 # Enabled       = true
@@ -213,6 +222,10 @@ Channel  = "stable"         # stable / beta
 | `Packages.Managers` | `[]` | Force subset of managers (`dpkg`/`rpm`/`apk`); empty = auto-detect |
 | `Packages.DisablePush` | `false` | Skip POSTing snapshots to `/v1/inventory` (keeps `/metrics` aggregates) |
 | `Packages.MaxPackages` | `10000` | Truncate snapshot if exceeded (logs a warning) |
+| `Security.Disabled` | `false` | Disable the security collector |
+| `Security.Interval` | `6h` | Full snapshot period (±10% jitter), minimum `15m` |
+| `Security.DisablePush` | `false` | Collect for `/metrics` and dry-run only, send nothing |
+| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `roleSignals` (and the names of later sections) |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
@@ -396,6 +409,51 @@ http {
     }
 }
 ```
+
+## Security snapshot
+
+The agent collects security **facts** about the host and pushes them every
+`Interval` as one snapshot, `kind="security"`, to `/v1/inventory`. It never
+runs external commands, never sends file contents, secrets or environment
+values, and reports what it could not read rather than guessing: every
+section carries a `status` — `ok`, `partial` (with `gaps`), `unknown` (with a
+`reason`: `permission_denied`, `not_found`, `timeout`, `container_env`, …) or
+`na`. Rules, scores and host roles are computed by the backend.
+
+| Section | What it reports |
+|---------|-----------------|
+| `environment` | Host or container (docker, podman, k8s, lxc, nspawn, openvz), hypervisor (kvm, vmware, …, or none), pid/net/user namespaces, libc, init. In an app container the host sections come out `unknown/container_env` |
+| `kernel` | Taint flags, loaded modules, modules hidden from `/proc/modules`, CPU vulnerabilities, active LSMs, lockdown, AppArmor/SELinux mode, livepatches, clock sync (adjtimex), module signature enforcement, Secure Boot, kexec, SMT, microcode, whitelisted `/proc/cmdline` tokens only |
+| `sysctl` | Raw hardening values (KSPP and CIS keys, user namespaces, `core_pattern`/`modprobe`/`hotplug`, forwarding), `rp_filter`, redirects, forwarding and `accept_ra` for `all` and per interface |
+| `roleSignals` | Role processes in the host network namespace (dockerd, kubelet, libvirtd, tailscaled, …), interface and tunnel types (bridge, wireguard, tun, gre), interfaces with a default route, role marker files (`/dev/kvm`, kubelet config) |
+
+Untrusted files are read without following FIFOs or devices and with size
+limits; each section has a time budget, and a section stuck in a blocking
+read is reported as `timeout` and not restarted until it returns. Tokens that
+change when a secret changes are keyed with a random per-host key kept in
+`<state dir>/security.key` (0600), the parent of `[Push].SpoolDir` or
+`/var/lib/topsrv`; only the key id is sent. A key file that others can
+read or another user owns is replaced.
+
+See exactly what leaves the host — nothing is sent and nothing is written:
+
+```bash
+topsrv -config /etc/topsrv/topsrv.toml -security-dry-run
+topsrv -config /etc/topsrv/topsrv.toml -security-dry-run -security-section kernel,sysctl
+```
+
+The agent needs root (or `CAP_DAC_READ_SEARCH` + `CAP_SYS_PTRACE`) to see
+everything; without it the affected sections say `permission_denied`, and
+`agent.capEff` in the snapshot shows what was missing.
+
+Every field of the snapshot, the status and reason values, and what is never
+sent: [docs/security.md](docs/security.md).
+
+Metrics: `topsrv_security_scan_duration_seconds{section}`,
+`topsrv_security_scan_errors_total{section,reason}`,
+`topsrv_security_last_scan_timestamp_seconds`,
+`topsrv_security_last_push_timestamp_seconds`,
+`topsrv_security_snapshot_bytes`, `topsrv_security_section_inflight{section}`.
 
 ## Bot-logs (optional)
 

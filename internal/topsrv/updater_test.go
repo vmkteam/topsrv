@@ -473,3 +473,9 @@ func createTestTarGz(t *testing.T, tarPath, name string, content []byte) {
 	_, err = tw.Write(content)
 	require.NoError(t, err)
 }
+
+func TestStateDir(t *testing.T) {
+	assert.Equal(t, "/var/lib/topsrv", StateDir(""))
+	assert.Equal(t, "/var/lib/topsrv", StateDir("/var/lib/topsrv/spool"))
+	assert.Equal(t, "spool", StateDir("spool"), "a bare relative dir is its own state dir")
+}

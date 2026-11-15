@@ -89,7 +89,7 @@ type Updater struct {
 	version   string
 	binPath   string // os.Executable()
 	backupDir string // <binDir>/.topsrv-backup/
-	stateDir  string // from push SpoolDir parent or /var/lib/topsrv
+	stateDir  string // StateDir(push SpoolDir)
 	client    *http.Client
 	interval  time.Duration
 	hostname  string
@@ -113,13 +113,7 @@ func NewUpdater(logger embedlog.Logger, appName, version string, cfg UpdateConfi
 
 	backupDir := filepath.Join(filepath.Dir(binPath), ".topsrv-backup")
 
-	stateDir := "/var/lib/topsrv"
-	if pushCfg.SpoolDir != "" {
-		stateDir = filepath.Dir(pushCfg.SpoolDir)
-		if stateDir == "." {
-			stateDir = pushCfg.SpoolDir
-		}
-	}
+	stateDir := StateDir(pushCfg.SpoolDir)
 
 	hostname := ""
 	if info, err := host.Info(); err == nil {
@@ -638,4 +632,16 @@ func (u *Updater) saveState(s updateState) {
 	}
 	path := filepath.Join(u.stateDir, updateStateFile)
 	_ = os.WriteFile(path, data, 0o640)
+}
+
+// StateDir is where the agent keeps its state: the parent of the push
+// SpoolDir, or /var/lib/topsrv without one.
+func StateDir(spoolDir string) string {
+	if spoolDir == "" {
+		return "/var/lib/topsrv"
+	}
+	if dir := filepath.Dir(spoolDir); dir != "." {
+		return dir
+	}
+	return spoolDir
 }

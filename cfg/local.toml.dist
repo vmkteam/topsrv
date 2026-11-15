@@ -43,6 +43,16 @@ Channel  = "stable"      # stable / beta
 # MaxPackages    = 10000      # safety cap; logs a warning and truncates if exceeded
 # CheckUpgrades  = false      # (Phase 4, not wired yet) — will populate topsrv_packages_upgradable from local apt/dnf cache
 
+# Security snapshot (enabled by default). Sends security facts to /v1/inventory
+# with kind="security": container detection, kernel taint and modules, CPU
+# vulnerabilities, LSM, sysctl hardening, role signals. No exec, no secrets.
+# Preview what would be sent: topsrv -config <cfg> -security-dry-run
+# [Security]
+# Disabled         = false   # set true to fully skip the collector
+# Interval         = "6h"    # full snapshot period (±10% jitter), minimum 15m
+# DisablePush      = false   # set true to collect for /metrics and dry-run only
+# DisabledSections = []      # e.g. ["roleSignals"]
+
 # Bot-logs ingest to topsrv.io (optional — ships bot traffic events for analytics).
 # When enabled, botlog reads four nginx variables (http_user_agent, server_name,
 # remote_addr, http_referer) from each access-log line. These are NOT added to
