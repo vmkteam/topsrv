@@ -52,7 +52,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **System** | CPU per-core, memory, load, swap, uptime, host info, context switches | node_exporter |
 | **Disk** | IO (read/write bytes/ops/time), filesystem (space/inodes) | node_exporter |
 | **Network** | IO per interface, interface info (MAC/IP/MTU/status) | node_exporter |
-| **Netstat** | TCP connections by state/direction/port and remote-peer scope (loopback/private/public), TCP+UDP listening ports by scope and owning process, TCP segment counters (in/out/retransmit), UDP/IP errors | node_exporter |
+| **Netstat** | TCP connections by state/direction and remote-peer scope (loopback/private/public), also per listen port — public peers on a public port confirm exposure by traffic; TCP+UDP listening ports by scope and owning process, TCP segment counters (in/out/retransmit), UDP/IP errors | node_exporter |
 | **Process** | CPU, memory, disk IO, threads, FDs, worst_fd_ratio per process group | process-exporter |
 | **PostgreSQL** | Connections (by state/addr/app), transactions, longest transaction age, checkpoints, bgwriter, locks, replication, WAL, wraparound, pg_stat_statements, tables (top 50) | postgres_exporter |
 | **Nginx** | stub_status, access log parsing (text & JSON log_format, response time histogram, status codes, cache, 4xx/5xx URIs, bytes by URI) | nginx-exporter + mtail |
@@ -62,7 +62,7 @@ That's it. System, disk, network, netstat, process, and S.M.A.R.T. metrics are c
 | **Bot-logs** *(opt-in)* | Ships UA-classified bot events from nginx access logs to topsrv.io as gzipped ndjson with disk-backed WAL. 38 families: global/RU/Asian search, AI 2026 crawlers, SEO tools, social link previews, archive | — |
 | **Web-logs** *(opt-in)* | Ships the full HTTP stream from the access logs you name, with the UA match carried as a signal rather than a gate — the scraper on a plain browser UA the bot stream cannot see. Local filters (reached-a-backend, upstream allowlist, path prefixes) keep the volume in hand; log_formats carrying request bodies, cookies or credentials are refused at startup | — |
 | **Packages** | Installed-package inventory: dpkg/rpm/apk parsed pure-Go (no shell-out). Aggregates on `/metrics`; full snapshot (NEVRA, vendor, GPG key, signature digest, modularityLabel, autoInstalled, repoOrigin, licenses) pushed to `/v1/inventory` for CVE matching, with `rebootRequired` (a newer kernel image installed, or Debian/Ubuntu `/var/run/reboot-required`) and the packages that asked for the reboot | apt-prom-exporter / pkg-exporter |
-| **Security** | Security facts about the host — where the agent runs (container detection), kernel taint, loaded and hidden modules, CPU vulnerabilities, LSM, sysctl hardening, users and password classes, effective sshd config, authorized keys, sudo rules, automatic updates, Docker daemon options and published ports, role signals — pushed to `/v1/inventory` as `kind="security"`. Facts only: no exec, no secrets, rules are evaluated by the backend. See [Security snapshot](#security-snapshot) | Lynis / osquery checks |
+| **Security** | Security facts about the host — where the agent runs (container detection), kernel taint, loaded and hidden modules, CPU vulnerabilities, LSM, sysctl hardening, users and password classes, effective sshd config, authorized keys, sudo rules, automatic updates, the nftables ruleset in outline (ufw, firewalld, Docker), Docker daemon options and published ports, role signals — pushed to `/v1/inventory` as `kind="security"`. Facts only: no exec, no secrets, rules are evaluated by the backend. See [Security snapshot](#security-snapshot) | Lynis / osquery checks |
 
 ## Auto-discovery
 
@@ -225,7 +225,7 @@ Channel  = "stable"         # stable / beta
 | `Security.Disabled` | `false` | Disable the security collector |
 | `Security.Interval` | `6h` | Full snapshot period (±10% jitter), minimum `15m` |
 | `Security.DisablePush` | `false` | Collect for `/metrics` and dry-run only, send nothing |
-| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `updates`, `firewall`, `docker`, `roleSignals` (and the names of later sections) |
+| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `updates`, `firewall`, `docker`, `roleSignals` |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
