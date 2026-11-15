@@ -1,0 +1,59 @@
+*raw
+:PREROUTING ACCEPT [1048796919:954111832664]
+:OUTPUT ACCEPT [0:0]
+COMMIT
+*filter
+:INPUT ACCEPT [1415996387:1303889827570]
+:FORWARD DROP [138:17176]
+:OUTPUT ACCEPT [0:0]
+:DOCKER - [0:0]
+:DOCKER-BRIDGE - [0:0]
+:DOCKER-CT - [0:0]
+:DOCKER-FORWARD - [0:0]
+:DOCKER-INTERNAL - [0:0]
+:DOCKER-USER - [0:0]
+:FIP-IN - [0:0]
+-A INPUT -d 192.0.2.35/32 -j FIP-IN
+-A FORWARD -o wg0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FORWARD -i wg0 -j ACCEPT
+-A FORWARD -j DOCKER-USER
+-A FORWARD -j DOCKER-FORWARD
+-A DOCKER ! -i docker0 -o docker0 -j DROP
+-A DOCKER-BRIDGE -o docker0 -j DOCKER
+-A DOCKER-CT -o docker0 -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A DOCKER-FORWARD -j DOCKER-CT
+-A DOCKER-FORWARD -j DOCKER-INTERNAL
+-A DOCKER-FORWARD -j DOCKER-BRIDGE
+-A DOCKER-FORWARD -i docker0 -j ACCEPT
+-A DOCKER-USER -j RETURN
+-A FIP-IN -m conntrack --ctstate RELATED,ESTABLISHED -j ACCEPT
+-A FIP-IN -s 192.0.2.36/32 -p udp -m udp --dport 51820 -j ACCEPT
+-A FIP-IN -s 192.0.2.37/32 -p tcp -m tcp --dport 22 -j ACCEPT
+-A FIP-IN -s 192.0.2.38/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.39/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.40/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.41/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.42/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.43/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.44/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.45/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.46/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.47/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.48/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.49/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.50/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.51/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -s 192.0.2.52/32 -p tcp -m multiport --dports 80,443 -j ACCEPT
+-A FIP-IN -j DROP
+COMMIT
+*nat
+:PREROUTING ACCEPT [48339372:6034477832]
+:INPUT ACCEPT [0:0]
+:OUTPUT ACCEPT [16241138:3369549746]
+:POSTROUTING ACCEPT [16241944:3369599562]
+:DOCKER - [0:0]
+-A PREROUTING -m addrtype --dst-type LOCAL -j DOCKER
+-A OUTPUT ! -d 127.0.0.0/8 -m addrtype --dst-type LOCAL -j DOCKER
+-A POSTROUTING -s 172.17.0.0/16 ! -o docker0 -j MASQUERADE
+-A POSTROUTING -s 198.51.100.18/32 -o eth0 -j SNAT --to-source 192.0.2.35
+COMMIT

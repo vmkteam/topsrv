@@ -5,6 +5,7 @@ The security collector sends one snapshot, `kind="security"`, to `/v1/inventory`
 ```bash
 topsrv -config /etc/topsrv/topsrv.toml -security-dry-run
 topsrv -config /etc/topsrv/topsrv.toml -security-dry-run -security-section kernel,sysctl
+topsrv -config /etc/topsrv/topsrv.toml -security-dry-run -security-section firewall -security-dump-netlink /root/nft
 ```
 
 Collector health metrics (`topsrv_security_*`) are in [metrics.md](metrics.md#security-topsrv_security_). Configuration is in the [README](../README.md#security-snapshot).
@@ -159,7 +160,7 @@ Users and groups from `/etc/passwd`, `/etc/shadow`, `/etc/group` and `/etc/nsswi
 |-------|------|-------------|
 | `users[]` | object | One per passwd user, in file order, at most 2000 (the receiving side caps a snapshot at 1 MB). Fields below |
 | `truncated` | bool | `true` when there were more users; the anomalies still cover all of them. Absent otherwise |
-| `privilegedGroups` | map | Group → members, for the groups present among `root`, `sudo`, `wheel`, `admin`, `adm`, `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `shadow`. Members are the group's member list and the users whose primary group it is. `docker`, `lxd` and `incus-admin` are root in all but name. `null` when group is unread |
+| `privilegedGroups` | map | Group → members, for the groups present among `root`, `sudo`, `wheel`, `admin`, `adm`, `docker`, `lxd`, `incus-admin`, `libvirt`, `disk`, `shadow`. Members hold the group's gid, as the kernel and sudo check it: the member lists of every line with that gid (another name sharing it counts, and so does a repeated name's later line, which initgroups reads too; agents up to 0.2.0-rc.4 read only the first line of the name) and the users whose primary group it is. `docker`, `lxd` and `incus-admin` are root in all but name; the group of the Docker socket, by gid and under any name, is `docker.socket.group`. `null` when group is unread |
 | `anomalies` | object | `uid0Users` (every user with uid 0, root included), `duplicateUids`, `duplicateNames`, `passwdShadowMismatch` (users with `x` in passwd and no shadow entry, and shadow entries with no passwd user; `null` when shadow is unread). Of `/etc/group` — `null` when it is unread: `duplicateGroupNames`, `duplicateGids`, `gid0Groups` (GID 0 other than `root`), `primaryGroupMissing` (users whose passwd GID has no group) |
 | `nisCompat` | bool | passwd or group has NIS `+`/`-` lines: users the agent does not see. Absent otherwise |
 | `nss` | object | Sources of `passwd`, `group`, `shadow`, `sudoers`, `netgroup` as listed in nsswitch.conf (an odd name comes as `invalid`), and `externalIdentities`: `true` when `passwd`, `group` or `shadow` also use `sss`, `ldap`, `winbind`, `nis`, `nisplus`, `hesiod`, `altfiles` (`/usr/lib/passwd`) or `extrausers` — some users and their sudo rules are not in the files the agent reads. `systemd` does not count: it is the Debian and Ubuntu default and only adds DynamicUser and homed users. `null` without nsswitch.conf (musl) |
@@ -286,6 +287,75 @@ Whether the host installs updates by itself, read from files without running apt
 | `reboot` | string | `never`, `when-changed`, `when-needed` |
 | `files[]` | object | `{path, mode, uid, gid}` of the files read, in order |
 
+## `firewall`
+
+The nftables ruleset in outline, read from the kernel over netlink — GET requests only, the agent's own client; `nft` and the iptables binaries are not run — and the firewalls that manage it. iptables-nft (the iptables of every current distribution) keeps its rules in nftables, so ufw, Docker's iptables backend, firewalld and kube-proxy are all read; rules of iptables-legacy are not (`legacyTablesPresent`).
+
+Before any request the agent checks that nf_tables is loaded (`/sys/module/nf_tables`) or built into the kernel (`modules.builtin` of the running kernel: a built-in nf_tables has no `/sys/module` entry); otherwise the first request would load the module, so nothing is asked and `nftLoaded` is `false` — no ruleset, nothing filters. When neither can be told the section is `partial` with a gap on `modules.builtin`. The ruleset read is that of PID 1's network namespace: an agent running in another one opens its socket there. A read is consistent: the generation is read before and after, and a dump the kernel marks as interrupted is read again, three times at most, then `unknown` with `dump_inconsistent`. The kernel answers only with `CAP_NET_ADMIN`: `unknown` with `permission_denied` without it.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `nftLoaded` | bool | nf_tables is loaded or built in. `false`: nothing was asked, the fields of the ruleset are `null` |
+| `tables[]` | object | `{family, name, dormant, ownerGuess}`, at most 256 (`tablesTruncated`). `family` is `ip`, `ip6`, `inet`, `arp`, `bridge` or `netdev`; `dormant` — the table is switched off and filters nothing. `ownerGuess` — who likely made it, every match, sorted: by name (`firewalld`, `docker-bridges` → `docker`, `kube-proxy`, `netavark`, `libvirt_network` → `libvirt`, `f2b-table` → `fail2ban`, `crowdsec`, `lxd`, `incus`), by chain prefixes (`ufw-`/`ufw6-` → `ufw`, `DOCKER` → `docker`, `KUBE-` → `kube-proxy`, `cali-` → `calico`, `CILIUM_` → `cilium`, `ts-` → `tailscale`, `f2b-` → `fail2ban`, `LIBVIRT_` → `libvirt`, `NETAVARK` → `netavark`, `CROWDSEC` → `crowdsec`), and `iptables-nft` for a `filter`, `nat`, `mangle`, `raw` or `security` table with an `INPUT`, `FORWARD`, `OUTPUT`, `PREROUTING` or `POSTROUTING` base chain. A name proves nothing — anyone may take it: a hint. One iptables-nft table is shared, so `ip filter` of a host with ufw and Docker is `["docker", "iptables-nft", "ufw"]` |
+| `baseChains[]` | object | Chains attached to a hook, at most 256 (`baseChainsTruncated`), in the kernel's order. Below |
+| `dockerUser[]` | object | `DOCKER-USER` chains, at most 16 (`dockerUserTruncated`), where Docker's iptables backend leaves the user room to filter what it publishes (FORWARD jumps there first): `{family, table, name, rulesCount}`. Docker 28 and later create it empty, Docker before 28 with one `RETURN`; more rules — the user filters. Docker's nftables backend has none; a `DOCKER-USER` left from the iptables backend stays after the switch |
+| `legacyTablesPresent` | bool | `/proc/1/net/ip_tables_names` or `ip6_tables_names` lists a table: iptables-legacy has been used — a table appears on first use, rules or not — and its rules are not read: the outline may be incomplete |
+| `ufw` | object | `null` when ufw is neither installed (`/etc/ufw/ufw.conf`) nor loaded. Below |
+| `firewalld` | object | `null` when firewalld is neither installed (`/etc/firewalld/firewalld.conf`) nor loaded. Below |
+| `firewallView` | string | `full`, or `partial` when `cilium-agent` or `calico-node` runs in PID 1's network namespace: Cilium filters in eBPF (tc, XDP), out of sight of nftables; Calico does with its eBPF dataplane, and is counted either way — its iptables mode would be visible |
+
+`baseChains[]`:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `family`, `table`, `name` | string | Table and chain names as nft writes them unquoted (letters, digits, `_./:-`, up to 128), else `invalid` |
+| `type` | string | `filter`, `nat` or `route` |
+| `hook` | string | `prerouting`, `input`, `forward`, `output`, `postrouting`, `ingress`, `egress` (`netdev`), by family; `hookN` for a number not known here |
+| `priority` | int | Lower runs first. iptables-nft and ufw use `0` (`filter`); firewalld `filter + 10` |
+| `policy` | string | `accept` or `drop`, the only ones the kernel takes; `unknown` otherwise |
+| `devices` | []string | The interfaces of an `ingress`/`egress` chain. Absent otherwise |
+| `rulesCount` | int | Rules of the chain. Read for the chains of inbound traffic only — `filter` chains on `input`, `forward` and `ingress` of `ip`, `ip6`, `inet` and `netdev`; `null` for the rest |
+| `terminal` | string | For the same chains: what happens to a packet no match of the chain took — the inbound default. Absent for the rest; `unknown` for one of them past the 128 chains whose rules a read takes. Below |
+
+`terminal` is decided by the first rule that applies to every packet — it holds statements only, such as `counter` and `log` (a `limit` is a match). Rules that match only some packets are passed over. A `jump` or `goto` that applies to every packet is followed into its chain, anywhere in the chain and up to six chains deep (firewalld nests its zones and policies five deep), and the walk goes on after a chain that returns. When no rule decides, the chain's policy does:
+
+| Value | Meaning |
+|-------|---------|
+| `drop`, `reject` | The chain drops what it did not accept. `reject` answers the sender |
+| `accept` | The chain lets through what it did not drop. Ends only this base chain: a later base chain on the same hook still sees the packet |
+| `queue` | Handed to a userspace program (an IPS), which decides |
+| `jump:CHAIN` | A jump deeper than six chains: not followed |
+| `unknown` | A rule on the way holds an expression the agent does not know and no known match: it may apply to every packet, or not. The agent never takes an unknown expression for a statement — that would turn "unknown match + drop" into a drop of everything |
+
+A `drop` or `reject` after a match that **returns** — or goes to another chain, which returns to the caller — does not decide: that chain judges only the packets it did not return, and they may be the usual ones. ufw's `ufw-not-local`, jumped to for every packet, returns every packet for a local address and drops the rest; read as a drop it would deny inbound traffic under `DEFAULT_INPUT_POLICY="ACCEPT"`. The price: an allowlist chain ("return the known addresses, drop the rest") reads as letting packets through — an error towards allow, never towards deny.
+
+Matches are not judged: `iifname "eth0" accept` before a final `drop` is a match like any other, and the chain is `drop`. In firewalld an interface or source bound to a zone of target `ACCEPT` (`trusted`) is such a match — everything on it is accepted, and `terminal` still says `reject`; the default zone is followed (`trusted` as the default zone gives `accept`). With NetworkManager the binding of an interface is kept in its connection, not in the zone files. Real rulesets: ufw — `drop` through `ufw-before-input` and its other chains, then the policy (`accept` under `DEFAULT_INPUT_POLICY="ACCEPT"`); firewalld — `filter_INPUT` has the policy `accept` and rejects at its end, or accepts in the zone `trusted`; the default `/etc/nftables.conf` of Debian — empty chains, the policy `accept`. Checked against `nft list ruleset` of these, of Docker 29 with both backends and of 11 production hosts.
+
+For the backend, per family, v4 from `ip` and `inet`, v6 from `ip6` and `inet`, over the `input` chains of tables not `dormant`: any `drop` or `reject` → inbound denied by default; all `accept` → allowed; **no `input` chain → nothing filters inbound** (ufw disabled, iptables-nft creates no `INPUT` until a rule needs it); anything else → unknown. The same over `forward` for routed and Docker-published traffic. A disabled ufw and an enabled `nftables.service` that flushed its rules both show as no chains.
+
+`ufw` — `/etc/default/ufw` read as ufw's Python reads it (a line `KEY=word` or `KEY="word"` from its first column, key and value lowercased, the last one wins), `ENABLED` of `/etc/ufw/ufw.conf` as `ufw-init` reads it at boot (a shell script sourcing the file: `yes` or `YES` exactly), and its chains in the ruleset:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `configEnabled` | bool | `ENABLED=yes`: ufw loads its rules at boot |
+| `serviceEnabled` | bool | `ufw.service` is enabled. `null` without systemd |
+| `defaultInputPolicy`, `defaultForwardPolicy` | string | `drop`, `reject` or `accept`, else `invalid`; `null` when not set or the file is missing |
+| `ipv6` | bool | `IPV6=yes` |
+| `runtimeRulesV4`, `runtimeRulesV6` | int | The rules loaded in `ufw-user-input` of `ip filter` (`ufw6-user-input` of `ip6 filter`) — the user's ufw rules; `null` when the chain is not in the ruleset: ufw's rules are not loaded. `configEnabled` without them — they were flushed since, often by `nftables.service`, or ufw uses iptables-legacy (`legacyTablesPresent`) |
+
+`firewalld` — `/etc/firewalld/firewalld.conf` read as firewalld reads it (a line split at every `=` must give two parts and a value, the first of a key wins), and its table:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `serviceEnabled` | bool | `firewalld.service` is enabled. `null` without systemd |
+| `backend` | string | `FirewallBackend`: `nftables` or `iptables`, else `invalid`; `null` when not set (nftables) |
+| `defaultZone` | string | `DefaultZone` as written, `invalid` for a value of another form |
+| `runtimeTablePresent` | bool | `inet firewalld` is in the ruleset: firewalld runs with the nftables backend |
+
+The ruleset is checked every minute by its generation alone (an `lstat` of `/sys/module/nf_tables` and one request; the generation itself is not sent: it moves with every change, the outline often does not). When it changed, the section is rebuilt in an unscheduled pass with the trigger `firewall`, at most once per 15 minutes — on a Kubernetes node the generation moves all the time — and, as any unscheduled pass, sent only when the section changed.
+
+`-security-dry-run -security-dump-netlink DIR` also saves the replies of the kernel to `DIR/nftables.json`, mode 0600 in a 0700 directory — they hold the full rules of the chains read, addresses and comments included — to make test fixtures from a host.
+
 ## `docker`
 
 The rootful Docker Engine of the host: how dockerd is configured and which container ports it publishes on the host — what decides whether a port bypasses the host firewall. Nothing is executed and no Docker SDK is used.
@@ -310,7 +380,7 @@ Its options come from its command line (`/proc/PID/cmdline`: only the flags belo
 | `apiExposed[]` | object | dockerd's own warnings about the TCP hosts it listens on, `{addr, noTls}`: `noTls: true` — plain HTTP; `false` — TLS without client verification. Covers what the configuration does not show (`DOCKER_TLS_VERIFY` in its environment) |
 | `config` | object | What flags and daemon.json set, below; a `null` field is set by neither and the engine version's default applies |
 | `hosts[]` | object | `{proto, addr, source}`: `proto` is `unix`, `tcp`, `fd` or `npipe` (`invalid` for an address dockerd refuses: it would not restart), `addr` the socket path or `host:port` (`[::]:2375` from a `ListenStream=` port alone), `source` `cmdline`, `config`, `socketUnit` or `default`. A `tcp` host is the Docker API on the network — root for anyone who reaches it without TLS client verification |
-| `socket` | object | `{path, mode, uid, gid}` of the unix socket: members of its group are root in all but name — join on `gid`, the group may be other than `docker`. `null` without one |
+| `socket` | object | `{path, mode, uid, gid, group}` of the unix socket: members of its group are root in all but name, and the group may be other than `docker` (dockerd's `--group`, `SocketGroup=` of `docker.socket`, `dockerroot` on old RHEL). `group` is `{name, members}` for the socket's `gid`, from the files the `accounts` section read: `name` — the first line of `/etc/group` with the gid, as `getgrgid` returns it, `null` when no line has it; `members` — as in `privilegedGroups`: of every line with the gid and the users whose primary group it is, sorted, at most 2000 (`truncated`); users a directory serves (sssd, LDAP — see `nss`) are not seen. `group` is `null` when `/etc/group` was not read: `accounts` disabled or failed. Agents up to 0.2.0-rc.4 send no `group`. `socket` is `null` without one |
 | `published[]` | object | Ports of running containers bound on the host, `{container, ip, publicPort, privatePort, type, publicPortEnd, privatePortEnd}`, sorted, at most 1000 after consecutive ports are merged into ranges (`publishedTruncated`). `ip` as dockerd sends it — `0.0.0.0`, `::` and `""` are every address; a port only exposed (`EXPOSE` without `-p`) is not listed. `container` is the first name without `/`. `null` when the API did not answer |
 | `containers[]` | object | Running containers with host networking or the Docker socket bind-mounted (the socket, `/var/run`, `/run` or `/`), from the container list — no request per container: `{name, hostNetwork, dockerSocket}`, at most 200 (`containersTruncated`). Privileged mode, capabilities and the like need one inspect per container and are not read |
 
@@ -360,6 +430,8 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | sudoers, doas.conf | Principals, host and runas lists, flags of the rules; never the commands |
 | APT configuration, dnf-automatic configuration, Alpine cron jobs | The keys of `updates` in a form the tool accepts, origin patterns as written; never proxies, hooks or other keys, never the job lines — only which file runs `apk upgrade` |
 | Command line of dockerd, daemon.json | The options of `config` and the hosts, in the form dockerd takes; never other keys (registry mirrors, TLS key paths, credentials) |
+| nftables ruleset | Table and chain names, hooks, priorities, policies, the interfaces of ingress chains, rule counts and the end of the inbound chains; never the rules: addresses, ports, sets, comments, log prefixes |
+| ufw, firewalld configuration | The keys of `ufw` and `firewalld`, in the form the tool takes; never other keys |
 | Docker API answers | Version, API version, firewall backend, security option names and the seccomp profile's kind, swarm state, whether an authorization plugin is set, the TCP hosts dockerd warns about, the count of running containers, published ports and host-network or socket-mounting containers by name; never labels, commands, images, environment, mount paths or plugin names |
 | `login.defs`, PAM service files | The keys of `loginDefs`; which PAM files take `nullok` — never their arguments |
 | `.rhosts`, `.shosts`, `.netrc`, `.forward` | That they exist, owner and mode (`lstat`); never opened |
@@ -376,7 +448,8 @@ Every file is opened without following FIFOs or device nodes, with a size limit,
 |------|------|
 | First | 1–5 minutes after the agent starts, random — away from the packages scan |
 | Scheduled | Every `Interval` ±10%. Always sent, changed or not, so the backend can tell "unchanged" from "agent silent" |
-| Unscheduled | On a trigger, rebuilding only the affected sections, the rest from the last pass. At most one per 5 minutes, and only after the first full pass. Triggers that arrive meanwhile are merged |
+| Unscheduled | On a trigger, rebuilding only the affected sections, the rest from the last pass. Sent only when a section it rebuilt changed (its `durationMs` aside); one that changed nothing is not sent. At most one pass per 5 minutes, sent or not, and only after the first pass. Triggers that arrive meanwhile are merged |
+| `firewall` | The nftables generation changed, or nf_tables got loaded (checked every minute): the firewall section alone, at most once per 15 minutes |
 
 A snapshot that fails to send with a network error, 5xx, 408, 429 or 401/403 is spooled and resent oldest first on later push ticks, for up to 7 days; any other 4xx drops it.
 

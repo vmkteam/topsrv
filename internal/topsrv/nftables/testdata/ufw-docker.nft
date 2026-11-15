@@ -1,0 +1,11 @@
+table inet f2b-table {
+	set addr-set-sshd {
+		type ipv4_addr
+		elements = { 203.0.113.1 }
+	}
+
+	chain f2b-chain {
+		type filter hook input priority filter - 1; policy accept;
+		tcp dport 22 ip saddr @addr-set-sshd reject with icmp port-unreachable
+	}
+}

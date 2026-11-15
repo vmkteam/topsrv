@@ -355,3 +355,57 @@ func TestAccountsGroupsByUser(t *testing.T) {
 	assert.Empty(t, res.groups["daemon"], "GID 1 has no group line")
 	assert.Equal(t, []string{"adm"}, res.groups["syslog"], "a member without a passwd entry still gets its groups")
 }
+
+// TestAccountsGroupOf: the group of a gid as the kernel checks it — the
+// first name getgrgid returns, members of every line with the gid and the
+// users whose primary group it is.
+func TestAccountsGroupOf(t *testing.T) {
+	_, d, res := accountsOf(t, merge(accountsFixture(), map[string]string{
+		"etc/passwd": accountsFixture()["etc/passwd"] + "\nci:x:1010:987::/home/ci:/bin/sh",
+		"etc/group": strings.Join([]string{
+			"root:x:0:", "sudo:x:27:alice", "docker:x:999:bob,alice",
+			"dockerroot:x:987:bob", // dockerd --group dockerroot
+			"ops:x:987:carol,bob",  // the same gid under a later name
+			"alice:x:1000:", "bob:x:1001:",
+			"builders:x:999:eve", // docker's gid under another name
+			"docker:x:999:dave",  // a second docker line: initgroups reads it too
+			"docker:x:996:frank", // and one with a gid of its own
+		}, "\n"),
+	}))
+	require.NotNil(t, res)
+
+	t.Run("socket group other than docker: its gid shared, a primary member", func(t *testing.T) {
+		assert.Equal(t, &gidGroup{Name: new("dockerroot"), Members: []string{"bob", "carol", "ci"}}, res.groupOf(987))
+	})
+	t.Run("docker, and privilegedGroups agree: both by gid", func(t *testing.T) {
+		assert.Equal(t, &gidGroup{Name: new("docker"), Members: []string{"alice", "bob", "dave", "eve"}}, res.groupOf(999))
+		assert.Equal(t, []string{"alice", "bob", "dave", "eve"}, d.PrivilegedGroups["docker"])
+	})
+	t.Run("a gid first seen on a repeated name's line", func(t *testing.T) {
+		assert.Equal(t, &gidGroup{Name: new("docker"), Members: []string{"frank"}}, res.groupOf(996))
+	})
+	t.Run("root: the users with gid 0", func(t *testing.T) {
+		assert.Equal(t, &gidGroup{Name: new("root"), Members: []string{"root", "toor"}}, res.groupOf(0))
+	})
+	t.Run("no line with the gid: no name, primary members still", func(t *testing.T) {
+		assert.Equal(t, &gidGroup{Members: []string{"locked"}}, res.groupOf(1002))
+		assert.Equal(t, &gidGroup{Members: []string{}}, res.groupOf(4242))
+	})
+	t.Run("more than maxUsers members: cut, flagged", func(t *testing.T) {
+		users := make([]string, maxUsers+1)
+		for i := range users {
+			users[i] = fmt.Sprintf("u%05d", i)
+		}
+		big := &accountsResult{groupsByName: map[string]groupEntry{"users": {gid: 100, members: users}}}
+		g := big.groupOf(100)
+		assert.Len(t, g.Members, maxUsers)
+		assert.True(t, g.Truncated)
+	})
+	t.Run("group unread: unknown", func(t *testing.T) {
+		files := accountsFixture()
+		delete(files, "etc/group")
+		_, _, res := accountsOf(t, files)
+		require.NotNil(t, res)
+		assert.Nil(t, res.groupOf(999))
+	})
+}

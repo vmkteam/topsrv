@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"os"
 	"syscall"
 )
 
@@ -157,7 +158,8 @@ func reasonOf(err error) Reason {
 		return ReasonNotFound
 	case errors.Is(err, errTooLarge):
 		return ReasonBudgetExceeded
-	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
+	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled),
+		errors.Is(err, os.ErrDeadlineExceeded): // a socket's timeout
 		return ReasonTimeout
 	case errors.Is(err, errNotRegular), errors.Is(err, errPseudoFS),
 		errors.Is(err, syscall.ENOTDIR), // O_DIRECTORY on a FIFO or a file

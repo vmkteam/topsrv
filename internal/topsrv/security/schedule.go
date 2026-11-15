@@ -65,10 +65,10 @@ func (p *triggerSet) trigger() Trigger {
 // schedule decides what the collector runs and when. It holds no clock:
 // every method takes now, so tests drive it directly.
 type schedule struct {
-	interval     time.Duration
-	nextFull     time.Time
-	lastSnapshot time.Time // zero until the first full pass
-	pending      triggerSet
+	interval time.Duration
+	nextFull time.Time
+	lastPass time.Time // of the last pass, sent or not; zero until the first
+	pending  triggerSet
 }
 
 func newSchedule(now time.Time, interval, startDelay time.Duration) *schedule {
@@ -77,10 +77,10 @@ func newSchedule(now time.Time, interval, startDelay time.Duration) *schedule {
 
 // wake returns when the collector should next look at the schedule.
 func (s *schedule) wake() time.Time {
-	if s.pending.empty() || s.lastSnapshot.IsZero() {
+	if s.pending.empty() || s.lastPass.IsZero() {
 		return s.nextFull
 	}
-	if at := s.lastSnapshot.Add(minUnscheduledGap); at.Before(s.nextFull) {
+	if at := s.lastPass.Add(minUnscheduledGap); at.Before(s.nextFull) {
 		return at
 	}
 	return s.nextFull
@@ -88,24 +88,25 @@ func (s *schedule) wake() time.Time {
 
 // due returns the pass to run at now, if any: the full pass when it is
 // time, which also covers pending triggers; otherwise the pending trigger
-// once minUnscheduledGap has passed since the last snapshot. Triggers wait
-// for the first full pass: before it, the sections they skip have nothing
-// in the cache.
+// once minUnscheduledGap has passed since the last pass — sent or not, so
+// that a stream of triggers runs no more passes than snapshots it may send.
+// Triggers wait for the first pass: before it, the sections they skip have
+// nothing in the cache.
 func (s *schedule) due(now time.Time) (Trigger, bool) {
 	switch {
 	case !now.Before(s.nextFull):
 		t := Trigger{Cause: triggerInterval}
-		if s.lastSnapshot.IsZero() {
+		if s.lastPass.IsZero() {
 			t.Cause = triggerStart
 		}
 		s.nextFull = now.Add(s.interval + jitter(s.interval))
 		s.pending = triggerSet{}
-		s.lastSnapshot = now
+		s.lastPass = now
 		return t, true
-	case !s.pending.empty() && !s.lastSnapshot.IsZero() && !now.Before(s.lastSnapshot.Add(minUnscheduledGap)):
+	case !s.pending.empty() && !s.lastPass.IsZero() && !now.Before(s.lastPass.Add(minUnscheduledGap)):
 		t := s.pending.trigger()
 		s.pending = triggerSet{}
-		s.lastSnapshot = now
+		s.lastPass = now
 		return t, true
 	}
 	return Trigger{}, false

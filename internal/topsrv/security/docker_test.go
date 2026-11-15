@@ -186,6 +186,40 @@ func TestDockerAbsent(t *testing.T) {
 	})
 }
 
+// TestDockerSocketGroup: the socket's group comes from the accounts
+// section by gid, whatever its name; null when accounts gave none.
+func TestDockerSocketGroup(t *testing.T) {
+	sc := fixture(t, dockerFixture())
+	serveDocker(t, sc, engineHandler(t, "29"))
+	fi, err := os.Lstat(filepath.Join(sc.root, "run", "docker.sock"))
+	require.NoError(t, err)
+	_, gid := fileOwner(fi)
+	acc := &accountsResult{
+		users:        []account{{Name: "ci", GID: gid}, {Name: "alice", GID: gid + 1}},
+		groupsByName: map[string]groupEntry{"dockerroot": {gid: gid, members: []string{"bob"}}, "alice": {gid: gid + 1}},
+	}
+
+	t.Run("from accounts", func(t *testing.T) {
+		withDeps(sc, map[string]depResult{SectionAccounts: {sec: ok(nil), res: acc}})
+		sec, d := dockerOf(t, sc)
+		require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+		require.NotNil(t, d.Socket)
+		assert.Equal(t, &gidGroup{Name: new("dockerroot"), Members: []string{"bob", "ci"}}, d.Socket.Group)
+	})
+	t.Run("accounts disabled: unknown", func(t *testing.T) {
+		withDeps(sc, map[string]depResult{})
+		_, d := dockerOf(t, sc)
+		require.NotNil(t, d.Socket)
+		assert.Nil(t, d.Socket.Group)
+	})
+	t.Run("accounts failed: unknown", func(t *testing.T) {
+		withDeps(sc, map[string]depResult{SectionAccounts: {sec: unknown(ReasonPermissionDenied)}})
+		_, d := dockerOf(t, sc)
+		require.NotNil(t, d.Socket)
+		assert.Nil(t, d.Socket.Group)
+	})
+}
+
 func TestDockerSocket(t *testing.T) {
 	t.Run("no socket: the configuration still", func(t *testing.T) {
 		sc := fixture(t, dockerFixture())
