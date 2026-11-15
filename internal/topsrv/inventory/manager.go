@@ -1,6 +1,9 @@
 package inventory
 
-import "os"
+import (
+	"os"
+	"slices"
+)
 
 // Package database paths. A manager is present on the host when its database
 // exists; the packages collector reads the same files.
@@ -21,6 +24,10 @@ var rpmDBPaths = []string{
 	"/usr/lib/sysimage/rpm/Packages.db",
 	"/usr/lib/sysimage/rpm/Packages",
 }
+
+// RpmDBPaths returns the rpm database paths in priority order, for callers
+// that read through their own accessors.
+func RpmDBPaths() []string { return slices.Clone(rpmDBPaths) }
 
 // RpmDB returns root + the first existing rpm database path, or "" if none.
 func RpmDB(root string) string {

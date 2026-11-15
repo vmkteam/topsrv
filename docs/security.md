@@ -241,6 +241,41 @@ Who may run what as whom, parsed by sudoers(5) without sudo or visudo: `/etc/sud
 | `parseErrors[]` | object | `{file, line, code}`: `syntax`, `include_depth`, `include_loop`, `too_many_files`. Never the text |
 | `doasRules[]` | object | `{source, permit, principal, nopass, persist, keepenv, asRoot, cmd}`: `principal` a user or `:group`, `asRoot` without `as` or `as root`, `cmd` when restricted to one command. `null` without doas.conf |
 
+## `updates`
+
+Whether the host installs updates by itself, read from files without running apt, dnf or systemctl. `na` without a package database. Values sent are only those the tools accept: an interval, a boolean or an enum of another form comes as `invalid`; the text of a configuration line is never sent — a proxy password or a hook command next to the keys below stays on the host.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `manager` | string | `dpkg`, `rpm` or `apk`, by the package database found first |
+| `apt` | object | Debian/Ubuntu, `null` otherwise. Below |
+| `dnfAutomatic` | object | RHEL/Fedora, `null` otherwise. Below |
+| `apk` | object | Alpine: `{upgradeJobs}` — the files of `/etc/crontabs/root` and `/etc/periodic/*/*` with an `apk … upgrade` line not commented out; Alpine has no update service of its own. `null` otherwise |
+| `timers[]` | object | The update timers installed, without D-Bus: `{name, enabled, masked, lastTriggerAt}` for `apt-daily`, `apt-daily-upgrade`, `dnf-automatic`, `dnf-automatic-{download,install,notifyonly}`, `dnf5-automatic`. `enabled` — a link in `timers.target.wants/` of a unit directory; `masked` — a link to `/dev/null` or an empty file in `/etc` or `/run` (a mask wins over the link); `lastTriggerAt` — mtime of the stamp a `Persistent` timer keeps in `/var/lib/systemd/timers`, `null` before the first run. An alias — a unit file linking to a unit of another name, Fedora's `dnf-automatic.timer` → `dnf5-automatic.timer` — is left out: its target is listed. Empty without systemd |
+| `lastPkgDbChangeAt` | time | mtime of the package database: when packages last changed |
+
+`apt` — the configuration merged as apt merges it (`apt-pkg` `configuration.cc`): `/etc/apt/apt.conf.d/*` in byte order of names apt takes (letters, digits, `_-:.`, no extension or `.conf` — `50unattended-upgrades.dpkg-old` is skipped), then `/etc/apt/apt.conf`; blocks, `::` lists, `#clear`, `#include`, `//`, `#` and `/* */` comments; tags case-insensitive. Checked against `apt-config dump` of Debian 12 and Ubuntu 24.04.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `configValid` | bool | apt accepts the files and every one was read. A line apt refuses stops apt — every apt command, unattended-upgrade included, fails until it is fixed |
+| `periodic` | object | `APT::Periodic::` `{enable, updatePackageLists, downloadUpgradeablePackages, unattendedUpgrade}` as written: days, with an `s`/`m`/`h`/`d` suffix, or `always`; `"0"` is off; `null` when not set. `enable` `"0"` switches all of them off |
+| `unattended` | object | `{installed, originsPatterns, allowedOrigins, autoReboot}`: `/usr/bin/unattended-upgrade` exists; `Unattended-Upgrade::Origins-Pattern` (Debian) and `::Allowed-Origins` (Ubuntu), at most 64 each, as written — `${distro_codename}` is not expanded; `Automatic-Reboot` (`true`/`false` and the other spellings apt takes). `truncated` when a list was cut |
+| `stamps` | object | mtimes of `/var/lib/apt/periodic/{update,update-success,download-upgradeable,upgrade}-stamp`: when apt.systemd.daily last ran each step. `updateSuccess` — the lists were fetched without an error; `upgrade` — unattended-upgrade ran |
+| `files[]` | object | `{path, mode, uid, gid}` of the files read: apt runs hooks from them as root |
+| `parseErrors[]` | object | The line apt stopped at, `{file, line, code}`: `block_without_name`, `malformed_tag`, `extra_junk`, `directive_not_top_level`, `unsupported_directive`, `clear_without_tree`, `junk_at_end`, `include_depth`, `too_many_files`, `too_many_nodes` |
+
+`dnfAutomatic` — `[commands]` of `/etc/dnf/automatic.conf`, or for dnf5 of `/usr/share/dnf5/dnf5-plugins/automatic.conf` overridden by `/etc/dnf/dnf5-plugins/automatic.conf`.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `installed` | bool | A configuration file of dnf-automatic is there |
+| `dnf5` | bool | The dnf5 plugin's files were read |
+| `applyUpdates`, `downloadUpdates` | string | As written (`yes`, `no`, `1`, `true`, …), `null` when not set. `dnf-automatic-install.timer` installs whatever `apply_updates` says |
+| `upgradeType` | string | `default` or `security` |
+| `reboot` | string | `never`, `when-changed`, `when-needed` |
+| `files[]` | object | `{path, mode, uid, gid}` |
+
 ## `roleSignals`
 
 Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi-uplink`); the backend derives the tags.
@@ -271,6 +306,7 @@ Signals for role tags (`docker-host`, `k8s-node`, `vpn-gw`, `hypervisor`, `multi
 | Command line of the sshd listener | Only `-f`, `-o`, `-p`, to parse the configuration as sshd does |
 | `authorized_keys` | Fingerprint, type, size and which options a key has; never the comment or the values of `from=`, `command=`, `environment=` |
 | sudoers, doas.conf | Principals, host and runas lists, flags of the rules; never the commands |
+| APT configuration, dnf-automatic configuration, Alpine cron jobs | The keys of `updates` in a form the tool accepts, origin patterns as written; never proxies, hooks or other keys, never the job lines — only which file runs `apk upgrade` |
 | Role marker files | Only that they exist; they are never opened (Xen capabilities excepted, a one-word file) |
 | AppArmor profiles | Counts by mode, no names |
 | A file the agent failed to parse | `{path, reason}`; logs carry `{section, file, line}` |
