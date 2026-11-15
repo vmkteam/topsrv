@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"slices"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -38,9 +39,10 @@ func serve(t *testing.T, h http.Handler) string {
 	return sock
 }
 
-// write answers a test request.
+// write answers a test request. The client may stop reading (at the end
+// of the JSON value, or at its limit): a broken pipe is not a failure.
 func write(t *testing.T, w http.ResponseWriter, b []byte) {
-	if _, err := w.Write(b); err != nil {
+	if _, err := w.Write(b); err != nil && !errors.Is(err, syscall.EPIPE) && !errors.Is(err, syscall.ECONNRESET) {
 		t.Errorf("test server: %v", err)
 	}
 }
@@ -141,6 +143,28 @@ func TestClientEngines(t *testing.T) {
 	}
 }
 
+func TestClientContainersStream(t *testing.T) {
+	t.Run("an answer at the limit is read", func(t *testing.T) {
+		body := `[{"Names": ["/a"], "Ports": []}]`
+		body += strings.Repeat(" ", MaxResponseSize-len(body))
+		c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { write(t, w, []byte(body)) })))
+		list, _, err := c.Containers(t.Context())
+		require.NoError(t, err)
+		assert.Len(t, list, 1)
+	})
+	t.Run("past the limit inside the list", func(t *testing.T) {
+		big := `[` + strings.Repeat(`{"Names": ["/a"]},`, MaxResponseSize/17) + `{"Names": ["/b"]}]`
+		c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { write(t, w, []byte(big)) })))
+		_, _, err := c.Containers(t.Context())
+		require.ErrorIs(t, err, ErrTooLarge)
+	})
+	t.Run("not a list", func(t *testing.T) {
+		c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { write(t, w, []byte(`{"message": "x"}`)) })))
+		_, _, err := c.Containers(t.Context())
+		require.ErrorIs(t, err, errNotList)
+	})
+}
+
 func TestClientRefuses(t *testing.T) {
 	t.Run("a redirect is not followed", func(t *testing.T) {
 		c := New(serve(t, http.RedirectHandler("http://192.0.2.1/", http.StatusFound)))
@@ -151,7 +175,7 @@ func TestClientRefuses(t *testing.T) {
 	})
 	t.Run("an answer past the limit", func(t *testing.T) {
 		c := New(serve(t, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-			write(t, w, make([]byte, MaxResponseSize+1))
+			write(t, w, []byte(`{"ServerVersion": "`+strings.Repeat("a", MaxResponseSize)+`"}`)) // valid JSON, to the end
 		})))
 		_, err := c.Info(t.Context())
 		require.ErrorIs(t, err, ErrTooLarge)

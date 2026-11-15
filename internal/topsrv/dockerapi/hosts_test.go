@@ -64,3 +64,51 @@ func TestDefaultHosts(t *testing.T) {
 	assert.Equal(t, "unix:///var/run/docker.sock", DefaultHosts(false)[0].String())
 	assert.Equal(t, "tcp://localhost:2376", DefaultHosts(true)[0].String(), "--tls without -H")
 }
+
+func TestResolveHosts(t *testing.T) {
+	type rh struct{ host, source string }
+	resolve := func(flags, file Settings, listens ...string) []rh {
+		hosts := ResolveHosts(flags, file, listens)
+		out := make([]rh, 0, len(hosts))
+		for _, h := range hosts {
+			s := h.String()
+			if h.Err != nil {
+				s = "invalid"
+			}
+			out = append(out, rh{s, h.Source})
+		}
+		return out
+	}
+	cases := []struct {
+		name        string
+		flags, file Settings
+		listens     []string
+		want        []rh
+	}{
+		{"-H wins", Settings{Hosts: []string{"unix:///var/run/docker.sock", "tcp://0.0.0.0:2375"}}, Settings{Hosts: []string{"tcp://:2376"}}, nil,
+			[]rh{{"unix:///var/run/docker.sock", SourceCmdline}, {"tcp://0.0.0.0:2375", SourceCmdline}}},
+		{"hosts of daemon.json", Settings{}, Settings{Hosts: []string{"unix://", "tcp://:2376"}}, nil,
+			[]rh{{"unix:///var/run/docker.sock", SourceConfig}, {"tcp://localhost:2376", SourceConfig}}},
+		{`"hosts": [] is the default`, Settings{}, Settings{Hosts: []string{}}, nil, []rh{{"unix:///var/run/docker.sock", SourceDefault}}},
+		{"blank -H is dropped", Settings{Hosts: []string{" "}}, Settings{}, nil, []rh{{"unix:///var/run/docker.sock", SourceDefault}}},
+		{"--tls alone", Settings{TLS: new(true)}, Settings{}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
+		{"tlsverify of daemon.json", Settings{}, Settings{TLSVerify: new(true)}, nil, []rh{{"tcp://localhost:2376", SourceDefault}}},
+		{"in input order", Settings{Hosts: []string{"tcp://ok:1", "ssh://x"}}, Settings{}, nil,
+			[]rh{{"tcp://ok:1", SourceCmdline}, {"invalid", SourceCmdline}}},
+		{"fd:// with the socket unit", Settings{Hosts: []string{"fd://"}}, Settings{}, []string{"/run/docker.sock", "2375"},
+			[]rh{{"fd://", SourceCmdline}, {"unix:///run/docker.sock", SourceSocketUnit}, {"tcp://[::]:2375", SourceSocketUnit}}},
+		{"fd:// without it", Settings{Hosts: []string{"fd://"}}, Settings{}, nil,
+			[]rh{{"fd://", SourceCmdline}, {"unix:///run/docker.sock", SourceDefault}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, resolve(tc.flags, tc.file, tc.listens...))
+		})
+	}
+}
+
+func TestSocket(t *testing.T) {
+	hosts := ResolveHosts(Settings{Hosts: []string{"tcp://0.0.0.0:2375", "unix://@abstract", "fd://"}}, Settings{}, []string{"/run/docker.sock"})
+	assert.Equal(t, "/run/docker.sock", Socket(hosts), "the first unix socket with a path")
+	assert.Empty(t, Socket(ResolveHosts(Settings{Hosts: []string{"tcp://0.0.0.0:2375"}}, Settings{}, nil)))
+}

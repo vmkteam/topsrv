@@ -2,8 +2,10 @@ package dockerapi
 
 import (
 	"bytes"
+	"cmp"
 	"encoding/json"
 	"errors"
+	"slices"
 	"strconv"
 	"strings"
 )
@@ -79,8 +81,12 @@ func (s *Settings) setString(name, v string) {
 	}
 }
 
-// isBoolOption: the flag takes no separate value.
-func isBoolOption(name string) bool { return (&Settings{}).setBool(name, false) }
+// boolOptions are the boolean options setBool takes (a test keeps the two
+// in step): such a flag takes no separate value.
+var boolOptions = []string{"userland-proxy", "iptables", "ip6tables", "allow-direct-routing", "icc",
+	"no-new-privileges", "live-restore", "tls", "tlsverify"}
+
+func isBoolOption(name string) bool { return slices.Contains(boolOptions, name) }
 
 // ParseArgs reads the options of a dockerd command line (pflag syntax:
 // --name=value, --name value, -H value, -Hvalue; a boolean --name or
@@ -144,30 +150,26 @@ func ParseConfig(b []byte) (Settings, error) {
 	}
 	var bad error
 	for key, v := range raw {
-		var (
-			flag bool
-			str  string
-			list []string
-		)
-		switch {
-		case isBoolOption(key):
-			if err := strictUnmarshal(v, &flag); err != nil {
-				bad = errConfigType
+		var err error
+		switch key {
+		case "hosts":
+			err = strictUnmarshal(v, &s.Hosts)
+		case "firewall-backend", "ip", "userns-remap":
+			var str string
+			if err = strictUnmarshal(v, &str); err == nil {
+				s.setString(key, str)
+			}
+		default:
+			var flag bool
+			if !isBoolOption(key) {
 				continue
 			}
-			s.setBool(key, flag)
-		case key == "hosts":
-			if err := strictUnmarshal(v, &list); err != nil {
-				bad = errConfigType
-				continue
+			if err = strictUnmarshal(v, &flag); err == nil {
+				s.setBool(key, flag)
 			}
-			s.Hosts = list
-		case key == "firewall-backend", key == "ip", key == "userns-remap":
-			if err := strictUnmarshal(v, &str); err != nil {
-				bad = errConfigType
-				continue
-			}
-			s.setString(key, str)
+		}
+		if err != nil {
+			bad = errConfigType
 		}
 	}
 	return s, bad
@@ -181,31 +183,22 @@ func strictUnmarshal(v json.RawMessage, dst any) error {
 	return json.Unmarshal(v, dst)
 }
 
-// Merge returns flags with the options daemon.json sets that the flags do
-// not. Hosts come from one of them, the flags first.
+// Merge returns the options in force: a flag, else daemon.json. Hosts are
+// ResolveHosts'.
 func Merge(flags, file Settings) Settings {
-	out := flags
-	if out.Hosts == nil {
-		out.Hosts = file.Hosts
+	return Settings{
+		ConfigFile:         flags.ConfigFile,
+		UserlandProxy:      cmp.Or(flags.UserlandProxy, file.UserlandProxy),
+		IPTables:           cmp.Or(flags.IPTables, file.IPTables),
+		IP6Tables:          cmp.Or(flags.IP6Tables, file.IP6Tables),
+		AllowDirectRouting: cmp.Or(flags.AllowDirectRouting, file.AllowDirectRouting),
+		ICC:                cmp.Or(flags.ICC, file.ICC),
+		NoNewPrivileges:    cmp.Or(flags.NoNewPrivileges, file.NoNewPrivileges),
+		LiveRestore:        cmp.Or(flags.LiveRestore, file.LiveRestore),
+		TLS:                cmp.Or(flags.TLS, file.TLS),
+		TLSVerify:          cmp.Or(flags.TLSVerify, file.TLSVerify),
+		FirewallBackend:    cmp.Or(flags.FirewallBackend, file.FirewallBackend),
+		DefaultBindIP:      cmp.Or(flags.DefaultBindIP, file.DefaultBindIP),
+		UsernsRemap:        cmp.Or(flags.UsernsRemap, file.UsernsRemap),
 	}
-	out.UserlandProxy = firstSet(flags.UserlandProxy, file.UserlandProxy)
-	out.IPTables = firstSet(flags.IPTables, file.IPTables)
-	out.IP6Tables = firstSet(flags.IP6Tables, file.IP6Tables)
-	out.AllowDirectRouting = firstSet(flags.AllowDirectRouting, file.AllowDirectRouting)
-	out.ICC = firstSet(flags.ICC, file.ICC)
-	out.NoNewPrivileges = firstSet(flags.NoNewPrivileges, file.NoNewPrivileges)
-	out.LiveRestore = firstSet(flags.LiveRestore, file.LiveRestore)
-	out.TLS = firstSet(flags.TLS, file.TLS)
-	out.TLSVerify = firstSet(flags.TLSVerify, file.TLSVerify)
-	out.FirewallBackend = firstSet(flags.FirewallBackend, file.FirewallBackend)
-	out.DefaultBindIP = firstSet(flags.DefaultBindIP, file.DefaultBindIP)
-	out.UsernsRemap = firstSet(flags.UsernsRemap, file.UsernsRemap)
-	return out
-}
-
-func firstSet[T any](a, b *T) *T {
-	if a != nil {
-		return a
-	}
-	return b
 }

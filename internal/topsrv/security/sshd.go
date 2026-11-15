@@ -1,7 +1,6 @@
 package security
 
 import (
-	"bytes"
 	"context"
 	"crypto/sha256"
 	"debug/elf"
@@ -10,7 +9,6 @@ import (
 	"io/fs"
 	"os"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
@@ -205,7 +203,7 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 		if p.name != "sshd" || !trustedProcess(sc, p) {
 			continue
 		}
-		if mnt, err := sc.readlink("/proc/" + p.pid + "/ns/mnt"); err == nil && hostMnt != "" && mnt != hostMnt {
+		if !sameNamespace(sc, p.pid, "mnt", hostMnt) {
 			continue // sshd in a container reads its own /etc/ssh
 		}
 		head, err := sc.readHead("/proc/"+p.pid+"/cmdline", argv0Limit)
@@ -220,26 +218,6 @@ func sshdFlags(sc *scanCtx, gaps *gapList) (sshdconf.Flags, sshdListener) {
 		return sshdconf.ParseFlags(args), l
 	}
 	return sshdconf.ParseFlags(sshdUnitArgs(sc)), sshdListener{}
-}
-
-// trustedProcess: a process that runs as root from a binary only root can
-// change. Any user can start ~/bin/sshd -f ~/evil, whose -f and Include
-// would otherwise make the agent read files of its choosing — or
-// ~/bin/dockerd naming a socket and a daemon.json.
-func trustedProcess(sc *scanCtx, p process) bool {
-	proc, err := sc.stat("/proc/" + p.pid)
-	if err != nil {
-		return false
-	}
-	if uid, _ := fileOwner(proc); uid != sc.trustedUID || p.exe == "" {
-		return false
-	}
-	exe, err := sc.stat(p.exe)
-	if err != nil {
-		return false
-	}
-	uid, _ := fileOwner(exe)
-	return uid == sc.trustedUID && exe.Mode().Perm()&0o022 == 0
 }
 
 // sshdUnitArgs reads the sshd arguments from the service unit (with its
@@ -300,39 +278,6 @@ func expandEnv(s string, env map[string]string) string {
 func sshdSocketActivated(sc *scanCtx) bool {
 	return sc.exists("/etc/systemd/system/sockets.target.wants/ssh.socket") ||
 		sc.exists("/etc/systemd/system/sockets.target.wants/sshd.socket")
-}
-
-// processStart is when a process started: field 22 of /proc/PID/stat, in
-// clock ticks since boot (USER_HZ, 100 on Linux), plus btime of /proc/stat.
-func processStart(sc *scanCtx, pid string) *time.Time {
-	stat, err := sc.read("/proc/"+pid+"/stat", smallFileLimit)
-	if err != nil {
-		return nil
-	}
-	_, after, ok := bytes.CutLast(stat, []byte(")")) // comm may hold spaces and parentheses
-	f := strings.Fields(string(after))
-	if !ok || len(f) < 20 {
-		return nil
-	}
-	ticks, err := strconv.ParseInt(f[19], 10, 64)
-	if err != nil {
-		return nil
-	}
-	b, err := sc.read("/proc/stat", procStatLimit)
-	if err != nil {
-		return nil
-	}
-	for line := range strings.SplitSeq(string(b), "\n") {
-		if v, ok := strings.CutPrefix(line, "btime "); ok {
-			btime, err := strconv.ParseInt(strings.TrimSpace(v), 10, 64)
-			if err != nil {
-				return nil
-			}
-			t := time.Unix(btime+ticks/100, 0).UTC()
-			return &t
-		}
-	}
-	return nil
 }
 
 // sshdPAMCompiled looks for libpam among the libraries the sshd binaries

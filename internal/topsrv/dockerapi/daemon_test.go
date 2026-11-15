@@ -65,8 +65,18 @@ func TestParseConfig(t *testing.T) {
 }
 
 func TestMerge(t *testing.T) {
-	flags := Settings{Hosts: []string{"fd://"}, IPTables: new(false)}
-	file := Settings{Hosts: []string{"tcp://0.0.0.0:2375"}, IPTables: new(true), UserlandProxy: new(false)}
-	assert.Equal(t, Settings{Hosts: []string{"fd://"}, IPTables: new(false), UserlandProxy: new(false)}, Merge(flags, file))
-	assert.Equal(t, []string{"tcp://0.0.0.0:2375"}, Merge(Settings{}, file).Hosts)
+	flags := Settings{ConfigFile: "/srv/d.json", IPTables: new(false)}
+	file := Settings{IPTables: new(true), UserlandProxy: new(false), FirewallBackend: new("nftables")}
+	assert.Equal(t, Settings{ConfigFile: "/srv/d.json", IPTables: new(false), UserlandProxy: new(false), FirewallBackend: new("nftables")},
+		Merge(flags, file), "a flag wins")
+}
+
+// TestBoolOptions keeps boolOptions and setBool in step.
+func TestBoolOptions(t *testing.T) {
+	for _, name := range boolOptions {
+		assert.True(t, (&Settings{}).setBool(name, true), name)
+	}
+	for _, name := range []string{"host", "ip", "firewall-backend", "debug"} {
+		assert.False(t, isBoolOption(name), name)
+	}
 }

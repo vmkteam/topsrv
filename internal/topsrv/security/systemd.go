@@ -41,6 +41,25 @@ func unitLines(sc *scanCtx, unit string) []string {
 	return out
 }
 
+// unitValues are the values of a directive in a unit and its drop-ins, in
+// order; an empty assignment resets the list, as systemd does for list
+// directives (ListenStream=, ExecStart=, EnvironmentFile=).
+func unitValues(sc *scanCtx, unit, key string) []string {
+	var out []string
+	for _, line := range unitLines(sc, unit) {
+		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
+		if !ok || strings.TrimSpace(k) != key {
+			continue
+		}
+		if v = strings.TrimSpace(v); v == "" {
+			out = nil
+			continue
+		}
+		out = append(out, v)
+	}
+	return out
+}
+
 // unitAlias: the unit file is a link to a unit of another name, as
 // systemctl's "alias" state.
 func unitAlias(sc *scanCtx, unit string) bool {

@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/vmkteam/topsrv/internal/topsrv/dockerapi"
+
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vmkteam/embedlog"
@@ -182,7 +184,7 @@ func requireMarkersRead(t *testing.T, d Data) {
 	dk := d.Sections[SectionDocker].Data.(dockerData)
 	assert.False(t, *dk.Config.IPTables, "daemon.json read")
 	assert.Equal(t, valueInvalid, *dk.Config.FirewallBackend)
-	assert.Equal(t, []dockerHost{{Proto: "unix", Addr: "/run/docker.sock", Source: hostFromCmdline}}, dk.Hosts, "the flags read")
+	assert.Equal(t, []dockerHost{{Proto: "unix", Addr: "/run/docker.sock", Source: dockerapi.SourceCmdline}}, dk.Hosts, "the flags read")
 
 	apt := d.Sections[SectionUpdates].Data.(updatesData).APT
 	require.NotNil(t, apt)

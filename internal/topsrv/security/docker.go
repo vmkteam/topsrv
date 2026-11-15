@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"fmt"
 	"io/fs"
 	"net"
 	"net/netip"
@@ -23,15 +24,6 @@ const (
 	dockerConfigLimit = 1 << 20
 	dockerAPIBudget   = 5 * time.Second // the whole conversation with dockerd
 	maxPublished      = 1000
-	dockerStockSocket = "/run/docker.sock" // ListenStream of the docker.socket Docker ships
-)
-
-// Sources of dockerHost.
-const (
-	hostFromCmdline    = "cmdline"
-	hostFromConfig     = "config"
-	hostFromSocketUnit = "socketUnit"
-	hostFromDefault    = "default"
 )
 
 // Forms of what dockerd answers and of daemon.json values: anything else is
@@ -122,25 +114,24 @@ func collectDocker(ctx context.Context, sc *scanCtx) Section {
 	flags := dockerapi.ParseArgs(strings.Split(strings.TrimRight(string(head), "\x00"), "\x00"))
 
 	file, fileSettings := readDockerConfig(sc, cmp.Or(flags.ConfigFile, dockerapi.DefaultConfigFile), &gaps)
-	settings := dockerapi.Merge(flags, fileSettings)
-	d.Config = dockerConfigOf(settings, file)
-	hosts, socket := dockerHosts(sc, flags, fileSettings, settings)
-	d.Hosts = hosts
+	d.Config = dockerConfigOf(dockerapi.Merge(flags, fileSettings), file)
+	hosts := dockerapi.ResolveHosts(flags, fileSettings, unitValues(sc, dockerSocketUnit, "ListenStream"))
+	d.Hosts = dockerHostsOf(hosts)
+	socket := dockerapi.Socket(hosts)
 	if socket == "" {
 		return collected(gaps, d) // TCP only, or an abstract socket: not talked to
 	}
 	fi, err := sc.lstat(socket)
-	switch {
-	case err != nil:
+	if err == nil && fi.Mode()&fs.ModeSocket == 0 {
+		err = errNotRegular
+	}
+	if err != nil {
 		gaps.add(socket, err)
-		return collected(gaps, d)
-	case fi.Mode()&fs.ModeSocket == 0:
-		gaps.add(socket, errNotRegular)
 		return collected(gaps, d)
 	}
 	m := metaOf(socket, fi)
 	d.Socket = &m
-	d.readAPI(ctx, sc, socket, &gaps)
+	gaps.add(socket, dockerErr(d.readAPI(ctx, sc.newDockerClient(sc.root+socket))))
 	return collected(gaps, d)
 }
 
@@ -161,13 +152,6 @@ func dockerDaemon(sc *scanCtx) (*process, error) {
 		}
 	}
 	return nil, err
-}
-
-// sameNamespace: the process is in the namespace of PID 1, or that cannot
-// be told.
-func sameNamespace(sc *scanCtx, pid, kind, host string) bool {
-	ns, err := sc.readlink("/proc/" + pid + "/ns/" + kind)
-	return err != nil || host == "" || ns == host
 }
 
 // readDockerConfig reads daemon.json: nil without the file.
@@ -207,102 +191,58 @@ func dockerConfigOf(s dockerapi.Settings, file *dockerConfigFile) dockerConfig {
 
 func isIPAddr(v string) bool { return net.ParseIP(v) != nil }
 
-// dockerHosts are the addresses dockerd listens on, as dockerd picks them:
-// -H, else hosts of daemon.json, else the default; fd:// takes the sockets
-// of docker.socket. socket is the first unix socket, the one to talk to.
-func dockerHosts(sc *scanCtx, flags, file, s dockerapi.Settings) (hosts []dockerHost, socket string) {
-	raw, source := flags.Hosts, hostFromCmdline
-	if raw == nil {
-		raw, source = file.Hosts, hostFromConfig
-	}
-	var parsed []dockerapi.Host
-	if raw == nil {
-		parsed, source = dockerapi.DefaultHosts(isTrue(s.TLS) || isTrue(s.TLSVerify)), hostFromDefault
-	}
-	hosts = []dockerHost{}
-	add := func(h dockerapi.Host, src string) {
-		hosts = append(hosts, dockerHost{Proto: h.Proto, Addr: h.Addr, Source: src})
-		if socket == "" && h.Proto == dockerapi.ProtoUnix && strings.HasPrefix(h.Addr, "/") {
-			socket = h.Addr
-		}
-	}
-	for _, r := range raw {
-		h, err := dockerapi.ParseHost(r)
-		if err != nil {
-			hosts = append(hosts, dockerHost{Proto: valueInvalid, Source: source})
+// dockerHostsOf is the wire form of the hosts: an address dockerd refuses
+// is "invalid", never sent as written.
+func dockerHostsOf(hosts []dockerapi.ResolvedHost) []dockerHost {
+	out := make([]dockerHost, 0, len(hosts))
+	for _, h := range hosts {
+		if h.Err != nil {
+			out = append(out, dockerHost{Proto: valueInvalid, Source: h.Source})
 			continue
 		}
-		parsed = append(parsed, h)
-	}
-	for _, h := range parsed {
-		add(h, source)
-		if h.Proto != dockerapi.ProtoFD {
-			continue
-		}
-		listens := socketUnitListens(sc)
-		for _, l := range listens {
-			add(l, hostFromSocketUnit)
-		}
-		if len(listens) == 0 { // no docker.socket found: its stock path
-			add(dockerapi.Host{Proto: dockerapi.ProtoUnix, Addr: dockerStockSocket}, hostFromDefault)
-		}
-	}
-	return hosts, socket
-}
-
-func isTrue(b *bool) bool { return b != nil && *b }
-
-// socketUnitListens are the ListenStream= of docker.socket with its
-// drop-ins; an empty ListenStream= resets the list, as systemd does.
-func socketUnitListens(sc *scanCtx) []dockerapi.Host {
-	var out []dockerapi.Host
-	for _, line := range unitLines(sc, dockerSocketUnit) {
-		k, v, ok := strings.Cut(strings.TrimSpace(line), "=")
-		if !ok || strings.TrimSpace(k) != "ListenStream" {
-			continue
-		}
-		if v = strings.TrimSpace(v); v == "" {
-			out = nil
-			continue
-		}
-		if h, err := dockerapi.ListenStreamHost(v); err == nil {
-			out = append(out, h)
-		}
+		out = append(out, dockerHost{Proto: h.Proto, Addr: h.Addr, Source: h.Source})
 	}
 	return out
 }
 
+// errSkipped: entries of /containers/json of a shape the agent does not
+// read; the ports listed are not all of them.
+var errSkipped = fmt.Errorf("docker: containers skipped: %w", errParse)
+
 // readAPI reads the version, the firewall backend and the published ports
-// from dockerd, within dockerAPIBudget. A failed request is a gap on the
-// socket; what came before it is kept.
-func (d *dockerData) readAPI(ctx context.Context, sc *scanCtx, socket string, gaps *gapList) {
+// from dockerd, within dockerAPIBudget. The error is of the request that
+// failed; what came before it is kept.
+func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client) error {
 	ctx, cancel := context.WithTimeout(ctx, dockerAPIBudget)
 	defer cancel()
-	c := sc.newDockerClient(sc.root + socket)
 	api, err := c.Ping(ctx)
 	if err != nil {
-		gaps.add(socket, dockerErr(err))
-		return
+		return err
 	}
 	d.APIVersion = checked(nonEmpty(api), dockerVersionRe.MatchString)
 	info, err := c.Info(ctx)
 	if err != nil {
-		gaps.add(socket, dockerErr(err))
-		return
+		return err
 	}
 	d.Version = checked(nonEmpty(info.ServerVersion), dockerVersionRe.MatchString)
 	d.FirewallBackend = checked(nonEmpty(info.FirewallBackend), dockerWordRe.MatchString)
 	d.SecurityOptions = make([]string, 0, len(info.SecurityOptions))
 	for _, o := range info.SecurityOptions {
-		d.SecurityOptions = append(d.SecurityOptions, *checked(&o, dockerWordRe.MatchString))
+		if !dockerWordRe.MatchString(o) {
+			o = valueInvalid
+		}
+		d.SecurityOptions = append(d.SecurityOptions, o)
 	}
 	d.ContainersRunning = info.ContainersRunning
-	list, _, err := c.Containers(ctx)
+	list, skipped, err := c.Containers(ctx)
 	if err != nil {
-		gaps.add(socket, dockerErr(err))
-		return
+		return err
 	}
 	d.Published, d.PublishedTruncated = publishedPorts(list)
+	if skipped > 0 {
+		return errSkipped
+	}
+	return nil
 }
 
 // newDockerClient is dockerapi.New, or the test's.
@@ -322,6 +262,9 @@ func nonEmpty(s string) *string {
 
 // dockerErr maps an API failure to the error reasonOf reads.
 func dockerErr(err error) error {
+	if err == nil {
+		return nil
+	}
 	var (
 		se *dockerapi.StatusError
 		ne net.Error
@@ -353,8 +296,11 @@ func publishedPorts(list []dockerapi.Container) ([]dockerPort, bool) {
 			if p.PublicPort < 1 || p.PublicPort > 65535 {
 				continue // exposed, not published
 			}
+			if !dockerProtocolsRe.MatchString(p.Type) {
+				p.Type = valueInvalid
+			}
 			out = append(out, dockerPort{Container: name, IP: portIP(p.IP), PublicPort: p.PublicPort,
-				PrivatePort: p.PrivatePort, Type: *checked(&p.Type, dockerProtocolsRe.MatchString)})
+				PrivatePort: p.PrivatePort, Type: p.Type})
 		}
 	}
 	slices.SortFunc(out, func(a, b dockerPort) int {

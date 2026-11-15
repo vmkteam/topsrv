@@ -115,8 +115,8 @@ func TestDocker(t *testing.T) {
 	assert.Equal(t, []string{"seccomp", "cgroupns"}, d.SecurityOptions)
 	assert.Equal(t, 3, *d.ContainersRunning)
 	assert.Equal(t, []dockerHost{
-		{Proto: "fd", Addr: "", Source: hostFromCmdline},
-		{Proto: "unix", Addr: "/run/docker.sock", Source: hostFromSocketUnit},
+		{Proto: "fd", Addr: "", Source: dockerapi.SourceCmdline},
+		{Proto: "unix", Addr: "/run/docker.sock", Source: dockerapi.SourceSocketUnit},
 	}, d.Hosts)
 	require.NotNil(t, d.Socket)
 	assert.Equal(t, "/run/docker.sock", d.Socket.Path)
@@ -139,24 +139,15 @@ func TestDocker(t *testing.T) {
 		{Container: "web", IP: "127.0.0.1", PublicPort: 9000, PrivatePort: 9000, Type: "tcp"},
 	}, d.Published, "internal publishes nothing")
 	assert.False(t, d.PublishedTruncated)
-}
 
-func TestDockerEngines(t *testing.T) {
-	for _, tc := range []struct{ version, backend string }{{"27", ""}, {"28", "iptables"}} {
-		t.Run(tc.version, func(t *testing.T) {
-			sc := fixture(t, dockerFixture())
-			serveDocker(t, sc, engineHandler(t, tc.version))
-			sec, d := dockerOf(t, sc)
-			require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
-			assert.True(t, strings.HasPrefix(*d.Version, tc.version+"."))
-			if tc.backend == "" {
-				assert.Nil(t, d.FirewallBackend, "before API 1.49: iptables, not reported")
-			} else {
-				assert.Equal(t, tc.backend, *d.FirewallBackend)
-			}
-			assert.Len(t, d.Published, 6)
-		})
-	}
+	t.Run("before API 1.49: no firewall backend", func(t *testing.T) {
+		sc := fixture(t, dockerFixture())
+		serveDocker(t, sc, apiHandler(t, "1.47", `{"ServerVersion": "27.5.1", "FirewallBackend": null}`, `[]`))
+		sec, d := dockerOf(t, sc)
+		require.Equal(t, StatusOK, sec.Status, "gaps: %v", sec.Gaps)
+		assert.Nil(t, d.FirewallBackend, "iptables then, not reported")
+		assert.Equal(t, []dockerPort{}, d.Published, "read, nothing published")
+	})
 }
 
 func TestDockerAbsent(t *testing.T) {
@@ -206,6 +197,14 @@ func TestDockerSocket(t *testing.T) {
 		sec, _ := dockerOf(t, sc)
 		assert.Equal(t, []Gap{{Path: "/run/docker.sock", Reason: ReasonNotRegular}}, sec.Gaps)
 	})
+	t.Run("an entry of an odd shape", func(t *testing.T) {
+		sc := fixture(t, dockerFixture())
+		serveDocker(t, sc, apiHandler(t, "1.51", `{"ServerVersion": "28.5.2"}`,
+			`[{"Names": 7}, {"Names": ["/web"], "Ports": [{"IP": "0.0.0.0", "PrivatePort": 80, "PublicPort": 8080, "Type": "tcp"}]}]`))
+		sec, d := dockerOf(t, sc)
+		assert.Equal(t, []Gap{{Path: "/run/docker.sock", Reason: ReasonParseError}}, sec.Gaps, "the list is not complete")
+		assert.Len(t, d.Published, 1, "the rest is kept")
+	})
 	t.Run("a daemon that refuses", func(t *testing.T) {
 		sc := fixture(t, dockerFixture())
 		serveDocker(t, sc, http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusForbidden) }))
@@ -221,25 +220,25 @@ func TestDockerHosts(t *testing.T) {
 		name    string
 		cmdline string
 		config  string
-		unit    bool
+		noUnit  bool
 		want    []dockerHost
 	}{
 		{"-H wins over daemon.json", "dockerd\x00-H\x00unix:///var/run/docker.sock\x00-H\x00tcp://0.0.0.0:2375\x00", `{"hosts": ["tcp://:2376"]}`, true,
-			[]dockerHost{{"unix", "/var/run/docker.sock", hostFromCmdline}, {"tcp", "0.0.0.0:2375", hostFromCmdline}}},
+			[]dockerHost{{"unix", "/var/run/docker.sock", dockerapi.SourceCmdline}, {"tcp", "0.0.0.0:2375", dockerapi.SourceCmdline}}},
 		{"hosts of daemon.json", "dockerd\x00", `{"hosts": ["unix://", "tcp://:2376"]}`, true,
-			[]dockerHost{{"unix", "/var/run/docker.sock", hostFromConfig}, {"tcp", "localhost:2376", hostFromConfig}}},
-		{"neither", "dockerd\x00", `{}`, true, []dockerHost{{"unix", "/var/run/docker.sock", hostFromDefault}}},
-		{"--tls alone: TCP", "dockerd\x00--tls\x00", `{}`, true, []dockerHost{{"tcp", "localhost:2376", hostFromDefault}}},
-		{"an address dockerd refuses", "dockerd\x00-H\x00ssh://host\x00", `{}`, true, []dockerHost{{Proto: valueInvalid, Source: hostFromCmdline}}},
+			[]dockerHost{{"unix", "/var/run/docker.sock", dockerapi.SourceConfig}, {"tcp", "localhost:2376", dockerapi.SourceConfig}}},
+		{"neither", "dockerd\x00", `{}`, true, []dockerHost{{"unix", "/var/run/docker.sock", dockerapi.SourceDefault}}},
+		{"--tls alone: TCP", "dockerd\x00--tls\x00", `{}`, true, []dockerHost{{"tcp", "localhost:2376", dockerapi.SourceDefault}}},
+		{"an address dockerd refuses", "dockerd\x00-H\x00ssh://host\x00", `{}`, true, []dockerHost{{Proto: valueInvalid, Source: dockerapi.SourceCmdline}}},
 		{"docker.socket on TCP too", "dockerd\x00-H\x00fd://\x00", `{}`, false,
-			[]dockerHost{{"fd", "", hostFromCmdline}, {"unix", "/run/docker.sock", hostFromSocketUnit}, {"tcp", "[::]:2375", hostFromSocketUnit}}},
+			[]dockerHost{{"fd", "", dockerapi.SourceCmdline}, {"unix", "/run/docker.sock", dockerapi.SourceSocketUnit}, {"tcp", "[::]:2375", dockerapi.SourceSocketUnit}}},
 		{"fd:// without the unit", "dockerd\x00-H\x00fd://\x00", `{}`, true,
-			[]dockerHost{{"fd", "", hostFromCmdline}, {"unix", "/run/docker.sock", hostFromDefault}}},
+			[]dockerHost{{"fd", "", dockerapi.SourceCmdline}, {"unix", "/run/docker.sock", dockerapi.SourceDefault}}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			files := merge(dockerFixture(), map[string]string{"proc/300/cmdline": tc.cmdline, "etc/docker/daemon.json": tc.config})
-			if tc.unit {
+			if tc.noUnit {
 				delete(files, "lib/systemd/system/docker.socket")
 			} else {
 				files["etc/systemd/system/docker.socket.d/tcp.conf"] = "[Socket]\nListenStream=2375\n"

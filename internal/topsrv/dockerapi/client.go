@@ -64,7 +64,7 @@ func New(path string) *Client {
 // requests use it. "" when the daemon sends none or an odd one: requests
 // then go without a version.
 func (c *Client) Ping(ctx context.Context) (string, error) {
-	_, h, err := c.get(ctx, "/_ping")
+	h, err := c.do(ctx, "/_ping", func(r io.Reader) error { _, err := io.Copy(io.Discard, r); return err })
 	if err != nil {
 		return "", err
 	}
@@ -85,27 +85,24 @@ type Info struct {
 // Info reads /info. A field of an unexpected type is left empty: one odd
 // field does not cost the rest.
 func (c *Client) Info(ctx context.Context) (Info, error) {
-	b, _, err := c.get(ctx, c.versioned("/info"))
-	if err != nil {
-		return Info{}, err
-	}
-	var raw map[string]json.RawMessage
-	if err = json.Unmarshal(b, &raw); err != nil {
+	var raw struct{ ServerVersion, FirewallBackend, SecurityOptions, ContainersRunning json.RawMessage }
+	if err := c.get(ctx, c.versioned("/info"), func(r io.Reader) error { return json.NewDecoder(r).Decode(&raw) }); err != nil {
 		return Info{}, err
 	}
 	var (
-		info Info
-		fb   struct{ Driver string }
-		opts []string
+		info    Info
+		version string
+		fb      struct{ Driver string }
+		opts    []string
+		running int
 	)
-	var version string
-	if json.Unmarshal(raw["ServerVersion"], &version) == nil {
+	if json.Unmarshal(raw.ServerVersion, &version) == nil {
 		info.ServerVersion = version
 	}
-	if json.Unmarshal(raw["FirewallBackend"], &fb) == nil {
+	if json.Unmarshal(raw.FirewallBackend, &fb) == nil {
 		info.FirewallBackend = fb.Driver
 	}
-	if json.Unmarshal(raw["SecurityOptions"], &opts) == nil {
+	if json.Unmarshal(raw.SecurityOptions, &opts) == nil {
 		for _, o := range opts {
 			for kv := range strings.SplitSeq(o, ",") { // "name=seccomp,profile=builtin"
 				if name, ok := strings.CutPrefix(kv, "name="); ok {
@@ -114,8 +111,7 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 			}
 		}
 	}
-	var running int
-	if json.Unmarshal(raw["ContainersRunning"], &running) == nil {
+	if json.Unmarshal(raw.ContainersRunning, &running) == nil {
 		info.ContainersRunning = &running
 	}
 	return info, nil
@@ -135,28 +131,49 @@ type Port struct {
 	Type        string
 }
 
-// Containers lists the running containers. An entry that does not decode
-// is skipped; the count of those is returned.
-func (c *Client) Containers(ctx context.Context) (list []Container, skipped int, err error) {
-	b, _, err := c.get(ctx, c.versioned("/containers/json"))
+// Containers lists the running containers, decoded one entry at a time:
+// a host with thousands of them is not held twice in memory. An entry of an
+// unexpected shape is skipped and counted.
+func (c *Client) Containers(ctx context.Context) ([]Container, int, error) {
+	var (
+		list    []Container
+		skipped int
+	)
+	err := c.get(ctx, c.versioned("/containers/json"), func(r io.Reader) error {
+		var err error
+		list, skipped, err = decodeContainers(r)
+		return err
+	})
+	return list, skipped, err
+}
+
+func decodeContainers(r io.Reader) (list []Container, skipped int, err error) {
+	dec := json.NewDecoder(r)
+	t, err := dec.Token()
 	if err != nil {
 		return nil, 0, err
 	}
-	var raw []json.RawMessage
-	if err = json.Unmarshal(b, &raw); err != nil {
-		return nil, 0, err
+	if t != json.Delim('[') {
+		return nil, 0, errNotList
 	}
-	list = make([]Container, 0, len(raw))
-	for _, r := range raw {
-		var ct Container
-		if json.Unmarshal(r, &ct) != nil {
+	for dec.More() {
+		var (
+			ct Container
+			te *json.UnmarshalTypeError
+		)
+		switch err = dec.Decode(&ct); {
+		case errors.As(err, &te): // the entry was read whole; its shape is odd
 			skipped++
-			continue
+		case err != nil:
+			return list, skipped, err
+		default:
+			list = append(list, ct)
 		}
-		list = append(list, ct)
 	}
 	return list, skipped, nil
 }
+
+var errNotList = errors.New("dockerapi: not a list")
 
 func (c *Client) versioned(path string) string {
 	if c.apiVersion == "" {
@@ -165,28 +182,48 @@ func (c *Client) versioned(path string) string {
 	return "/v" + c.apiVersion + path
 }
 
-// get is the one request this client makes: GET, the body up to
-// MaxResponseSize.
-func (c *Client) get(ctx context.Context, path string) ([]byte, http.Header, error) {
+// get is the one request this client makes: GET, the body read by
+// decode up to MaxResponseSize.
+func (c *Client) get(ctx context.Context, path string, decode func(io.Reader) error) error {
+	_, err := c.do(ctx, path, decode)
+	return err
+}
+
+func (c *Client) do(ctx context.Context, path string, decode func(io.Reader) error) (http.Header, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, "http://docker"+path, nil)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	req.Header.Set("User-Agent", "topsrv")
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return nil, nil, err
+		return nil, err
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {
-		return nil, nil, &StatusError{Code: resp.StatusCode}
+		return nil, &StatusError{Code: resp.StatusCode}
 	}
-	b, err := io.ReadAll(io.LimitReader(resp.Body, MaxResponseSize+1))
-	if err != nil {
-		return nil, nil, err
+	return resp.Header, decode(&capped{r: resp.Body, n: MaxResponseSize})
+}
+
+// capped reads up to n bytes and fails with ErrTooLarge past them, unlike
+// io.LimitReader, whose EOF would read as a truncated answer.
+type capped struct {
+	r io.Reader
+	n int64
+}
+
+func (c *capped) Read(p []byte) (int, error) {
+	if c.n <= 0 {
+		var probe [1]byte
+		n, err := c.r.Read(probe[:])
+		if n > 0 {
+			return 0, ErrTooLarge
+		}
+		return 0, err // io.EOF: the answer ended right at the limit
 	}
-	if len(b) > MaxResponseSize {
-		return nil, nil, ErrTooLarge
-	}
-	return b, resp.Header, nil
+	p = p[:min(int64(len(p)), c.n)]
+	n, err := c.r.Read(p)
+	c.n -= int64(n)
+	return n, err
 }
