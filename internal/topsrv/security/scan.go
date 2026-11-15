@@ -3,6 +3,7 @@ package security
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -53,6 +54,10 @@ type scanCtx struct {
 	// test serves a socket at a short path: the fixture's would pass the
 	// 104 bytes a socket address takes on macOS.
 	dockerClient func(path string) *dockerapi.Client
+	// nftDial opens the netlink connection of the firewall section in the
+	// namespace at netns ("" the agent's); nil is nftables.Dial. A test
+	// replays a recording, a dry-run records.
+	nftDial nftDialer
 }
 
 // depResult is how a section came out and the typed result later sections
@@ -503,6 +508,7 @@ var allSections = []sectionDef{
 	{name: SectionAuthorizedKeys, budget: 10 * time.Second, host: true, run: noResult(collectAuthorizedKeys)},
 	{name: SectionSudoers, budget: 3 * time.Second, host: true, run: noResult(collectSudoers)},
 	{name: SectionUpdates, budget: 2 * time.Second, host: true, run: noResult(collectUpdates)},
+	{name: SectionFirewall, budget: firewallBudget, host: true, run: collectFirewall},
 	{name: SectionDocker, budget: dockerAPIBudget + 3*time.Second, host: true, run: noResult(collectDocker)},
 	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
 }
@@ -519,10 +525,14 @@ type cachedSection struct {
 
 // pass runs the sections of t — every enabled one when t lists none — and
 // builds a full snapshot from the section cache: an unscheduled pass
-// rebuilds only its sections.
-func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
+// rebuilds only its sections. changed: a section run came out other than in
+// its last run, as the backend sees it.
+func (c *Collector) pass(ctx context.Context, t Trigger) (p inventory.Payload, changed bool) {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep, trustedUID: c.trustedUID}
+	sc := &scanCtx{
+		root: c.root, timeSync: c.timeSync, key: c.key, now: start, deps: c.dep, trustedUID: c.trustedUID,
+		nftDial: c.nftDial,
+	}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {
@@ -530,7 +540,7 @@ func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 			continue
 		}
 		sec, res := c.runSection(ctx, def, sc)
-		c.store(def.name, sec, res, start)
+		changed = c.store(def.name, sec, res, start) || changed
 	}
 
 	host := inventory.DetectHost(c.root)
@@ -546,7 +556,7 @@ func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 			Environment:   envSec,
 			Sections:      c.cachedSections(start),
 		},
-	}
+	}, changed
 }
 
 func (c *Collector) environment(sc *scanCtx) (Section, envData) {
@@ -639,12 +649,25 @@ func (c *Collector) endInflight(name string) {
 	c.mu.Unlock()
 }
 
-func (c *Collector) store(name string, sec Section, res any, at time.Time) {
+// store caches a section run and reports whether it differs from the last
+// run as the backend sees it: the duration aside.
+func (c *Collector) store(name string, sec Section, res any, at time.Time) (changed bool) {
 	c.recordMetrics(name, sec)
 	c.mu.Lock()
+	prev, had := c.cache[name]
 	c.cache[name] = cachedSection{sec: sec, at: at}
 	c.results[name] = depResult{sec: sec, res: res} // a fresh run replaces a stale result, a failed one too
 	c.mu.Unlock()
+	return !had || !sameForBackend(prev.sec, sec)
+}
+
+// sameForBackend compares two runs of a section on the wire, without their
+// durations.
+func sameForBackend(a, b Section) bool {
+	a.DurationMs, b.DurationMs = 0, 0
+	ja, erra := json.Marshal(a)
+	jb, errb := json.Marshal(b)
+	return erra == nil && errb == nil && bytes.Equal(ja, jb)
 }
 
 // dep is scanCtx.deps: the last run of a section, for the sections after

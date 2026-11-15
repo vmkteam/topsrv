@@ -8,9 +8,11 @@ import (
 	"runtime"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
+	"github.com/vmkteam/topsrv/internal/topsrv/nftables"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/vmkteam/embedlog"
@@ -37,6 +39,9 @@ type Collector struct {
 	delay      time.Duration // before the first pass
 	wakeup     chan struct{} // Trigger → Run; the triggers themselves are in queued
 	key        tokenKey
+	// nftDial opens the netlink connections of the firewall section and of
+	// the gen trigger: a socket, a recording in tests and dry-run.
+	nftDial nftDialer
 
 	scanDuration *prometheus.Desc
 	scanErrors   *prometheus.Desc
@@ -67,6 +72,7 @@ func NewCollector(logger embedlog.Logger, cfg Config, stateDir string) *Collecto
 		stateDir:  stateDir,
 		supported: runtime.GOOS == "linux",
 		timeSync:  timeSyncReader(),
+		nftDial:   socketDialer,
 		now:       time.Now,
 		delay:     startDelay(),
 		wakeup:    make(chan struct{}, 1),
@@ -81,7 +87,7 @@ func NewCollector(logger embedlog.Logger, cfg Config, stateDir string) *Collecto
 		scanErrors: prometheus.NewDesc("topsrv_security_scan_errors_total",
 			"Security sections that came out unknown, or with a gap, by reason.", []string{labelSection, "reason"}, nil),
 		lastScanTS: prometheus.NewDesc("topsrv_security_last_scan_timestamp_seconds",
-			"Unix time of the last security pass.", nil, nil),
+			"Unix time of the last security snapshot built for sending; an unscheduled pass that changed nothing does not count.", nil, nil),
 		lastPushTS: prometheus.NewDesc("topsrv_security_last_push_timestamp_seconds",
 			"Unix time of the last security snapshot accepted by /v1/inventory.", nil, nil),
 		snapshotSize: prometheus.NewDesc("topsrv_security_snapshot_bytes",
@@ -166,11 +172,17 @@ func (c *Collector) Trigger(cause string, sections ...string) {
 
 // Run scans on schedule until ctx is cancelled: first after a random 1–5
 // minute delay, then every Interval ±10%, plus unscheduled passes from
-// Trigger, at most one per minUnscheduledGap.
+// Trigger, at most one per minUnscheduledGap. An unscheduled pass is sent
+// only when a section it rebuilt changed for the backend. Trigger sources
+// run beside it and limit their own rate: the nftables generation
+// (watchGen).
 func (c *Collector) Run(ctx context.Context) {
 	c.Print(ctx, "security: started", "interval", c.cfg.ParsedInterval(), "sections", len(c.sections))
 	c.key = c.loadKey(ctx)
 	s := newSchedule(c.now(), c.cfg.ParsedInterval(), c.delay)
+	if c.supported && c.cfg.SectionEnabled(SectionFirewall) {
+		go c.watchGen(ctx)
+	}
 	for {
 		timer := time.NewTimer(s.wake().Sub(c.now()))
 		select {
@@ -187,25 +199,41 @@ func (c *Collector) Run(ctx context.Context) {
 			continue
 		case <-timer.C:
 		}
-		if t, ok := s.due(c.now()); ok {
-			if p, ok := c.recoverPass(ctx, func() inventory.Payload { return c.pass(ctx, t) }); ok {
-				c.finish(ctx, p)
-			}
-		}
+		c.runDue(ctx, s, c.now())
+	}
+}
+
+// runDue runs the pass due at now, if any, and queues its snapshot: always
+// for a full pass, for an unscheduled one only when a section it rebuilt
+// changed for the backend.
+func (c *Collector) runDue(ctx context.Context, s *schedule, now time.Time) {
+	t, ok := s.due(now)
+	if !ok {
+		return
+	}
+	pass := func() (inventory.Payload, bool) { return c.pass(ctx, t) }
+	p, changed, ok := c.recoverPass(ctx, pass)
+	switch {
+	case !ok:
+	case t.Sections == nil || changed:
+		c.finish(ctx, p)
+	default:
+		c.Print(ctx, "security: unscheduled pass changed nothing, not sent", "trigger", t.Cause)
 	}
 }
 
 // recoverPass runs a pass. Sections recover on their own; a panic outside
 // them (environment, host facts) drops this snapshot rather than the agent,
 // logged with its type and site only.
-func (c *Collector) recoverPass(ctx context.Context, pass func() inventory.Payload) (p inventory.Payload, ok bool) {
+func (c *Collector) recoverPass(ctx context.Context, pass func() (inventory.Payload, bool)) (p inventory.Payload, changed, ok bool) {
 	defer func() {
 		if r := recover(); r != nil {
 			c.Error(ctx, "security: pass panicked", "error", fmt.Sprintf("panic %T at %s", r, panicSite()))
 			ok = false
 		}
 	}()
-	return pass(), true
+	p, changed = pass()
+	return p, changed, true
 }
 
 // finish records a pass and queues its snapshot for the pusher.
@@ -267,13 +295,22 @@ func (c *Collector) recordMetrics(name string, sec Section) {
 	}
 }
 
-// DryRun runs one pass of the sections (every enabled one when empty) and
-// returns the snapshot as indented JSON, exactly what would be sent, with
-// the agentVersion the pusher stamps. It writes nothing: the existing token
-// key is used, or an ephemeral one.
-func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir, version string, sections []string) ([]byte, error) {
+// DryRunOptions narrow a dry-run.
+type DryRunOptions struct {
+	// Sections to collect; every enabled one when empty.
+	Sections []string
+	// NetlinkDump: a directory to save the replies of the kernel to, for
+	// test fixtures (-security-dump-netlink).
+	NetlinkDump string
+}
+
+// DryRun runs one pass of the sections and returns the snapshot as indented
+// JSON, exactly what would be sent, with the agentVersion the pusher
+// stamps. It writes nothing but the netlink dump asked for: the existing
+// token key is used, or an ephemeral one.
+func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir, version string, opts DryRunOptions) ([]byte, error) {
 	c := NewCollector(logger, cfg, stateDir)
-	for _, name := range sections {
+	for _, name := range opts.Sections {
 		switch {
 		case !slices.ContainsFunc(allSections, func(d sectionDef) bool { return d.name == name }):
 			return nil, fmt.Errorf("security: section %q is not collected by this version", name)
@@ -281,13 +318,22 @@ func DryRun(ctx context.Context, logger embedlog.Logger, cfg Config, stateDir, v
 			return nil, fmt.Errorf("security: section %q is disabled in [Security].DisabledSections", name)
 		}
 	}
-	if len(sections) > 0 {
-		c.sections = slices.DeleteFunc(c.sections, func(d sectionDef) bool { return !slices.Contains(sections, d.name) })
+	if len(opts.Sections) > 0 {
+		c.sections = slices.DeleteFunc(c.sections, func(d sectionDef) bool { return !slices.Contains(opts.Sections, d.name) })
 	}
 	c.key = existingOrEphemeralKey(stateDir)
-	p, ok := c.recoverPass(ctx, func() inventory.Payload { return c.pass(ctx, Trigger{Cause: "dry-run"}) })
+	var rec atomic.Pointer[nftables.Recorder]
+	if opts.NetlinkDump != "" {
+		c.nftDial = recordingDialer(c.nftDial, &rec)
+	}
+	p, _, ok := c.recoverPass(ctx, func() (inventory.Payload, bool) { return c.pass(ctx, Trigger{Cause: "dry-run"}) })
 	if !ok {
 		return nil, errors.New("security: the pass panicked, see the log")
+	}
+	if opts.NetlinkDump != "" {
+		if err := writeNetlinkDump(opts.NetlinkDump, rec.Load()); err != nil {
+			return nil, err
+		}
 	}
 	p.AgentVersion = version
 	return json.MarshalIndent(p, "", "  ")

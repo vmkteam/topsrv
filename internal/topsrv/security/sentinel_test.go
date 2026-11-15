@@ -83,6 +83,15 @@ func sentinelFiles() map[string]string {
 		"etc/apt/apt.conf.d/20auto-upgrades": "APT::Periodic::Update-Package-Lists \"1\";\n" +
 			"APT::Periodic::Unattended-Upgrade \"SENTINELSECRET\";\n",
 		"etc/apt/apt.conf.d/99broken": "SENTINELLINE is not apt.conf\n",
+
+		// firewall: values ufw and firewalld refuse, keys not sent; the
+		// ruleset (the sentinel recording) has comments, a set name, an
+		// address and log prefixes in its rules, none of them decoded
+		"sys/module/nf_tables/": "",
+		"etc/ufw/ufw.conf":      "ENABLED=yes\n# SENTINELLINE\n",
+		"etc/default/ufw":       "DEFAULT_INPUT_POLICY=\"SENTINELSECRET\"\nIPT_MODULES=\"SENTINELSECRET\"\n",
+		"etc/firewalld/firewalld.conf": "DefaultZone=SENTINEL zone\nFirewallBackend=SENTINELSECRET\n" +
+			"RFC3964_IPv4=SENTINELSECRET\n",
 	}
 }
 
@@ -119,13 +128,14 @@ func TestNoSecretsLeak(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			c, _ := newTestCollector(t, tc.files)
+			c.nftDial = nftReplay(t, "sentinel", nil)
 			logger, logged := captureLogs(t)
 			c.Logger = logger
 			// a panicking parser logs its error
 			bad := &fakeSection{next: func(context.Context) Section { panic(errors.New("parse SENTINELLINE: invalid syntax")) }}
 			c.sections = append(c.sections, bad.def("bad", time.Second))
 
-			p := c.pass(t.Context(), Trigger{Cause: triggerStart})
+			p := passOf(t, c, Trigger{Cause: triggerStart})
 			c.finish(t.Context(), p)
 
 			snapshot, logs := toJSON(t, p), logged()
@@ -146,7 +156,7 @@ func TestNoSecretsLeak(t *testing.T) {
 // nothing.
 func requireMarkersRead(t *testing.T, d Data) {
 	t.Helper()
-	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers, SectionUpdates, SectionDocker} {
+	for _, name := range []string{SectionAccounts, SectionSSHD, SectionAuthorizedKeys, SectionSudoers, SectionUpdates, SectionDocker, SectionFirewall} {
 		require.Contains(t, []Status{StatusOK, StatusPartial}, d.Sections[name].Status, "%s: %+v", name, d.Sections[name])
 	}
 
@@ -190,6 +200,13 @@ func requireMarkersRead(t *testing.T, d Data) {
 	require.NotNil(t, apt)
 	assert.Equal(t, valueInvalid, *apt.Periodic.UnattendedUpgrade, "the value read and replaced")
 	assert.Len(t, apt.ParseErrors, 1, "the line apt refuses")
+
+	fw := d.Sections[SectionFirewall].Data.(firewallData)
+	require.Len(t, fw.BaseChains, 1, "the ruleset read")
+	assert.Equal(t, "drop", *fw.BaseChains[0].Terminal, "the rules read")
+	assert.Equal(t, valueInvalid, *fw.UFW.DefaultInputPolicy, "the value read and replaced")
+	assert.Equal(t, valueInvalid, *fw.Firewalld.DefaultZone)
+	assert.Equal(t, valueInvalid, *fw.Firewalld.Backend)
 }
 
 // TestNoSecretsLeakUpdates covers the updates sources of the hosts the

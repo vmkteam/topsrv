@@ -48,7 +48,21 @@ func TestSchedule(t *testing.T) {
 
 		s.pending.add(Trigger{Cause: "inotify", Sections: []string{SectionSSHD}})
 		_, ok = s.due(t0.Add(minUnscheduledGap + time.Minute))
-		assert.False(t, ok, "the unscheduled pass counts as the last snapshot")
+		assert.False(t, ok, "the unscheduled pass counts as the last pass")
+	})
+
+	t.Run("an unscheduled pass counts, sent or not", func(t *testing.T) {
+		s := newSchedule(t0, interval, 0)
+		_, ok := s.due(t0)
+		require.True(t, ok)
+
+		s.pending.add(Trigger{Cause: triggerFirewall, Sections: []string{SectionFirewall}})
+		_, ok = s.due(t0.Add(minUnscheduledGap))
+		require.True(t, ok, "it may change nothing and not be sent")
+
+		s.pending.add(Trigger{Cause: "inotify", Sections: []string{SectionSSHD}})
+		_, ok = s.due(t0.Add(minUnscheduledGap + time.Minute))
+		assert.False(t, ok, "a stream of triggers runs no more passes than snapshots it may send")
 	})
 
 	t.Run("the full pass absorbs pending triggers", func(t *testing.T) {

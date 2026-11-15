@@ -12,6 +12,7 @@ import (
 	"syscall"
 
 	"github.com/vmkteam/topsrv/internal/app"
+	"github.com/vmkteam/topsrv/internal/topsrv/security"
 
 	"github.com/BurntSushi/toml"
 	"github.com/namsral/flag"
@@ -34,6 +35,7 @@ var (
 	flVersion    = fs.Bool("version", false, "print version and exit")
 	flSecDryRun  = fs.Bool("security-dry-run", false, "print the security snapshot the agent would send, and exit")
 	flSecSection = fs.String("security-section", "", "with -security-dry-run: comma-separated sections to collect, e.g. kernel,sysctl")
+	flSecNetlink = fs.String("security-dump-netlink", "", "with -security-dry-run: directory to save the nftables netlink replies to, for test fixtures")
 	cfg          app.Config
 )
 
@@ -60,8 +62,8 @@ func main() {
 		securityDryRun(sl)
 		return
 	}
-	if *flSecSection != "" {
-		exitOnError(errors.New("-security-section works with -security-dry-run only"))
+	if *flSecSection != "" || *flSecNetlink != "" {
+		exitOnError(errors.New("-security-section and -security-dump-netlink work with -security-dry-run only"))
 	}
 
 	// app
@@ -97,7 +99,8 @@ func securityDryRun(logger embedlog.Logger) {
 			sections = append(sections, s)
 		}
 	}
-	out, err := app.SecurityDryRun(context.Background(), logger, cfg, version, sections)
+	opts := security.DryRunOptions{Sections: sections, NetlinkDump: *flSecNetlink}
+	out, err := app.SecurityDryRun(context.Background(), logger, cfg, version, opts)
 	exitOnError(err)
 	_, err = os.Stdout.Write(append(out, '\n'))
 	exitOnError(err)

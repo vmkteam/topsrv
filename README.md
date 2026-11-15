@@ -225,7 +225,7 @@ Channel  = "stable"         # stable / beta
 | `Security.Disabled` | `false` | Disable the security collector |
 | `Security.Interval` | `6h` | Full snapshot period (±10% jitter), minimum `15m` |
 | `Security.DisablePush` | `false` | Collect for `/metrics` and dry-run only, send nothing |
-| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `updates`, `docker`, `roleSignals` (and the names of later sections) |
+| `Security.DisabledSections` | `[]` | Sections to skip: `kernel`, `sysctl`, `accounts`, `sshd`, `authorizedKeys`, `sudoers`, `updates`, `firewall`, `docker`, `roleSignals` (and the names of later sections) |
 | `BotLogs.Enabled` | `false` | Ship UA-classified bot events to topsrv.io |
 | `BotLogs.Token` | — | Bot-logs ingest bearer token (separate from `Push.Token`) |
 | `BotLogs.Endpoint` | derived | Ingest URL; defaults to `[Push].Endpoint` with `/v1/bot-logs` path |
@@ -430,6 +430,7 @@ section carries a `status` — `ok`, `partial` (with `gaps`), `unknown` (with a
 | `authorizedKeys` | Keys sshd would accept per user, from the paths of the effective config: fingerprint, type, size, which options (never their values or the comment); files sshd ignores under StrictModes; NFS and autofs homes are never touched |
 | `sudoers` | sudo rules in file order (who, as whom, NOPASSWD, ALL), global and bound Defaults, files sudo skips in `sudoers.d`, rules from LDAP/SSSD flagged; doas on Alpine. Never the commands |
 | `updates` | Whether updates install themselves: the APT configuration merged as apt merges it (`APT::Periodic`, unattended-upgrades origins and auto-reboot, whether apt accepts it), dnf-automatic or dnf5-automatic settings, `apk upgrade` cron jobs on Alpine; update timers (enabled, masked, last run) read without D-Bus; when the package lists and packages last changed |
+| `firewall` | The nftables ruleset in outline, read over netlink (GET only, no `nft`): tables with a guess of who made them (ufw, Docker, firewalld, kube-proxy, …), base chains with hook, priority and policy, and for the inbound chains the rule count and the default for a packet no rule matched (`drop`, `reject`, `accept`), jumps followed; ufw and firewalld settings and how many ufw rules are loaded; iptables-legacy tables present; eBPF dataplanes out of sight. Never the rules themselves. Checked every minute by the ruleset generation; nf_tables is never loaded by the agent |
 | `docker` | The rootful dockerd of the host, found as a process before its socket is touched: options from its command line and `daemon.json` (`iptables`, `userland-proxy`, firewall backend, TLS), the addresses it listens on (the Docker API on TCP), the socket's owner and mode, and from the API (GET only, over the unix socket) the engine version, firewall backend and the container ports published on the host |
 | `roleSignals` | Role processes in the host network namespace (dockerd, kubelet, libvirtd, tailscaled, …), interface and tunnel types (bridge, wireguard, tun, gre), interfaces with a default route, role marker files (`/dev/kvm`, kubelet config) |
 

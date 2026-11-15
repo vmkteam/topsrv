@@ -30,12 +30,14 @@ func hostFixture() map[string]string {
 	roles := rolesFixture()
 	delete(roles, "proc/self") // a directory here
 	return merge(hostProc(), kernelFixture(), sysctlFixture(), accountsFixture(), sshdFixture(), sudoFixture(), roles, map[string]string{
-		"etc/os-release":             "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
-		"proc/sys/kernel/osrelease":  "6.1.0-27-amd64\n",
-		"var/lib/dpkg/status":        "",
-		"lib64/ld-linux-x86-64.so.2": "",
-		"run/systemd/system/":        "",
-		"proc/self/mountinfo":        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n",
+		"etc/os-release":            "ID=debian\nVERSION_ID=\"12\"\nPRETTY_NAME=\"Debian GNU/Linux 12 (bookworm)\"\n",
+		"proc/sys/kernel/osrelease": "6.1.0-27-amd64\n",
+		"var/lib/dpkg/status":       "",
+		// nf_tables neither loaded nor built in: firewall asks nothing
+		"lib/modules/6.1.0-27-amd64/modules.builtin": "kernel/net/netfilter/nfnetlink.ko\n",
+		"lib64/ld-linux-x86-64.so.2":                 "",
+		"run/systemd/system/":                        "",
+		"proc/self/mountinfo":                        "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n",
 	})
 }
 
@@ -56,6 +58,13 @@ func newTestCollector(t *testing.T, files map[string]string) (*Collector, *time.
 	return c, &now
 }
 
+// passOf runs a pass and returns its snapshot.
+func passOf(t *testing.T, c *Collector, trig Trigger) inventory.Payload {
+	t.Helper()
+	p, _ := c.pass(t.Context(), trig)
+	return p
+}
+
 func dataOf(t *testing.T, p inventory.Payload) Data {
 	t.Helper()
 	d := p.Data.(Data)
@@ -65,7 +74,7 @@ func dataOf(t *testing.T, p inventory.Payload) Data {
 func TestPass(t *testing.T) {
 	c, now := newTestCollector(t, hostFixture())
 
-	p := c.pass(t.Context(), Trigger{Cause: triggerStart})
+	p := passOf(t, c, Trigger{Cause: triggerStart})
 
 	assert.Equal(t, Kind, p.Kind)
 	assert.Equal(t, *now, p.ScannedAt)
@@ -117,11 +126,11 @@ func TestPassSectionCache(t *testing.T) {
 	c.sections = []sectionDef{a.def("a", time.Second), b.def("b", time.Second)}
 	c.cfg.parsedInterval = time.Hour
 
-	c.pass(t.Context(), Trigger{Cause: triggerStart})
+	passOf(t, c, Trigger{Cause: triggerStart})
 	a.next = func(context.Context) Section { return ok("a2") }
 	b.next = func(context.Context) Section { return ok("b2") }
 	*now = now.Add(10 * time.Minute)
-	d := dataOf(t, c.pass(t.Context(), Trigger{Cause: "inotify", Sections: []string{"b"}}))
+	d := dataOf(t, passOf(t, c, Trigger{Cause: "inotify", Sections: []string{"b"}}))
 
 	assert.EqualValues(t, 1, a.runs.Load(), "an unscheduled pass rebuilds only its sections")
 	assert.EqualValues(t, 2, b.runs.Load())
@@ -129,7 +138,7 @@ func TestPassSectionCache(t *testing.T) {
 	assert.Equal(t, "b2", d.Sections["b"].Data)
 
 	*now = now.Add(2*time.Hour + time.Minute)
-	d = dataOf(t, c.pass(t.Context(), Trigger{Cause: "inotify", Sections: []string{"b"}}))
+	d = dataOf(t, passOf(t, c, Trigger{Cause: "inotify", Sections: []string{"b"}}))
 	assert.Equal(t, unknown(ReasonTimeout), d.Sections["a"], "older than two intervals")
 }
 
@@ -143,12 +152,12 @@ func TestPassWatchdog(t *testing.T) {
 	fine := &fakeSection{next: func(context.Context) Section { return ok("fine") }}
 	c.sections = []sectionDef{stuck.def("stuck", 20*time.Millisecond), fine.def("fine", time.Second)}
 
-	d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+	d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
 	assert.Equal(t, StatusUnknown, d.Sections["stuck"].Status)
 	assert.Equal(t, ReasonTimeout, d.Sections["stuck"].Reason)
 	assert.Equal(t, "fine", d.Sections["fine"].Data, "the pass goes on past a stuck section")
 
-	d = dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerInterval}))
+	d = dataOf(t, passOf(t, c, Trigger{Cause: triggerInterval}))
 	assert.Equal(t, ReasonTimeout, d.Sections["stuck"].Reason)
 	assert.EqualValues(t, 1, stuck.runs.Load(), "not started again while the first run is stuck")
 	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(`
@@ -160,7 +169,7 @@ topsrv_security_section_inflight{section="stuck"} 1
 
 	close(release)
 	require.Eventually(t, func() bool { return !c.isInflight("stuck") }, time.Second, time.Millisecond)
-	d = dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerInterval}))
+	d = dataOf(t, passOf(t, c, Trigger{Cause: triggerInterval}))
 	assert.Equal(t, "late", d.Sections["stuck"].Data)
 	assert.EqualValues(t, 2, stuck.runs.Load())
 }
@@ -170,7 +179,7 @@ func TestPassPanic(t *testing.T) {
 	bad := &fakeSection{next: func(context.Context) Section { panic("index out of range") }}
 	c.sections = []sectionDef{bad.def("bad", time.Second)}
 
-	d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+	d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
 
 	assert.Equal(t, ReasonParseError, d.Sections["bad"].Reason)
 	assert.False(t, c.isInflight("bad"))
@@ -182,7 +191,7 @@ func TestPassAppContainer(t *testing.T) {
 		".dockerenv":       "",
 	}))
 
-	d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+	d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
 
 	assert.Equal(t, StatusOK, d.Sections[SectionKernel].Status, "kernel facts are global")
 	assert.Equal(t, unknown(ReasonContainerEnv), withoutDuration(d.Sections[SectionSysctl]))
@@ -193,7 +202,7 @@ func TestPassUnsupportedPlatform(t *testing.T) {
 	c, _ := newTestCollector(t, hostFixture())
 	c.supported = false
 
-	p := c.pass(t.Context(), Trigger{Cause: triggerStart})
+	p := passOf(t, c, Trigger{Cause: triggerStart})
 	d := dataOf(t, p)
 
 	assert.Equal(t, ReasonUnsupportedPlatform, d.Environment.Reason)
@@ -208,14 +217,14 @@ func TestInventory(t *testing.T) {
 	c, _ := newTestCollector(t, hostFixture())
 
 	assert.Empty(t, c.Inventory(), "nothing before the first pass")
-	c.finish(t.Context(), c.pass(t.Context(), Trigger{Cause: triggerStart}))
+	c.finish(t.Context(), passOf(t, c, Trigger{Cause: triggerStart}))
 	got := c.Inventory()
 	require.Len(t, got, 1)
 	assert.Equal(t, Kind, got[0].Kind)
 	assert.Empty(t, c.Inventory(), "one-shot")
 
 	c.cfg.DisablePush = true
-	c.finish(t.Context(), c.pass(t.Context(), Trigger{Cause: triggerInterval}))
+	c.finish(t.Context(), passOf(t, c, Trigger{Cause: triggerInterval}))
 	assert.Empty(t, c.Inventory(), "DisablePush keeps snapshots local")
 }
 
@@ -224,7 +233,7 @@ func TestCollectorMetrics(t *testing.T) {
 	reg := prometheus.NewPedanticRegistry()
 	require.NoError(t, reg.Register(c))
 
-	c.finish(t.Context(), c.pass(t.Context(), Trigger{Cause: triggerStart}))
+	c.finish(t.Context(), passOf(t, c, Trigger{Cause: triggerStart}))
 	c.OnInventoryPushed(Kind)
 
 	families, err := reg.Gather()
@@ -271,7 +280,7 @@ func TestRun(t *testing.T) {
 func TestDryRun(t *testing.T) {
 	stateDir := t.TempDir()
 
-	out, err := DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionSysctl})
+	out, err := DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", DryRunOptions{Sections: []string{SectionSysctl}})
 	require.NoError(t, err)
 
 	var p struct {
@@ -290,10 +299,10 @@ func TestDryRun(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, entries, "dry-run writes nothing")
 
-	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", []string{SectionFirewall})
-	require.ErrorContains(t, err, `"firewall" is not collected by this version`)
+	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{}, stateDir, "1.2.3", DryRunOptions{Sections: []string{SectionProcScan}})
+	require.ErrorContains(t, err, `"procScan" is not collected by this version`)
 
-	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{DisabledSections: []string{SectionSysctl}}, stateDir, "1.2.3", []string{SectionSysctl})
+	_, err = DryRun(t.Context(), embedlog.Logger{}, Config{DisabledSections: []string{SectionSysctl}}, stateDir, "1.2.3", DryRunOptions{Sections: []string{SectionSysctl}})
 	require.ErrorContains(t, err, `"sysctl" is disabled`)
 }
 
@@ -327,7 +336,7 @@ func TestRecoverPass(t *testing.T) {
 	logger, logged := captureLogs(t)
 	c.Logger = logger
 
-	_, ok := c.recoverPass(t.Context(), func() inventory.Payload { panic(errors.New("SENTINELLINE")) })
+	_, _, ok := c.recoverPass(t.Context(), func() (inventory.Payload, bool) { panic(errors.New("SENTINELLINE")) })
 
 	assert.False(t, ok, "the snapshot is dropped, the agent goes on")
 	assert.Contains(t, logged(), "panic *errors.errorString at scan_test.go:")
@@ -340,6 +349,7 @@ func TestReasonOf(t *testing.T) {
 		fs.ErrNotExist:           ReasonNotFound,
 		errTooLarge:              ReasonBudgetExceeded,
 		context.DeadlineExceeded: ReasonTimeout,
+		os.ErrDeadlineExceeded:   ReasonTimeout, // a socket's timeout
 		&fs.PathError{Op: "open", Err: errNotRegular}: ReasonNotRegular,
 		fmt.Errorf("line 3: %w", errParse):            ReasonParseError,
 		syscall.EIO:                                   ReasonIOError,
@@ -365,7 +375,7 @@ func TestPassSectionResults(t *testing.T) {
 		c, _ := newTestCollector(t, hostProc())
 		c.sections = []sectionDef{producer("p1"), consumer}
 
-		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+		d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
 
 		assert.Equal(t, "saw p1", d.Sections["consumer"].Data)
 	})
@@ -373,9 +383,9 @@ func TestPassSectionResults(t *testing.T) {
 	t.Run("an unscheduled pass takes the result of the last pass", func(t *testing.T) {
 		c, _ := newTestCollector(t, hostProc())
 		c.sections = []sectionDef{producer("p1"), consumer}
-		c.pass(t.Context(), Trigger{Cause: triggerStart})
+		passOf(t, c, Trigger{Cause: triggerStart})
 
-		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: "inotify", Sections: []string{"consumer"}}))
+		d := dataOf(t, passOf(t, c, Trigger{Cause: "inotify", Sections: []string{"consumer"}}))
 
 		assert.Equal(t, "saw p1", d.Sections["consumer"].Data)
 	})
@@ -383,13 +393,13 @@ func TestPassSectionResults(t *testing.T) {
 	t.Run("a failed run replaces the result of the last pass", func(t *testing.T) {
 		c, _ := newTestCollector(t, hostProc())
 		c.sections = []sectionDef{producer("p1"), consumer}
-		c.pass(t.Context(), Trigger{Cause: triggerStart})
+		passOf(t, c, Trigger{Cause: triggerStart})
 		failing := sectionDef{name: "producer", budget: time.Second, run: func(context.Context, *scanCtx) (Section, any) {
 			return unknown(ReasonPermissionDenied), nil
 		}}
 		c.sections = []sectionDef{failing, consumer}
 
-		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerInterval}))
+		d := dataOf(t, passOf(t, c, Trigger{Cause: triggerInterval}))
 
 		assert.Equal(t, "saw ", d.Sections["consumer"].Data, "no stale result from the pass before")
 	})
@@ -404,7 +414,7 @@ func TestPassSectionResults(t *testing.T) {
 		}}
 		c.sections = []sectionDef{slow, consumer}
 
-		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+		d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
 
 		assert.Equal(t, ReasonTimeout, d.Sections["producer"].Reason)
 		assert.Equal(t, "saw ", d.Sections["consumer"].Data, "no result from the timed-out section")
