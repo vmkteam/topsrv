@@ -98,9 +98,9 @@ type fakeSection struct {
 }
 
 func (f *fakeSection) def(name string, budget time.Duration) sectionDef {
-	return sectionDef{name: name, budget: budget, run: func(ctx context.Context, _ *scanCtx) Section {
+	return sectionDef{name: name, budget: budget, run: func(ctx context.Context, _ *scanCtx) (Section, any) {
 		f.runs.Add(1)
-		return f.next(ctx)
+		return f.next(ctx), nil
 	}}
 }
 
@@ -340,4 +340,153 @@ func TestReasonOf(t *testing.T) {
 	} {
 		assert.Equal(t, want, reasonOf(err), "%v", err)
 	}
+}
+
+func TestPassSectionResults(t *testing.T) {
+	// producer's result is what consumer builds on, as accounts for sshd.
+	producer := func(result string) sectionDef {
+		return sectionDef{name: "producer", budget: time.Second, run: func(context.Context, *scanCtx) (Section, any) {
+			return ok(result), result
+		}}
+	}
+	consumer := sectionDef{name: "consumer", budget: time.Second, run: func(_ context.Context, sc *scanCtx) (Section, any) {
+		r, _ := sc.result("producer").(string)
+		return ok("saw " + r), nil
+	}}
+
+	t.Run("a later section reads the result of an earlier one", func(t *testing.T) {
+		c, _ := newTestCollector(t, hostProc())
+		c.sections = []sectionDef{producer("p1"), consumer}
+
+		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+
+		assert.Equal(t, "saw p1", d.Sections["consumer"].Data)
+	})
+
+	t.Run("an unscheduled pass takes the result of the last pass", func(t *testing.T) {
+		c, _ := newTestCollector(t, hostProc())
+		c.sections = []sectionDef{producer("p1"), consumer}
+		c.pass(t.Context(), Trigger{Cause: triggerStart})
+
+		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: "inotify", Sections: []string{"consumer"}}))
+
+		assert.Equal(t, "saw p1", d.Sections["consumer"].Data)
+	})
+
+	t.Run("the result of a section past its budget is not kept", func(t *testing.T) {
+		c, _ := newTestCollector(t, hostProc())
+		release := make(chan struct{})
+		t.Cleanup(func() { close(release) })
+		slow := sectionDef{name: "producer", budget: 10 * time.Millisecond, run: func(context.Context, *scanCtx) (Section, any) {
+			<-release
+			return ok("late"), "late"
+		}}
+		c.sections = []sectionDef{slow, consumer}
+
+		d := dataOf(t, c.pass(t.Context(), Trigger{Cause: triggerStart}))
+
+		assert.Equal(t, ReasonTimeout, d.Sections["producer"].Reason)
+		assert.Equal(t, "saw ", d.Sections["consumer"].Data, "no result from the timed-out section")
+	})
+}
+
+func TestScanCtxRemoteFS(t *testing.T) {
+	mountinfo := "22 1 8:1 / / rw - ext4 /dev/sda1 rw\n" +
+		"30 22 0:40 / /home rw - autofs systemd-1 rw\n" +
+		"31 30 8:2 / /home/local rw - ext4 /dev/sda2 rw\n"
+	files := map[string]string{
+		"proc/self/mountinfo":   mountinfo,
+		"home/alice/key":        "secret",
+		"home/local/bob/key":    "ok",
+		"etc/ssh/sshd_config":   "Port 22\n",
+		"home/alice/.ssh/dir/f": "",
+	}
+
+	t.Run("a path on autofs is refused before any syscall", func(t *testing.T) {
+		sc := fixture(t, files)
+
+		_, err := sc.read("/home/alice/key", 64)
+		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
+		_, err = sc.readUser("/home/alice/key", 64)
+		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
+		_, err = sc.readDirUser("/home/alice/.ssh/dir")
+		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
+		_, err = sc.lstatUser("/home/alice/key")
+		assert.Equal(t, ReasonRemoteFSSkipped, reasonOf(err))
+		assert.False(t, sc.exists("/home/alice/key"))
+	})
+
+	t.Run("a local mount under autofs is read", func(t *testing.T) {
+		sc := fixture(t, files)
+
+		b, err := sc.readUser("/home/local/bob/key", 64)
+		require.NoError(t, err)
+		assert.Equal(t, "ok", string(b))
+	})
+
+	t.Run("without a mount table: system paths are read, user paths are not", func(t *testing.T) {
+		noMounts := maps.Clone(files)
+		delete(noMounts, "proc/self/mountinfo")
+		sc := fixture(t, noMounts)
+
+		_, err := sc.read("/etc/ssh/sshd_config", 64)
+		require.NoError(t, err)
+		_, err = sc.readUser("/home/local/bob/key", 64)
+		assert.Equal(t, ReasonNotFound, reasonOf(err), "the missing mount table is the reason")
+	})
+
+	t.Run("readUser keeps the size limit", func(t *testing.T) {
+		sc := fixture(t, files)
+
+		_, err := sc.readUser("/home/local/bob/key", 1)
+		assert.Equal(t, ReasonBudgetExceeded, reasonOf(err))
+	})
+
+	t.Run("readUser refuses a symlink", func(t *testing.T) {
+		sc := fixture(t, merge(files, map[string]string{"etc/link": "-> ssh/sshd_config"}))
+
+		_, err := sc.readUser("/etc/link", 64)
+		assert.Equal(t, ReasonNotRegular, reasonOf(err))
+	})
+}
+
+func TestProcesses(t *testing.T) {
+	t.Run("exe, deleted exe and an argv0 title", func(t *testing.T) {
+		sc := fixture(t, map[string]string{
+			"proc/1/exe":      "-> /usr/lib/systemd/systemd",
+			"proc/77/exe":     "-> /usr/sbin/sshd (deleted)",
+			"proc/88/cmdline": "k3s server\x00--token\x00SENTINEL\x00",
+			"proc/99/":        "", // exited during the walk
+			"proc/self":       "-> 1",
+		})
+
+		procs, err := sc.processes()
+
+		require.NoError(t, err)
+		assert.Equal(t, []process{
+			{pid: "1", exe: "/usr/lib/systemd/systemd", name: "systemd"},
+			{pid: "77", exe: "/usr/sbin/sshd", name: "sshd"},
+			{pid: "88", name: "k3s"},
+		}, procs)
+	})
+
+	t.Run("hidepid=2: PID 1 hidden, the list is incomplete", func(t *testing.T) {
+		sc := fixture(t, map[string]string{"proc/500/exe": "-> /usr/bin/bash"})
+
+		procs, err := sc.processes()
+
+		require.ErrorIs(t, err, fs.ErrPermission)
+		assert.Len(t, procs, 1)
+	})
+
+	t.Run("walked once per pass", func(t *testing.T) {
+		sc := fixture(t, map[string]string{"proc/1/exe": "-> /sbin/init"})
+		first, _ := sc.processes()
+		writeTree(t, sc.root, map[string]string{"proc/2/exe": "-> /usr/sbin/sshd"})
+
+		again, _ := sc.processes()
+
+		assert.Equal(t, first, again, "a process started after the walk is not seen until the next pass")
+		assert.Len(t, again, 1)
+	})
 }

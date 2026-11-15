@@ -9,7 +9,10 @@ import "os"
 const (
 	openFlags = 0
 	oNoFollow = 0
+	dirFlags  = 0
 )
+
+func clearNonblock(*os.File) error { return nil }
 
 // privateFile has no owner to check off unix.
 func privateFile(os.FileInfo) bool { return true }

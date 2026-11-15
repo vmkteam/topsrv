@@ -2,57 +2,239 @@ package security
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"runtime"
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/vmkteam/topsrv/internal/topsrv/inventory"
 )
 
 // scanCtx is what a section gets: the root to read from ("" in production,
-// a fixture directory in tests) and what earlier sections found.
+// a fixture directory in tests) and what earlier sections found. A section
+// that ran past its budget may still hold it, so what is filled in lazily
+// or by the pass is guarded.
 type scanCtx struct {
 	root string
 	env  envData
 
 	// timeSync reads the kernel clock state; nil where it cannot be read.
 	timeSync func() (*timeSync, error)
+
+	mountsOnce sync.Once
+	mounts     mounts // remote mounts only, see remoteOnly
+	mountsErr  error
+
+	procsOnce sync.Once
+	procs     []process
+	procsErr  error
+
+	mu      sync.Mutex
+	results map[string]any // section → its typed result, this pass or cached
 }
 
 // The accessors below are the only way sections touch the filesystem: each
 // takes a path as the host sees it and prefixes the scan root. Files go
-// through safefile.
+// through safefile. A path on a network or automount filesystem is refused
+// before any syscall: touching it may hang or mount it.
 
 func (sc *scanCtx) read(path string, limit int64) ([]byte, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
 	return readFile(sc.root+path, limit)
 }
 
 // readHead reads up to n bytes from the start of a file.
 func (sc *scanCtx) readHead(path string, n int64) ([]byte, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
 	return readHead(sc.root+path, n)
 }
 
-func (sc *scanCtx) readDir(path string) ([]os.DirEntry, error) { return os.ReadDir(sc.root + path) }
+func (sc *scanCtx) readDir(path string) ([]os.DirEntry, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
+	return readDir(sc.root+path, false)
+}
 
-func (sc *scanCtx) readlink(path string) (string, error) { return os.Readlink(sc.root + path) }
+func (sc *scanCtx) readlink(path string) (string, error) {
+	if err := sc.local(path); err != nil {
+		return "", err
+	}
+	return os.Readlink(sc.root + path)
+}
 
-func (sc *scanCtx) stat(path string) (os.FileInfo, error) { return os.Stat(sc.root + path) }
+func (sc *scanCtx) stat(path string) (os.FileInfo, error) {
+	if err := sc.local(path); err != nil {
+		return nil, err
+	}
+	return os.Stat(sc.root + path)
+}
 
 // exists is a presence probe; any error, permission included, means absent.
 func (sc *scanCtx) exists(path string) bool {
+	if sc.local(path) != nil {
+		return false
+	}
 	_, err := os.Lstat(sc.root + path)
 	return err == nil
 }
 
 // glob reports whether the pattern matches anything.
 func (sc *scanCtx) glob(pattern string) bool {
+	if sc.local(filepath.Dir(pattern)) != nil {
+		return false
+	}
 	m, _ := filepath.Glob(sc.root + pattern)
 	return len(m) > 0
+}
+
+// The user accessors are for paths other users control (home directories):
+// a symlink at the last component is refused, and without a readable mount
+// table nothing is touched.
+
+func (sc *scanCtx) readUser(path string, limit int64) ([]byte, error) {
+	if err := sc.localStrict(path); err != nil {
+		return nil, err
+	}
+	return readFileNoFollow(sc.root+path, limit)
+}
+
+func (sc *scanCtx) readDirUser(path string) ([]os.DirEntry, error) {
+	if err := sc.localStrict(path); err != nil {
+		return nil, err
+	}
+	return readDir(sc.root+path, true)
+}
+
+func (sc *scanCtx) lstatUser(path string) (os.FileInfo, error) {
+	if err := sc.localStrict(path); err != nil {
+		return nil, err
+	}
+	return os.Lstat(sc.root + path)
+}
+
+// local refuses a path on a remote filesystem. An unreadable mount table
+// lets system paths through: /proc and /etc are not where autofs lives.
+func (sc *scanCtx) local(path string) error {
+	m, err := sc.mountTable()
+	if err == nil && m.isRemote(path) {
+		return &fs.PathError{Op: opOpen, Path: path, Err: errRemoteFS}
+	}
+	return nil
+}
+
+// localStrict is local for user paths: without the mount table a home
+// directory may be on autofs, so it is not touched.
+func (sc *scanCtx) localStrict(path string) error {
+	if _, err := sc.mountTable(); err != nil {
+		return err
+	}
+	return sc.local(path)
+}
+
+func (sc *scanCtx) mountTable() (mounts, error) {
+	sc.mountsOnce.Do(func() {
+		m, err := loadMounts(sc.root)
+		sc.mounts, sc.mountsErr = m.remoteOnly(), err
+	})
+	return sc.mounts, sc.mountsErr
+}
+
+// result returns the typed result of an earlier section: from this pass, or
+// from the last pass it finished in time.
+func (sc *scanCtx) result(section string) any {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	return sc.results[section]
+}
+
+func (sc *scanCtx) setResult(section string, r any) {
+	sc.mu.Lock()
+	defer sc.mu.Unlock()
+	if sc.results == nil {
+		sc.results = map[string]any{}
+	}
+	sc.results[section] = r
+}
+
+// process is one entry of the /proc walk, shared by the sections of a pass.
+type process struct {
+	pid  string
+	exe  string // /proc/PID/exe, " (deleted)" trimmed; "" when unreadable
+	name string // base name of exe, or of argv[0] when exe is unreadable
+}
+
+// processes walks /proc once per pass. Processes come and go during the
+// walk, so a vanished one is skipped. The list is incomplete — with
+// fs.ErrPermission — when /proc is mounted with hidepid: =1 refuses the
+// details of other users' processes, =2 hides them, PID 1 included. Of the
+// command line only argv[0] is read, and only when the executable link is
+// unreadable: the rest may hold secrets.
+func (sc *scanCtx) processes() ([]process, error) {
+	sc.procsOnce.Do(func() { sc.procs, sc.procsErr = walkProcesses(sc) })
+	return sc.procs, sc.procsErr
+}
+
+func walkProcesses(sc *scanCtx) ([]process, error) {
+	entries, err := sc.readDir("/proc")
+	if err != nil {
+		return nil, err
+	}
+	var (
+		out     []process
+		denied  error
+		sawInit bool
+	)
+	for _, e := range entries {
+		pid := e.Name()
+		if _, err := strconv.Atoi(pid); err != nil {
+			continue
+		}
+		sawInit = sawInit || pid == "1"
+		p, err := readProcess(sc, pid)
+		switch {
+		case errors.Is(err, fs.ErrPermission):
+			denied = err
+		case err != nil:
+			continue // exited during the walk, or a kernel thread
+		}
+		out = append(out, p)
+	}
+	if !sawInit {
+		denied = fs.ErrPermission
+	}
+	return out, denied
+}
+
+func readProcess(sc *scanCtx, pid string) (process, error) {
+	p := process{pid: pid}
+	if exe, err := sc.readlink("/proc/" + pid + "/exe"); err == nil {
+		p.exe = strings.TrimSuffix(exe, " (deleted)")
+		p.name = filepath.Base(p.exe)
+		return p, nil
+	}
+	head, err := sc.readHead("/proc/"+pid+"/cmdline", argv0Limit)
+	if err != nil {
+		return p, err
+	}
+	argv0, _, _ := strings.Cut(string(head), "\x00")
+	argv0, _, _ = strings.Cut(argv0, " ") // a rewritten title: "k3s server"
+	if argv0 != "" {
+		p.name = filepath.Base(argv0)
+	}
+	return p, nil
 }
 
 // sameFile reports whether two paths, symlinks followed, are the same inode.
@@ -75,15 +257,24 @@ type sectionDef struct {
 	// host: reads state an app container does not share with the host
 	// (its own /etc, pid and net namespaces).
 	host bool
-	run  func(context.Context, *scanCtx) Section
+	// run collects the section. A non-nil result is what later sections of
+	// the pass build on (accounts → sshd → authorizedKeys); it is kept only
+	// when the section finished within its budget.
+	run func(context.Context, *scanCtx) (Section, any)
 }
 
-// allSections of this release, in pass order. Kernel facts are global, so
-// the kernel section is collected in a container too.
+// allSections of this release, in pass order: a section comes after those
+// whose results it reads. Kernel facts are global, so the kernel section is
+// collected in a container too.
 var allSections = []sectionDef{
-	{name: SectionKernel, budget: 2 * time.Second, run: collectKernel},
-	{name: SectionSysctl, budget: 2 * time.Second, host: true, run: collectSysctl},
-	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: collectRoleSignals},
+	{name: SectionKernel, budget: 2 * time.Second, run: noResult(collectKernel)},
+	{name: SectionSysctl, budget: 2 * time.Second, host: true, run: noResult(collectSysctl)},
+	{name: SectionRoleSignals, budget: 5 * time.Second, host: true, run: noResult(collectRoleSignals)},
+}
+
+// noResult adapts a section no other section builds on.
+func noResult(f func(context.Context, *scanCtx) Section) func(context.Context, *scanCtx) (Section, any) {
+	return func(ctx context.Context, sc *scanCtx) (Section, any) { return f(ctx, sc), nil }
 }
 
 type cachedSection struct {
@@ -96,14 +287,18 @@ type cachedSection struct {
 // rebuilds only its sections.
 func (c *Collector) pass(ctx context.Context, t Trigger) inventory.Payload {
 	start := c.now()
-	sc := &scanCtx{root: c.root, timeSync: c.timeSync}
+	sc := &scanCtx{root: c.root, timeSync: c.timeSync, results: c.lastResults()}
 	var envSec Section
 	envSec, sc.env = c.environment(sc)
 	for _, def := range c.sections {
 		if len(t.Sections) > 0 && !slices.Contains(t.Sections, def.name) {
 			continue
 		}
-		c.store(def.name, c.runSection(ctx, def, sc), start)
+		sec, res := c.runSection(ctx, def, sc)
+		if res != nil {
+			sc.setResult(def.name, res)
+		}
+		c.store(def.name, sec, res, start)
 	}
 
 	host := inventory.DetectHost(c.root)
@@ -147,22 +342,26 @@ func (c *Collector) agent(sc *scanCtx) Agent {
 // own goroutine: on timeout the pass moves on, and the section is not
 // started again until that goroutine returns — at most one stuck thread per
 // section.
-func (c *Collector) runSection(ctx context.Context, def sectionDef, sc *scanCtx) Section {
+func (c *Collector) runSection(ctx context.Context, def sectionDef, sc *scanCtx) (Section, any) {
 	switch {
 	case !c.supported:
-		return unknown(ReasonUnsupportedPlatform)
+		return unknown(ReasonUnsupportedPlatform), nil
 	case def.host && sc.env.appContainer():
-		return unknown(ReasonContainerEnv)
+		return unknown(ReasonContainerEnv), nil
 	case !c.startInflight(def.name):
-		return unknown(ReasonTimeout) // still stuck since an earlier pass
+		return unknown(ReasonTimeout), nil // still stuck since an earlier pass
 	}
 
+	type outcome struct {
+		sec Section
+		res any
+	}
 	sctx, cancel := context.WithTimeout(ctx, def.budget)
 	defer cancel()
 	start := time.Now()
-	done := make(chan Section, 1)
+	done := make(chan outcome, 1)
 	go func() {
-		var sec Section
+		var o outcome
 		defer func() {
 			// Parsers read untrusted files: a bug there must not take the
 			// agent down. Only the panic type and site are logged — its value
@@ -170,26 +369,26 @@ func (c *Collector) runSection(ctx context.Context, def sectionDef, sc *scanCtx)
 			if r := recover(); r != nil {
 				c.Error(ctx, "security: section panicked", "section", def.name,
 					"error", fmt.Sprintf("panic %T at %s", r, panicSite()))
-				sec = unknown(ReasonParseError)
+				o = outcome{sec: unknown(ReasonParseError)}
 			}
 			c.endInflight(def.name)
-			done <- sec
+			done <- o
 		}()
-		sec = def.run(sctx, sc)
+		o.sec, o.res = def.run(sctx, sc)
 	}()
 
-	var sec Section
+	var o outcome
 	select {
-	case sec = <-done:
+	case o = <-done:
 	case <-sctx.Done():
 		select {
-		case sec = <-done: // returned right at the deadline
+		case o = <-done: // returned right at the deadline
 		default:
-			sec = unknown(ReasonTimeout)
+			o = outcome{sec: unknown(ReasonTimeout)}
 		}
 	}
-	sec.DurationMs = time.Since(start).Milliseconds()
-	return sec
+	o.sec.DurationMs = time.Since(start).Milliseconds()
+	return o.sec, o.res
 }
 
 func (c *Collector) startInflight(name string) bool {
@@ -208,11 +407,22 @@ func (c *Collector) endInflight(name string) {
 	c.mu.Unlock()
 }
 
-func (c *Collector) store(name string, sec Section, at time.Time) {
+func (c *Collector) store(name string, sec Section, res any, at time.Time) {
 	c.recordMetrics(name, sec)
 	c.mu.Lock()
 	c.cache[name] = cachedSection{sec: sec, at: at}
+	if res != nil {
+		c.results[name] = res
+	}
 	c.mu.Unlock()
+}
+
+// lastResults copies the results of the last passes, for an unscheduled
+// pass that rebuilds a section without the sections it builds on.
+func (c *Collector) lastResults() map[string]any {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return maps.Clone(c.results)
 }
 
 // cachedSections returns every enabled section from the cache. A section not

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"syscall"
 )
 
 // valueUnknown is the enum value for a fact that could not be read.
@@ -126,8 +127,12 @@ func reasonOf(err error) Reason {
 		return ReasonBudgetExceeded
 	case errors.Is(err, context.DeadlineExceeded), errors.Is(err, context.Canceled):
 		return ReasonTimeout
-	case errors.Is(err, errNotRegular):
+	case errors.Is(err, errNotRegular),
+		errors.Is(err, syscall.ENOTDIR), // O_DIRECTORY on a FIFO or a file
+		errors.Is(err, syscall.ELOOP):   // O_NOFOLLOW on a symlink
 		return ReasonNotRegular
+	case errors.Is(err, errRemoteFS):
+		return ReasonRemoteFSSkipped
 	case errors.Is(err, errParse):
 		return ReasonParseError
 	default:

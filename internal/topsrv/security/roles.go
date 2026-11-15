@@ -2,9 +2,6 @@ package security
 
 import (
 	"context"
-	"errors"
-	"io/fs"
-	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
@@ -117,62 +114,32 @@ func collectRoleSignals(_ context.Context, sc *scanCtx) Section {
 	return collected(gaps, d)
 }
 
-// roleProcessesRunning lists the role processes found, sorted. Processes come
-// and go during the walk, so a vanished one is skipped. The list is
-// incomplete — fs.ErrPermission with what was found — when /proc is mounted
-// with hidepid: =1 refuses the command lines of other users, =2 hides their
-// processes, PID 1 included. A process in a network namespace other than
-// PID 1's (a VPN client or kubelet in a container) is not a role of the
-// host. Of the command line only argv[0] is read: the rest may hold secrets.
+// roleProcessesRunning lists the role processes found, sorted; incomplete
+// with fs.ErrPermission under hidepid (see processes). A process in a network
+// namespace other than PID 1's (a VPN client or kubelet in a container) is
+// not a role of the host.
 func roleProcessesRunning(sc *scanCtx) ([]string, error) {
-	entries, err := sc.readDir("/proc")
-	if err != nil {
+	procs, err := sc.processes()
+	if procs == nil && err != nil {
 		return nil, err
 	}
 	hostNet, _ := sc.readlink("/proc/1/ns/net")
 	found := map[string]bool{}
-	var denied error
-	sawInit := false
-	for _, e := range entries {
-		pid := e.Name()
-		if _, err := strconv.Atoi(pid); err != nil {
+	for _, p := range procs {
+		if !isRoleProcess(p.name) {
 			continue
 		}
-		sawInit = sawInit || pid == "1"
-		name, err := processName(sc, pid)
-		if errors.Is(err, fs.ErrPermission) {
-			denied = err
-		}
-		if !isRoleProcess(name) {
+		if ns, nsErr := sc.readlink("/proc/" + p.pid + "/ns/net"); nsErr == nil && hostNet != "" && ns != hostNet {
 			continue
 		}
-		if ns, err := sc.readlink("/proc/" + pid + "/ns/net"); err == nil && hostNet != "" && ns != hostNet {
-			continue
-		}
-		found[name] = true
-	}
-	if !sawInit {
-		denied = fs.ErrPermission
+		found[p.name] = true
 	}
 	out := make([]string, 0, len(found))
 	for name := range found {
 		out = append(out, name)
 	}
 	slices.Sort(out)
-	return out, denied
-}
-
-func processName(sc *scanCtx, pid string) (string, error) {
-	if exe, err := sc.readlink("/proc/" + pid + "/exe"); err == nil {
-		return filepath.Base(strings.TrimSuffix(exe, " (deleted)")), nil
-	}
-	head, err := sc.readHead("/proc/"+pid+"/cmdline", argv0Limit)
-	if err != nil {
-		return "", err
-	}
-	argv0, _, _ := strings.Cut(string(head), "\x00")
-	argv0, _, _ = strings.Cut(argv0, " ") // a rewritten title: "k3s server"
-	return filepath.Base(argv0), nil
+	return out, err
 }
 
 func isRoleProcess(name string) bool {

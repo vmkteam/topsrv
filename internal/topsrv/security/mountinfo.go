@@ -2,11 +2,17 @@ package security
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 )
+
+// errRemoteFS: the path is on a network or automount filesystem and was not
+// touched.
+var errRemoteFS = errors.New("on a remote or automount filesystem")
 
 // mountinfoLimit caps /proc/self/mountinfo; a k8s node has a few thousand
 // lines of about 200 bytes.
@@ -99,6 +105,25 @@ func (m mounts) isRemote(path string) bool {
 		best, fsType = len(mt.point), mt.fsType
 	}
 	return isRemoteFS(fsType)
+}
+
+// remoteOnly keeps what isRemote needs: the remote mounts and the mounts
+// under them, which may bring a path back to a local filesystem. On a host
+// without remote mounts — most of them — it is empty, and a check is free.
+func (m mounts) remoteOnly() mounts {
+	var remote []string
+	for _, mt := range m {
+		if isRemoteFS(mt.fsType) {
+			remote = append(remote, mt.point)
+		}
+	}
+	var out mounts
+	for _, mt := range m {
+		if slices.ContainsFunc(remote, func(point string) bool { return underMount(mt.point, point) }) {
+			out = append(out, mt)
+		}
+	}
+	return out
 }
 
 func underMount(path, point string) bool {

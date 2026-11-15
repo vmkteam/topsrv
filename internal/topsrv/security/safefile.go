@@ -6,6 +6,8 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"slices"
+	"strings"
 )
 
 // opOpen is the Op of the errors openFile returns for a file it refuses.
@@ -54,7 +56,30 @@ func openFile(path string, noFollow bool) (*os.File, error) {
 		f.Close()
 		return nil, &fs.PathError{Op: opOpen, Path: path, Err: errNotRegular}
 	}
+	if err := clearNonblock(f); err != nil {
+		f.Close()
+		return nil, err
+	}
 	return f, nil
+}
+
+// readDir lists a directory sorted by name, as os.ReadDir, without hanging
+// on what is not one: a plain open of a FIFO put in place of the directory
+// blocks until a writer comes. With noFollow a symlink at the last path
+// component is refused.
+func readDir(path string, noFollow bool) ([]os.DirEntry, error) {
+	flags := os.O_RDONLY | dirFlags
+	if noFollow {
+		flags |= oNoFollow
+	}
+	f, err := os.OpenFile(path, flags, 0)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+	entries, err := f.ReadDir(-1)
+	slices.SortFunc(entries, func(a, b os.DirEntry) int { return strings.Compare(a.Name(), b.Name()) })
+	return entries, err
 }
 
 // readFile reads a regular file through openFile, following symlinks, and
