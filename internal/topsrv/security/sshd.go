@@ -122,11 +122,17 @@ type sshdListener struct {
 
 // sshdResult is what authorizedKeys builds on.
 type sshdResult struct {
-	authorizedKeysFiles []string            // global, with the default when unset
-	userKeysFiles       map[string][]string // AuthorizedKeysFile of "Match User x" blocks, by user
+	authorizedKeysFiles []string    // global, with the default when unset
+	keysBlocks          []keysBlock // Match blocks that set AuthorizedKeysFile, in order
 	strictModes         bool
 	keysCommand         bool
 	trustedCA           bool
+}
+
+// keysBlock is a Match block that sets AuthorizedKeysFile.
+type keysBlock struct {
+	criteria []string // pairs, Invalid-User alone
+	files    []string
 }
 
 // defaultAuthorizedKeysFiles is AuthorizedKeysFile when unset.
@@ -406,7 +412,7 @@ func sshdMatches(blocks []*sshdconf.MatchBlock) []sshdMatch {
 	for _, b := range blocks {
 		evaluable := len(b.Criteria)%2 == 0
 		for i := 0; i < len(b.Criteria); i += 2 {
-			if c := strings.ToLower(b.Criteria[i]); c != "user" && c != "group" {
+			if c := strings.ToLower(b.Criteria[i]); c != criterionUser && c != criterionGroup {
 				evaluable = false
 			}
 		}
@@ -429,7 +435,7 @@ func lineRefs(refs []sshdconf.Ref) []lineRef {
 }
 
 func sshdResultOf(cfg *sshdconf.Config) *sshdResult {
-	r := &sshdResult{authorizedKeysFiles: defaultAuthorizedKeysFiles, strictModes: true, userKeysFiles: map[string][]string{}}
+	r := &sshdResult{authorizedKeysFiles: defaultAuthorizedKeysFiles, strictModes: true}
 	g := cfg.Global
 	if v, ok := g["AuthorizedKeysFile"]; ok {
 		r.authorizedKeysFiles = v.Values
@@ -440,17 +446,97 @@ func sshdResultOf(cfg *sshdconf.Config) *sshdResult {
 	r.keysCommand = isSetNotNone(g, "AuthorizedKeysCommand")
 	r.trustedCA = isSetNotNone(g, "TrustedUserCAKeys")
 	for _, b := range cfg.MatchBlocks {
-		v, ok := b.Keys["AuthorizedKeysFile"]
-		if !ok || len(b.Criteria) != 2 || !strings.EqualFold(b.Criteria[0], "user") {
-			continue
-		}
-		for u := range strings.SplitSeq(b.Criteria[1], ",") {
-			if _, seen := r.userKeysFiles[u]; !seen && !strings.ContainsAny(u, "*?!") {
-				r.userKeysFiles[u] = v.Values
-			}
+		if v, ok := b.Keys["AuthorizedKeysFile"]; ok {
+			r.keysBlocks = append(r.keysBlocks, keysBlock{criteria: b.Criteria, files: v.Values})
 		}
 	}
 	return r
+}
+
+// Match criteria the backend and authorizedKeys can evaluate, lower case.
+const (
+	criterionUser  = "user"
+	criterionGroup = "group"
+)
+
+// Results of keysBlock.matches.
+const (
+	blockNo    = iota // never applies to the user
+	blockMaybe        // depends on the connection: Address, Host, LocalPort...
+	blockYes          // applies to every connection of the user
+)
+
+// matches evaluates the criteria of a block for a user and their groups
+// as match_cfg_line does: every criterion must match.
+func (b keysBlock) matches(user string, groups []string) int {
+	got := blockYes
+	for i := 0; i < len(b.criteria); i++ {
+		name := strings.ToLower(b.criteria[i])
+		if name == "invalid-user" {
+			return blockNo // a key login is for a user that exists
+		}
+		i++
+		if i == len(b.criteria) {
+			return blockNo
+		}
+		switch pattern := b.criteria[i]; name {
+		case criterionUser:
+			if sshdconf.PatternList(user, pattern) != sshdconf.ListMatch {
+				return blockNo
+			}
+		case criterionGroup:
+			if !groupsMatch(groups, pattern) {
+				return blockNo
+			}
+		default:
+			got = blockMaybe
+		}
+	}
+	return got
+}
+
+// groupsMatch is ga_match_pattern_list: some group matches, and none is
+// negated.
+func groupsMatch(groups []string, pattern string) bool {
+	found := false
+	for _, g := range groups {
+		switch sshdconf.PatternList(g, pattern) {
+		case sshdconf.ListNegated:
+			return false
+		case sshdconf.ListMatch:
+			found = true
+		}
+	}
+	return found
+}
+
+// filesFor is AuthorizedKeysFile for a user over every connection: the
+// first block that always applies, or the global value, plus the files of
+// the blocks before it that apply to some connections.
+func (r *sshdResult) filesFor(user string, groups []string) []string {
+	var out []string
+	for _, b := range r.keysBlocks {
+		switch b.matches(user, groups) {
+		case blockMaybe:
+			out = append(out, b.files...)
+		case blockYes:
+			return uniqueStrings(append(out, b.files...))
+		}
+	}
+	return uniqueStrings(append(out, r.authorizedKeysFiles...))
+}
+
+// uniqueStrings drops repeats, keeping the first.
+func uniqueStrings(in []string) []string {
+	out := make([]string, 0, len(in))
+	seen := map[string]bool{}
+	for _, s := range in {
+		if !seen[s] {
+			seen[s] = true
+			out = append(out, s)
+		}
+	}
+	return out
 }
 
 func isSetNotNone(vals map[string]sshdconf.Value, k string) bool {

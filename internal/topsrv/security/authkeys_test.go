@@ -124,7 +124,7 @@ func filesOf(t *testing.T, d authKeysData, user string) map[string]authKeysFile 
 func testSSHDResult() *depResult {
 	return sshdOK(&sshdResult{
 		authorizedKeysFiles: defaultAuthorizedKeysFiles,
-		userKeysFiles:       map[string][]string{"deploy": {"/etc/ssh/keys/%u"}},
+		keysBlocks:          []keysBlock{{criteria: []string{"User", "deploy"}, files: []string{"/etc/ssh/keys/%u"}}},
 		strictModes:         true,
 	})
 }
@@ -415,4 +415,24 @@ func TestExpandKeysPathEmptyHome(t *testing.T) {
 	paths, errs := expandKeysPath(fixture(t, nil), ".ssh/authorized_keys", account{Name: "svc"})
 	assert.Empty(t, errs)
 	assert.Equal(t, []string{"/.ssh/authorized_keys"}, paths, "sshd joins an empty home as /")
+}
+
+func TestAuthKeysTrustFiles(t *testing.T) {
+	sc := fixture(t, merge(authKeysFixture(), map[string]string{
+		"home/alice/.rhosts":       "+ +\n",
+		"home/alice/.netrc":        "machine example.com login a password SENTINELSECRET\n",
+		"home/bob/.forward":        "-> /etc/SENTINEL",
+		"home/remote/carol/.netrc": "on NFS: never looked at",
+		"etc/hosts.equiv":          "+\n",
+		"etc/shosts.equiv":         "", // empty: trusts nobody
+	}))
+	_, d := authKeysOf(t, sc, nil)
+	got := make([]string, 0, len(d.TrustFiles))
+	for _, f := range d.TrustFiles {
+		got = append(got, f.User+":"+f.Path)
+	}
+	assert.Equal(t, []string{"alice:/home/alice/.rhosts", "alice:/home/alice/.netrc", "bob:/home/bob/.forward"}, got,
+		"a link is found, not followed; a remote home is not touched")
+	assert.Equal(t, []string{"/etc/hosts.equiv"}, pathsOf(d.HostsEquiv))
+	assert.NotContains(t, toJSON(t, d), "SENTINEL")
 }

@@ -1,10 +1,13 @@
 package security
 
 import (
+	"io/fs"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/vmkteam/topsrv/internal/topsrv/security/sshdconf"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -97,7 +100,7 @@ func TestSSHD(t *testing.T) {
 	t.Run("the result for authorizedKeys", func(t *testing.T) {
 		require.NotNil(t, res)
 		assert.Equal(t, defaultAuthorizedKeysFiles, res.authorizedKeysFiles)
-		assert.Equal(t, map[string][]string{"deploy": {"/etc/ssh/keys/%u"}}, res.userKeysFiles)
+		assert.Equal(t, []string{"/etc/ssh/keys/%u"}, res.filesFor("deploy", nil))
 		assert.True(t, res.strictModes)
 		assert.True(t, res.keysCommand)
 		assert.False(t, res.trustedCA)
@@ -268,4 +271,43 @@ func TestSSHDHostKeysAndHardening(t *testing.T) {
 		assert.Nil(t, d.Effective["PermitTTY"].Value, "unset")
 		assert.NotContains(t, toJSON(t, d), "SENTINEL")
 	})
+}
+
+func TestSSHDFilesFor(t *testing.T) {
+	r := sshdResultOf(parseSSHDText(t, "AuthorizedKeysFile .ssh/authorized_keys\n"+
+		"Match Address 10.0.0.0/8 User deploy-*\n  AuthorizedKeysFile /etc/ssh/lan/%u\n"+
+		"Match User deploy-*,!deploy-old\n  AuthorizedKeysFile /etc/ssh/deploy/%u\n"+
+		"Match Group admins\n  AuthorizedKeysFile /etc/ssh/admins/%u\n"+
+		"Match Group *,!wheel\n  AuthorizedKeysFile /etc/ssh/staff/%u\n"+
+		"Match Invalid-User\n  AuthorizedKeysFile /etc/ssh/none\n"))
+	cases := []struct {
+		user   string
+		groups []string
+		want   []string
+	}{
+		{"deploy-01", []string{"deploy"}, []string{"/etc/ssh/lan/%u", "/etc/ssh/deploy/%u"}}, // the LAN block for some connections
+		{"deploy-old", nil, []string{"/etc/ssh/lan/%u", ".ssh/authorized_keys"}},             // negated out of the second block
+		{"alice", []string{"admins", "alice"}, []string{"/etc/ssh/admins/%u"}},
+		{"bob", []string{"bob"}, []string{"/etc/ssh/staff/%u"}},
+		{"carol", []string{"carol", "wheel"}, []string{".ssh/authorized_keys"}}, // a negated group wins
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, r.filesFor(tc.user, tc.groups), tc.user)
+	}
+}
+
+// parseSSHDText parses one sshd_config.
+func parseSSHDText(t *testing.T, text string) *sshdconf.Config {
+	t.Helper()
+	cfg := sshdconf.Parse(sshdconf.Flags{ConfigFile: sshdconf.DefaultConfig}, sshdconf.Files{
+		ReadFile: func(p string) ([]byte, error) {
+			if p == sshdconf.DefaultConfig {
+				return []byte(text), nil
+			}
+			return nil, fs.ErrNotExist
+		},
+		ReadDir: func(string) ([]string, error) { return nil, fs.ErrNotExist },
+	})
+	require.True(t, cfg.Valid(), "%v", cfg.Errors)
+	return cfg
 }

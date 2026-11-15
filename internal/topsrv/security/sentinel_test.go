@@ -60,6 +60,12 @@ func sentinelFiles() map[string]string {
 			"SENTINELLINE is not sudoers\n",
 		"etc/doas.conf": "permit nopass alice as root cmd /usr/bin/SENTINEL args SENTINELSECRET\n",
 
+		// accounts: login.defs keys of a form shadow refuses and keys not sent,
+		// PAM arguments; authorizedKeys: a .netrc with a password
+		"etc/login.defs":     "ENCRYPT_METHOD SENTINELSECRET\nMAIL_DIR /var/SENTINEL\nPASS_MAX_DAYS 90\n",
+		"etc/pam.d/sentinel": "auth required pam_exec.so /usr/bin/SENTINEL SENTINELSECRET\nauth sufficient pam_unix.so nullok\n",
+		"root/.netrc":        "machine example.com login root password SENTINELSECRET\n",
+
 		// updates: a proxy password and a hook command apt reads with the
 		// periodic keys, a value of an unexpected form, a line apt refuses
 		"etc/apt/apt.conf.d/01proxy": "Acquire::http::Proxy \"http://u:SENTINELSECRET@192.0.2.1:3128\";\n" +
@@ -139,6 +145,8 @@ func requireMarkersRead(t *testing.T, d Data) {
 	assert.Equal(t, "root", acc.Users[0].Name)
 	assert.NotEmpty(t, acc.Users[0].PWToken, "shadow read")
 	assert.NotEmpty(t, acc.Malformed, "the malformed passwd line")
+	assert.Equal(t, map[string]string{"ENCRYPT_METHOD": valueInvalid, "PASS_MAX_DAYS": "90"}, acc.LoginDefs)
+	assert.Equal(t, []string{"/etc/pam.d/sentinel"}, acc.PAMNullok)
 
 	sshd := d.Sections[SectionSSHD].Data.(sshdData)
 	assert.Equal(t, true, sshd.Effective["Banner"].Value, "the drop-in read")
@@ -154,6 +162,7 @@ func requireMarkersRead(t *testing.T, d Data) {
 	key := keys.Users[0].Files[0].Keys[0]
 	assert.Equal(t, fingerprint(ed25519Blob(1)), key.FP)
 	assert.True(t, key.Options.Command && key.Options.From, "options read, values dropped")
+	require.Len(t, keys.TrustFiles, 1, "the .netrc found, never read")
 
 	sudo := d.Sections[SectionSudoers].Data.(sudoData)
 	assert.True(t, slices.ContainsFunc(sudo.Rules, func(r sudoRule) bool { return slices.Contains(r.Principals, "alice") }),

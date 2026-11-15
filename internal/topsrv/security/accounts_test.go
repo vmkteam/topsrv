@@ -346,3 +346,12 @@ func TestAccountsGroupUnread(t *testing.T) {
 	assert.Nil(t, d.Anomalies.DuplicateGIDs, "null: not read")
 	assert.Nil(t, d.Anomalies.PrimaryGroupMissing)
 }
+
+func TestAccountsGroupsByUser(t *testing.T) {
+	_, _, res := accountsOf(t, accountsFixture())
+	require.NotNil(t, res)
+	assert.Equal(t, []string{"alice", "docker", "sudo"}, res.groups["alice"], "primary by GID, supplementary by member list")
+	assert.Equal(t, []string{"root"}, res.groups["root"])
+	assert.Empty(t, res.groups["daemon"], "GID 1 has no group line")
+	assert.Equal(t, []string{"adm"}, res.groups["syslog"], "a member without a passwd entry still gets its groups")
+}

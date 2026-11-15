@@ -1,6 +1,7 @@
 package security
 
 import (
+	"cmp"
 	"context"
 	"path/filepath"
 	"slices"
@@ -76,6 +77,12 @@ type accountsData struct {
 	// not see.
 	NISCompat bool       `json:"nisCompat,omitempty"`
 	NSS       *nssConfig `json:"nss"`
+	// LoginDefs are the keys of login.defs the backend checks, as written,
+	// "invalid" in a form shadow-utils refuses; null without the file.
+	LoginDefs map[string]string `json:"loginDefs"`
+	// PAMNullok are the PAM service files where pam_unix takes an empty
+	// password; null without PAM.
+	PAMNullok []string   `json:"pamNullok"`
 	Files     []fileMeta `json:"files"`
 	Malformed []lineRef  `json:"malformed,omitempty"`
 }
@@ -84,15 +91,18 @@ type accountsData struct {
 // leaves the host: only its class, algorithm and a keyed token that changes
 // with the password.
 type account struct {
-	Name       string  `json:"name"`
-	UID        int64   `json:"uid"`
-	GID        int64   `json:"gid"`
-	Shell      string  `json:"shell"`
-	ShellClass string  `json:"shellClass"`
-	PW         *string `json:"pw"` // null: shadow unread, or no shadow entry for "x"
-	Marker     string  `json:"marker,omitempty"`
-	Algo       string  `json:"algo,omitempty"`
-	PWToken    string  `json:"pwToken,omitempty"`
+	Name       string `json:"name"`
+	UID        int64  `json:"uid"`
+	GID        int64  `json:"gid"`
+	Shell      string `json:"shell"`
+	ShellClass string `json:"shellClass"`
+	// ShellListed: the shell is in /etc/shells (chsh, pam_shells, ftp
+	// servers check it); null when the file is unreadable.
+	ShellListed *bool   `json:"shellListed"`
+	PW          *string `json:"pw"` // null: shadow unread, or no shadow entry for "x"
+	Marker      string  `json:"marker,omitempty"`
+	Algo        string  `json:"algo,omitempty"`
+	PWToken     string  `json:"pwToken,omitempty"`
 	// LastChangeDays is the shadow field as kept: days since 1970-01-01 of
 	// the last change, 0 — change at next login.
 	LastChangeDays *int64 `json:"lastChangeDays"`
@@ -131,7 +141,8 @@ type accountAnomalies struct {
 // accountsResult is what authorizedKeys builds on: every user, not only the
 // listed ones, with home directories.
 type accountsResult struct {
-	users []account
+	users  []account
+	groups map[string][]string // user → names of the primary and supplementary groups; nil when group is unread
 }
 
 type passwdEntry struct {
@@ -185,6 +196,15 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 	}
 
 	all := buildAccounts(sc, users, shadow)
+	if shells := collectShells(sc, &gaps); shells != nil {
+		for i := range all {
+			shell := cmp.Or(all[i].Shell, "/bin/sh") // login runs /bin/sh for an empty field
+			listed := shells[shell]
+			all[i].ShellListed = &listed
+		}
+	}
+	d.LoginDefs = collectLoginDefs(sc, &gaps)
+	d.PAMNullok = collectPAMNullok(sc, &gaps)
 	d.Users = all
 	if len(all) > maxUsers {
 		d.Users, d.Truncated = all[:maxUsers], true
@@ -196,7 +216,7 @@ func collectAccounts(_ context.Context, sc *scanCtx) (Section, any) {
 		d.Anomalies.addGroups(users, groups)
 	}
 	d.Files = filesMeta(sc, []string{pathPasswd, pathShadow, pathGroup, pathGshadow})
-	return collected(gaps, d), &accountsResult{users: all}
+	return collected(gaps, d), &accountsResult{users: all, groups: groupsByUser(users, groups)}
 }
 
 // parsePasswd parses name:pw:uid:gid:gecos:home:shell. GECOS is skipped
@@ -460,6 +480,33 @@ func accountAnomaliesOf(users []passwdEntry, shadow map[string]shadowEntry) acco
 
 // privilegedMembers lists the members of each privileged group present:
 // those in the member list and those whose primary group it is.
+// groupsByUser lists each user's groups by name, as getgrouplist does from
+// files: the primary GID's group and those naming the user. nil without
+// group.
+func groupsByUser(users []passwdEntry, groups map[string]groupEntry) map[string][]string {
+	if groups == nil {
+		return nil
+	}
+	byGID := map[int64][]string{}
+	for name, g := range groups {
+		byGID[g.gid] = append(byGID[g.gid], name)
+	}
+	out := map[string][]string{}
+	for _, u := range users {
+		out[u.name] = append(out[u.name], byGID[u.gid]...)
+	}
+	for name, g := range groups {
+		for _, m := range g.members {
+			out[m] = append(out[m], name)
+		}
+	}
+	for u, gs := range out {
+		slices.Sort(gs)
+		out[u] = slices.Compact(gs)
+	}
+	return out
+}
+
 // addGroups adds the anomalies of /etc/group.
 func (a *accountAnomalies) addGroups(users []passwdEntry, groups map[string]groupEntry) {
 	a.DuplicateGroupNames, a.DuplicateGIDs, a.GID0Groups, a.PrimaryGroupMissing = []string{}, []int64{}, []string{}, []string{}
