@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"context"
+	"net/netip"
 	"os"
 	"path/filepath"
 	"slices"
@@ -30,12 +31,12 @@ type NetworkCollector struct {
 func NewNetworkCollector(logger embedlog.Logger) *NetworkCollector {
 	return &NetworkCollector{
 		Logger:     logger,
-		netBytes:   prometheus.NewDesc("topsrv_network_bytes_total", "Total bytes transferred.", []string{"interface", "direction"}, nil),
-		netPackets: prometheus.NewDesc("topsrv_network_packets_total", "Total packets transferred.", []string{"interface", "direction"}, nil),
-		netErrors:  prometheus.NewDesc("topsrv_network_errors_total", "Total network errors.", []string{"interface", "direction"}, nil),
-		netDrops:   prometheus.NewDesc("topsrv_network_drops_total", "Total dropped packets.", []string{"interface", "direction"}, nil),
-		netSpeed:   prometheus.NewDesc("topsrv_network_speed_bytes", "Network interface link speed in bytes per second.", []string{"interface"}, nil),
-		ifaceInfo:  prometheus.NewDesc("topsrv_network_info", "Network interface information.", []string{"interface", "mac", "address", "mtu", "operstate"}, nil),
+		netBytes:   prometheus.NewDesc("topsrv_network_bytes_total", "Total bytes transferred.", []string{labelInterface, "direction"}, nil),
+		netPackets: prometheus.NewDesc("topsrv_network_packets_total", "Total packets transferred.", []string{labelInterface, "direction"}, nil),
+		netErrors:  prometheus.NewDesc("topsrv_network_errors_total", "Total network errors.", []string{labelInterface, "direction"}, nil),
+		netDrops:   prometheus.NewDesc("topsrv_network_drops_total", "Total dropped packets.", []string{labelInterface, "direction"}, nil),
+		netSpeed:   prometheus.NewDesc("topsrv_network_speed_bytes", "Network interface link speed in bytes per second.", []string{labelInterface}, nil),
+		ifaceInfo:  prometheus.NewDesc("topsrv_network_info", "Network interface information.", []string{labelInterface, "mac", "address", "mtu", "operstate"}, nil),
 	}
 }
 
@@ -83,23 +84,40 @@ func (c *NetworkCollector) collectInterfaces(ch chan<- prometheus.Metric) {
 		return
 	}
 	for _, iface := range ifaces {
-		// first IPv4 address
-		addr := ""
-		for _, a := range iface.Addrs {
-			if strings.Contains(a.Addr, ".") {
-				addr = a.Addr
-				break
-			}
-		}
-
 		operstate := "down"
 		if slices.Contains(iface.Flags, "up") {
 			operstate = "up"
 		}
-
-		ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,
-			iface.Name, iface.HardwareAddr, addr, strconv.Itoa(iface.MTU), operstate)
+		for _, addr := range ifaceAddresses(iface.Addrs) {
+			ch <- prometheus.MustNewConstMetric(c.ifaceInfo, prometheus.GaugeValue, 1,
+				iface.Name, iface.HardwareAddr, addr, strconv.Itoa(iface.MTU), operstate)
+		}
 	}
+}
+
+// maxIfaceAddrs caps the addresses reported per interface: kube-ipvs0 of an
+// IPVS node holds the ClusterIP of every Service.
+const maxIfaceAddrs = 16
+
+// ifaceAddresses lists the addresses of an interface as reported ("10.0.0.5/24"),
+// IPv4 and IPv6, link-local left out, at most maxIfaceAddrs: a series per
+// address, since the first address is often a floating IP and not where
+// traffic goes from. An interface without addresses gets one series with an
+// empty address.
+func ifaceAddresses(addrs []net.InterfaceAddr) []string {
+	var out []string
+	for _, a := range addrs {
+		if len(out) == maxIfaceAddrs {
+			break
+		}
+		if p, err := netip.ParsePrefix(a.Addr); err == nil && !p.Addr().IsLinkLocalUnicast() {
+			out = append(out, a.Addr)
+		}
+	}
+	if out == nil {
+		out = []string{""}
+	}
+	return out
 }
 
 // collectSpeed reads link speed from /sys/class/net/<iface>/speed for physical NICs (Linux only).

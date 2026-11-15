@@ -38,7 +38,13 @@ type HostMeta struct {
 	KernelRelease     string   `json:"kernelRelease"`
 	KernelArch        string   `json:"kernelArch,omitempty"`
 	PackageManager    string   `json:"packageManager"`
-	// RebootRequired — a kernel image newer than the running one is installed;
-	// the update takes effect only after a reboot. Per manager snapshot.
+	// RebootRequired — an update takes effect only after a reboot: a kernel
+	// image newer than the running one is installed, or, on Debian and
+	// Ubuntu, /var/run/reboot-required exists (libc6, systemd, microcode).
+	// Per manager snapshot.
 	RebootRequired bool `json:"rebootRequired,omitempty"`
+	// RebootRequiredPackages — Debian and Ubuntu: the packages that asked for
+	// the reboot, from /var/run/reboot-required.pkgs: unique, sorted, at most
+	// 64.
+	RebootRequiredPackages []string `json:"rebootRequiredPackages,omitempty"`
 }

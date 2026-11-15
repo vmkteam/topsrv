@@ -62,6 +62,7 @@ type Pusher struct {
 	inventoryEndpoint  string    // derived: /v1/write → /v1/inventory
 	metricsSpool       spool.Dir // <SpoolDir>/<unixms>.gz
 	inventorySpool     spool.Dir // <SpoolDir>/inventory/<kind>-<unixms>.json
+	source             *pushSource
 
 	// rejectLoggedAt rate-limits logging of 4xx inventory responses per kind.
 	// Only the Run goroutine touches it (push → inventory send and resend).
@@ -92,6 +93,12 @@ func NewPusher(logger embedlog.Logger, appName, version string, cfg PushConfig, 
 		metricsSpool:      spool.Dir{Path: cfg.SpoolDir, Ext: ".gz"},
 		inventorySpool:    spool.Dir{Ext: ".json"},
 		rejectLoggedAt:    make(map[string]time.Time),
+		source:            newPushSource(cfg.Endpoint),
+	}
+	if registry != nil {
+		if err := registry.Register(p.source); err != nil {
+			logger.Error(context.Background(), "push: source address metric not registered", "error", err)
+		}
 	}
 	if cfg.SpoolDir != "" { // Join("", dir) would be a path relative to the working directory
 		p.inventorySpool.Path = filepath.Join(cfg.SpoolDir, inventorySpoolDir)
@@ -165,6 +172,7 @@ func (p *Pusher) push(ctx context.Context) {
 		return
 	}
 
+	p.source.current(false)
 	if err := p.deliverMetrics(ctx, data); err == nil {
 		totalMs := time.Since(start).Milliseconds()
 		p.Print(ctx, "push: ok", "size", len(data), "gatherMs", gatherMs, "totalMs", totalMs)
@@ -223,7 +231,7 @@ func (p *Pusher) deliverMetrics(ctx context.Context, data []byte) error {
 	switch {
 	case err == nil:
 	case spool.Retryable(err):
-		p.Error(ctx, "push: send failed, spooling", "error", err)
+		p.Error(ctx, "push: send failed, spooling", "src", p.source.current(true), "error", err)
 		p.spoolWrite(ctx, p.metricsSpool, "", pushMaxSpoolSize, data)
 	default:
 		p.Error(ctx, "push: rejected by the backend, dropping", "error", err)

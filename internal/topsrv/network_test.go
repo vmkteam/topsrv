@@ -1,9 +1,11 @@
 package topsrv
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/shirou/gopsutil/v4/net"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/vmkteam/embedlog"
@@ -80,4 +82,22 @@ func TestNetworkCollectorInterfaceInfo(t *testing.T) {
 		return
 	}
 	t.Fatal("topsrv_network_info not found")
+}
+
+func TestIfaceAddresses(t *testing.T) {
+	got := ifaceAddresses([]net.InterfaceAddr{
+		{Addr: "10.0.0.5/24"},
+		{Addr: "fe80::1/64"},
+		{Addr: "203.0.113.7/32"},
+		{Addr: "169.254.10.1/16"},
+		{Addr: "2001:db8::5/64"},
+	})
+	assert.Equal(t, []string{"10.0.0.5/24", "203.0.113.7/32", "2001:db8::5/64"}, got, "every address, link-local left out")
+	assert.Equal(t, []string{""}, ifaceAddresses(nil), "no addresses: one series with an empty address")
+
+	ipvs := make([]net.InterfaceAddr, 0, 500) // kube-ipvs0: a ClusterIP per Service
+	for i := range 500 {
+		ipvs = append(ipvs, net.InterfaceAddr{Addr: fmt.Sprintf("10.96.%d.%d/32", i/256, i%256)})
+	}
+	assert.Len(t, ifaceAddresses(ipvs), maxIfaceAddrs)
 }

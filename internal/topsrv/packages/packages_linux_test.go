@@ -58,3 +58,14 @@ func TestBuildPendingPayloadsRebootRequired(t *testing.T) {
 		t.Errorf("push disabled: got %d payloads, want none", len(got))
 	}
 }
+
+func TestBuildPendingPayloadsRebootPackages(t *testing.T) {
+	host := inventory.HostMeta{OsID: "ubuntu"}
+	snaps := []Snapshot{{Manager: inventory.ManagerDpkg, RebootRequired: true, RebootRequiredPackages: []string{"libc6"}}}
+
+	out := buildPendingPayloads(host, snaps, time.Now(), true)
+
+	if got := out[0].Host.RebootRequiredPackages; len(got) != 1 || got[0] != "libc6" {
+		t.Errorf("host packages = %q, want libc6", got)
+	}
+}

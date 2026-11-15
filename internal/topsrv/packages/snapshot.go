@@ -12,9 +12,10 @@ const (
 type Snapshot struct {
 	Manager  string    `json:"manager"`
 	Packages []Package `json:"packages"`
-	// RebootRequired is set by markKernelPackages and shipped in HostMeta,
-	// not in data.
-	RebootRequired bool `json:"-"`
+	// RebootRequired and RebootRequiredPackages are shipped in HostMeta, not
+	// in data.
+	RebootRequired         bool     `json:"-"`
+	RebootRequiredPackages []string `json:"-"`
 }
 
 // Package — security-oriented inventory entry. Field grouping mirrors the

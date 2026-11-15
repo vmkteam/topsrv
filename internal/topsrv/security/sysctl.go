@@ -2,6 +2,8 @@ package security
 
 import (
 	"context"
+	"errors"
+	"io/fs"
 	"slices"
 	"strings"
 )
@@ -58,11 +60,13 @@ var containerIfacePrefixes = []string{"veth", "cali", "lxc"}
 // never pushes out the uplinks and bridges of the host.
 var guestIfacePrefixes = []string{"fwbr", "fwln", "fwpr", "tap", "vnet", "vif"}
 
+// sysctlData holds raw values. A key the kernel does not have is absent; one
+// it has but the agent could not read is null, with a gap that says why.
 type sysctlData struct {
-	Values        map[string]string            `json:"values"`
-	IPv4Conf      map[string]map[string]string `json:"ipv4Conf"`
-	IPv6Conf      map[string]map[string]string `json:"ipv6Conf"`
-	ConfTruncated bool                         `json:"confTruncated,omitempty"`
+	Values        map[string]*string            `json:"values"`
+	IPv4Conf      map[string]map[string]*string `json:"ipv4Conf"`
+	IPv6Conf      map[string]map[string]*string `json:"ipv6Conf"`
+	ConfTruncated bool                          `json:"confTruncated,omitempty"`
 }
 
 func collectSysctl(_ context.Context, sc *scanCtx) Section {
@@ -70,7 +74,7 @@ func collectSysctl(_ context.Context, sc *scanCtx) Section {
 		return unknown(reasonOf(err))
 	}
 	var gaps gapList
-	d := sysctlData{Values: map[string]string{}}
+	d := sysctlData{Values: map[string]*string{}}
 	for _, key := range sysctlKeys {
 		if v, ok := readSysctl(sc, "/proc/sys/"+strings.ReplaceAll(key, ".", "/"), &gaps); ok {
 			d.Values[key] = v
@@ -83,19 +87,25 @@ func collectSysctl(_ context.Context, sc *scanCtx) Section {
 	return collected(gaps, d)
 }
 
-// readSysctl reads one value; a key the kernel does not have is skipped.
-func readSysctl(sc *scanCtx, path string, gaps *gapList) (string, bool) {
+// readSysctl reads one value. present is false for a key the kernel does
+// not have; a key it has that could not be read is present with a nil value
+// and a gap.
+func readSysctl(sc *scanCtx, path string, gaps *gapList) (v *string, present bool) {
 	b, err := sc.read(path, smallFileLimit)
-	if err != nil {
-		gaps.optional(path, err)
-		return "", false
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return nil, false
+	case err != nil:
+		gaps.add(path, err)
+		return nil, true
 	}
-	return strings.TrimRight(string(b), "\n"), true
+	s := strings.TrimRight(string(b), "\n")
+	return &s, true
 }
 
 // readConf reads keys for "all", "default" and up to maxConfInterfaces
 // interfaces: physical ones first, guest ones last, by name within a group.
-func readConf(sc *scanCtx, dir string, keys []string, gaps *gapList) (map[string]map[string]string, bool) {
+func readConf(sc *scanCtx, dir string, keys []string, gaps *gapList) (map[string]map[string]*string, bool) {
 	entries, err := sc.readDir(dir)
 	if err != nil {
 		gaps.optional(dir, err) // no IPv6
@@ -121,9 +131,9 @@ func readConf(sc *scanCtx, dir string, keys []string, gaps *gapList) (map[string
 	truncated := len(ifaces) > maxConfInterfaces
 	names := slices.Concat([]string{"all", "default"}, ifaces[:min(len(ifaces), maxConfInterfaces)])
 
-	out := map[string]map[string]string{}
+	out := map[string]map[string]*string{}
 	for _, name := range names {
-		vals := map[string]string{}
+		vals := map[string]*string{}
 		for _, k := range keys {
 			if v, ok := readSysctl(sc, dir+name+"/"+k, gaps); ok {
 				vals[k] = v

@@ -79,6 +79,11 @@ func (c *Collector) scanManager(ctx context.Context, m managerFunc, host invento
 		return Snapshot{}, nil, false
 	}
 	snap.RebootRequired = markKernelPackages(m.name, snap.Packages, host.KernelRelease)
+	if m.name == inventory.ManagerDpkg {
+		pending, pkgs := debianRebootRequired("")
+		snap.RebootRequired = snap.RebootRequired || pending
+		snap.RebootRequiredPackages = pkgs
+	}
 
 	total := len(snap.Packages)
 	if total > limit {
@@ -118,6 +123,7 @@ func buildPendingPayloads(host inventory.HostMeta, snaps []Snapshot, now time.Ti
 		h := host
 		h.PackageManager = s.Manager
 		h.RebootRequired = s.RebootRequired
+		h.RebootRequiredPackages = s.RebootRequiredPackages
 		out = append(out, inventory.Payload{
 			Kind:      inventoryKindPackages,
 			ScannedAt: now,
