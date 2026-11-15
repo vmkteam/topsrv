@@ -164,10 +164,7 @@ func expandKeysPath(sc *scanCtx, pattern string, u account) ([]string, []sshdcon
 		p = strings.NewReplacer("%%", "%", "%h", u.home, "%u", u.Name, "%U", strconv.FormatInt(u.UID, 10)).Replace(p)
 	}
 	if !path.IsAbs(p) {
-		if u.home == "" {
-			return nil, nil
-		}
-		p = path.Join(u.home, p)
+		p = path.Join("/", u.home, p) // an empty home: sshd reads /.ssh/authorized_keys
 	}
 	p = path.Clean(p)
 	if !sshdconf.HasMeta(p) {
@@ -240,12 +237,14 @@ func strictModesOK(sc *scanCtx, file string, fi fs.FileInfo, u account) bool {
 }
 
 // readableBy: sshd opens the file as the user, not as root — a link to
-// /root/.ssh/authorized_keys gives the user nothing. Supplementary groups are
-// not known here, only the primary one.
+// /root/.ssh/authorized_keys gives the user nothing. Root reads any file.
+// Supplementary groups are not known here, only the primary one.
 func readableBy(fi fs.FileInfo, u account) bool {
 	uid, gid := fileOwner(fi)
 	perm := fi.Mode().Perm()
 	switch {
+	case u.UID == 0:
+		return true
 	case uid == u.UID:
 		return perm&0o400 != 0
 	case gid == u.GID:

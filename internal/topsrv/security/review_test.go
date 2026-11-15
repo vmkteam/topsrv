@@ -132,6 +132,7 @@ func TestReadableBy(t *testing.T) {
 	assert.False(t, readableBy(stat(0o600), account{UID: me + 1, GID: myGroup}), "root's 0600 file is not the user's")
 	assert.True(t, readableBy(stat(0o640), account{UID: me + 1, GID: myGroup}))
 	assert.True(t, readableBy(stat(0o604), account{UID: me + 1, GID: myGroup + 1}))
+	assert.True(t, readableBy(stat(0), account{UID: 0, GID: myGroup + 1}), "root reads any file")
 }
 
 func TestSSHDUntrustedListener(t *testing.T) {

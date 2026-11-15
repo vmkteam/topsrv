@@ -217,7 +217,7 @@ func (p *parser) validCriteria(args []string) bool {
 		if name == "invalid-user" {
 			continue
 		}
-		if i+1 == len(args) {
+		if i+1 == len(args) || args[i+1] == "" { // "Missing Match criteria"
 			return false
 		}
 		i++

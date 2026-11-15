@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -330,4 +331,88 @@ func TestParseAuthKeyLineReview(t *testing.T) {
 			assert.Equal(t, tc.mismatch, k.TypeMismatch)
 		})
 	}
+}
+
+// typedBlob is a blob of the given type with a 32-byte body.
+func typedBlob(typ string) []byte {
+	return append(wireString([]byte(typ)), wireString(make([]byte, 32))...)
+}
+
+func TestParseAuthKeyTypes(t *testing.T) {
+	cases := []struct {
+		name     string
+		line     string
+		ok       bool
+		mismatch bool
+		unknown  bool
+	}{
+		{"webauthn names an sk-ecdsa key", keyTypeWebAuthn + " " + b64(typedBlob("sk-ecdsa-sha2-nistp256@openssh.com")), true, false, false},
+		{"webauthn certificate", keyTypeWebAuthnCert + " " + b64(typedBlob("sk-ecdsa-sha2-nistp256-cert-v01@openssh.com")), true, false, false},
+		{"ML-DSA hybrid", "ssh-mldsa44-ed25519 " + b64(typedBlob("ssh-mldsa44-ed25519")), true, false, false},
+		{"a type of a newer OpenSSH, named by the blob too", "ssh-future@openssh.com " + b64(typedBlob("ssh-future@openssh.com")), true, false, true},
+		{"an unknown type with a blob of another", "ssh-future " + b64(ed25519Blob(1)), false, false, false},
+		{"an unknown type after options", `no-pty ssh-future ` + b64(typedBlob("ssh-future")), true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k, ok := parseAuthKeyLine(tc.line)
+			require.Equal(t, tc.ok, ok)
+			assert.Equal(t, tc.mismatch, k.TypeMismatch)
+			assert.Equal(t, tc.unknown, k.TypeUnknown)
+		})
+	}
+}
+
+// TestParseAuthKeyOptions: the options as sshauthopt_parse applies them,
+// left to right.
+func TestParseAuthKeyOptions(t *testing.T) {
+	key := " ssh-ed25519 " + b64(ed25519Blob(1))
+	allDenied := authKeyOptions{Restrict: true, NoPortForwarding: true, NoAgentForwarding: true, NoX11Forwarding: true, NoPty: true, NoUserRC: true}
+	at := func(s string) *time.Time { tm, err := time.Parse(time.RFC3339, s); require.NoError(t, err); return &tm }
+	cases := []struct {
+		name     string
+		opts     string
+		want     authKeyOptions
+		rejected bool
+	}{
+		{"restrict denies all", "restrict", allDenied, false},
+		{"a later flag allows again", "restrict,port-forwarding,PTY",
+			authKeyOptions{Restrict: true, NoAgentForwarding: true, NoX11Forwarding: true, NoUserRC: true}, false},
+		{"restrict after a flag wins", "pty,restrict", allDenied, false},
+		{"no- then allow", "no-port-forwarding,port-forwarding", authKeyOptions{}, false},
+		{"security key flags", "no-touch-required,verify-required", authKeyOptions{NoTouchRequired: true, VerifyRequired: true}, false},
+		{"no-restrict is not an option", "no-restrict", authKeyOptions{}, true},
+		{"a second command", `command="a",command="b"`, authKeyOptions{Command: true}, true},
+		{"a second from", `from="192.0.2.1",from="192.0.2.2"`, authKeyOptions{From: true}, true},
+		{"principals", `principals="alice"`, authKeyOptions{Principals: true}, false},
+		{"environment", `environment="TOKEN=x"`, authKeyOptions{Environment: true}, false},
+		{"environment without =", `environment="TOKEN"`, authKeyOptions{}, true},
+		{"environment with a bad name", `environment="A-B=1"`, authKeyOptions{}, true},
+		{"expiry in UTC, the earliest kept", `expiry-time="202612312359Z",expiry-time="20271231UTC"`,
+			authKeyOptions{Expiry: true, ExpiresAt: at("2026-12-31T23:59:00Z")}, false},
+		{"expiry of a bad form", `expiry-time="2026"`, authKeyOptions{}, true},
+		{"tunnel", `tunnel="any",tunnel="5"`, authKeyOptions{Tunnel: true}, false},
+		{"tunnel of a bad form", `tunnel="tun0"`, authKeyOptions{}, true},
+		{"permitopen and permitlisten", `permitopen="host:22",permitlisten="8080"`, authKeyOptions{PermitOpen: true, PermitListen: true}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			k, ok := parseAuthKeyLine(tc.opts + key)
+			require.True(t, ok)
+			assert.Equal(t, tc.want, k.Options)
+			assert.Equal(t, tc.rejected, k.Rejected)
+		})
+	}
+
+	t.Run("expiry in local time", func(t *testing.T) {
+		k, ok := parseAuthKeyLine(`expiry-time="20261231"` + key)
+		require.True(t, ok)
+		assert.Equal(t, time.Date(2026, 12, 31, 0, 0, 0, 0, time.Local).UTC(), *k.Options.ExpiresAt)
+	})
+}
+
+func TestExpandKeysPathEmptyHome(t *testing.T) {
+	paths, errs := expandKeysPath(fixture(t, nil), ".ssh/authorized_keys", account{Name: "svc"})
+	assert.Empty(t, errs)
+	assert.Equal(t, []string{"/.ssh/authorized_keys"}, paths, "sshd joins an empty home as /")
 }

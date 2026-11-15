@@ -88,6 +88,9 @@ type sshdMatch struct {
 	// with accounts; Address and Host depend on the connection.
 	Evaluable bool                 `json:"evaluable"`
 	Keys      map[string]sshdValue `json:"keys"`
+	// EqualsSyntax: written criterion=pattern (criteria come split into
+	// pairs either way), which only OpenSSH 10.0+ accepts: older sshd exits.
+	EqualsSyntax bool `json:"equalsSyntax,omitempty"`
 }
 
 type sshdFile struct {
@@ -387,7 +390,8 @@ func sshdMatches(blocks []*sshdconf.MatchBlock) []sshdMatch {
 				evaluable = false
 			}
 		}
-		out = append(out, sshdMatch{Criteria: b.Criteria, Source: b.Source, Evaluable: evaluable, Keys: sshdValues(b.Keys, false)})
+		out = append(out, sshdMatch{Criteria: b.Criteria, Source: b.Source, Evaluable: evaluable, Keys: sshdValues(b.Keys, false),
+			EqualsSyntax: b.EqualsSyntax})
 	}
 	return out
 }
