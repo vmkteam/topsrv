@@ -2,6 +2,7 @@ package topsrv
 
 import (
 	"archive/tar"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"crypto/sha256"
@@ -17,14 +18,14 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
-	"sort"
-	"strconv"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/shirou/gopsutil/v4/host"
 	"github.com/vmkteam/appkit"
 	"github.com/vmkteam/embedlog"
+	"golang.org/x/mod/semver"
 )
 
 const (
@@ -527,57 +528,54 @@ func (u *Updater) backup() error {
 	return nil
 }
 
+// trimBackups keeps the updateMaxBackups newest copies. The copy of the
+// running version, just made for a crash-loop rollback, is kept whatever
+// its number: a host downgraded by hand runs an older version than its
+// other copies.
 func (u *Updater) trimBackups() {
 	entries, err := os.ReadDir(u.backupDir)
 	if err != nil || len(entries) <= updateMaxBackups {
 		return
 	}
 
-	// Sort by version (semantic), remove oldest.
 	names := make([]string, 0, len(entries))
 	for _, e := range entries {
 		if !e.IsDir() {
 			names = append(names, e.Name())
 		}
 	}
-	sort.Slice(names, func(i, j int) bool {
-		return compareVersionedNames(names[i], names[j]) < 0
+	current := backupPrefix + u.version
+	slices.SortFunc(names, func(a, b string) int {
+		switch current {
+		case a:
+			return 1
+		case b:
+			return -1
+		}
+		return compareVersionedNames(a, b)
 	})
 
-	for _, name := range names[:len(names)-updateMaxBackups] {
+	for _, name := range names[:max(len(names)-updateMaxBackups, 0)] {
 		os.Remove(filepath.Join(u.backupDir, name))
 	}
 }
 
-// compareVersionedNames compares backup filenames like "topsrv-0.0.9" and "topsrv-0.0.10"
-// using numeric segment comparison to ensure correct ordering.
+// compareVersionedNames orders backup names like "topsrv-0.2.0-rc.6" and
+// "topsrv-v0.2.1" by semver: a pre-release before its release, rc.9
+// before rc.10. A name that is not a version comes first, so it is
+// removed first.
 func compareVersionedNames(a, b string) int {
-	va := extractVersion(a)
-	vb := extractVersion(b)
-	if va == "" || vb == "" {
-		return strings.Compare(a, b)
-	}
-
-	partsA := strings.Split(va, ".")
-	partsB := strings.Split(vb, ".")
-
-	for i := 0; i < len(partsA) && i < len(partsB); i++ {
-		na, _ := strconv.Atoi(partsA[i])
-		nb, _ := strconv.Atoi(partsB[i])
-		if na != nb {
-			return na - nb
-		}
-	}
-	return len(partsA) - len(partsB)
+	return cmp.Or(semver.Compare(backupVersion(a), backupVersion(b)), strings.Compare(a, b))
 }
 
-// extractVersion extracts version string from backup filename like "topsrv-0.0.9" or "topsrv-v0.0.9".
-func extractVersion(name string) string {
-	_, after, ok := strings.Cut(name, backupPrefix)
+// backupVersion returns the version of a backup name with the "v" semver
+// wants, "" for a name without the prefix.
+func backupVersion(name string) string {
+	v, ok := strings.CutPrefix(name, backupPrefix)
 	if !ok {
 		return ""
 	}
-	return strings.TrimPrefix(after, "v")
+	return "v" + strings.TrimPrefix(v, "v")
 }
 
 // replace copies new binary to same filesystem, then atomic rename.

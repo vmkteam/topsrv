@@ -418,6 +418,12 @@ func TestCompareVersionedNames(t *testing.T) {
 		{"topsrv-0.0.9", "topsrv-0.0.9", 0},
 		{"topsrv-1.0.0", "topsrv-0.9.99", 1},
 		{"topsrv-v0.0.9", "topsrv-v0.0.10", -1},
+		{"topsrv-0.2.0-rc.5", "topsrv-0.2.0", -1},
+		{"topsrv-0.2.0-rc.6", "topsrv-0.2.1-rc.1", -1},
+		{"topsrv-0.2.0-rc.9", "topsrv-0.2.0-rc.10", -1},
+		{"topsrv-v0.2.1", "topsrv-0.2.1-rc.2", 1},
+		{"topsrv-junk", "topsrv-0.0.1", -1},
+		{"other", "topsrv-0.0.1", -1},
 	}
 	for _, tt := range tests {
 		got := compareVersionedNames(tt.a, tt.b)
@@ -430,6 +436,75 @@ func TestCompareVersionedNames(t *testing.T) {
 			assert.Zero(t, got, "%s vs %s", tt.a, tt.b)
 		}
 	}
+}
+
+func TestTrimBackupsPreRelease(t *testing.T) {
+	tests := []struct {
+		name    string
+		version string // running, its copy just made
+		files   []string
+		want    []string
+	}{
+		{"release after its rcs", "0.2.0",
+			[]string{"0.2.0", "0.2.0-rc.5", "0.2.0-rc.6"}, []string{"0.2.0", "0.2.0-rc.6"}},
+		{"next rc after older rcs", "0.2.1-rc.1",
+			[]string{"0.2.1-rc.1", "0.2.0-rc.5", "0.2.0-rc.6"}, []string{"0.2.0-rc.6", "0.2.1-rc.1"}},
+		{"v in a name", "0.2.1-rc.1",
+			[]string{"v0.1.9", "0.2.0", "0.2.1-rc.1"}, []string{"0.2.0", "0.2.1-rc.1"}},
+		{"not a version goes first", "0.2.1",
+			[]string{"junk", "0.2.0", "0.2.1"}, []string{"0.2.0", "0.2.1"}},
+		{"running copy kept after a downgrade by hand", "0.2.0",
+			[]string{"0.2.0", "0.2.1", "0.2.2"}, []string{"0.2.0", "0.2.2"}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			for _, v := range tt.files {
+				require.NoError(t, os.WriteFile(filepath.Join(dir, backupPrefix+v), []byte(v), 0o755))
+			}
+			u := &Updater{version: tt.version, backupDir: dir}
+
+			u.trimBackups()
+
+			want := make([]string, 0, len(tt.want))
+			for _, v := range tt.want {
+				want = append(want, backupPrefix+v)
+			}
+			assert.ElementsMatch(t, want, backupNames(t, dir))
+		})
+	}
+}
+
+// TestBackupKeepsRollbackCopy is the update of a beta host: the copy just
+// made is what attemptRollback reads.
+func TestBackupKeepsRollbackCopy(t *testing.T) {
+	tmpDir := t.TempDir()
+	binPath := filepath.Join(tmpDir, "topsrv")
+	require.NoError(t, os.WriteFile(binPath, []byte("rc.1"), 0o755))
+	backupDir := filepath.Join(tmpDir, ".topsrv-backup")
+	require.NoError(t, os.MkdirAll(backupDir, 0o755))
+	for _, v := range []string{"0.2.0-rc.5", "0.2.0-rc.6"} {
+		require.NoError(t, os.WriteFile(filepath.Join(backupDir, backupPrefix+v), []byte(v), 0o755))
+	}
+	u := &Updater{version: "0.2.1-rc.1", binPath: binPath, backupDir: backupDir}
+
+	require.NoError(t, u.backup())
+
+	assert.ElementsMatch(t, []string{"topsrv-0.2.0-rc.6", "topsrv-0.2.1-rc.1"}, backupNames(t, backupDir))
+	data, err := os.ReadFile(filepath.Join(backupDir, backupPrefix+"0.2.1-rc.1"))
+	require.NoError(t, err)
+	assert.Equal(t, "rc.1", string(data), "the rollback copy is the running binary")
+}
+
+func backupNames(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	names := make([]string, 0, len(entries))
+	for _, e := range entries {
+		names = append(names, e.Name())
+	}
+	return names
 }
 
 func TestTrimBackupsVersionOrder(t *testing.T) {
