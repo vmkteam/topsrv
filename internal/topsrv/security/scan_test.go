@@ -254,6 +254,32 @@ func TestCollectorMetrics(t *testing.T) {
 	assert.Empty(t, problems)
 }
 
+func TestCollectorScanErrors(t *testing.T) {
+	c, _ := newTestCollector(t, hostProc())
+	homes := &fakeSection{next: func(context.Context) Section {
+		return collected([]Gap{
+			{Path: "/home/remote/carol/.ssh/authorized_keys", Reason: ReasonRemoteFSSkipped},
+			{Path: "/home/bob/.ssh/authorized_keys", Reason: ReasonPermissionDenied},
+		}, "keys")
+	}}
+	onNFS := &fakeSection{next: func(context.Context) Section { return unknown(ReasonRemoteFSSkipped) }}
+	denied := &fakeSection{next: func(context.Context) Section { return unknown(ReasonPermissionDenied) }}
+	c.sections = []sectionDef{homes.def("homes", time.Second), onNFS.def("nfs", time.Second), denied.def("denied", time.Second)}
+
+	d := dataOf(t, passOf(t, c, Trigger{Cause: triggerStart}))
+	passOf(t, c, Trigger{Cause: triggerInterval})
+
+	assert.Equal(t, StatusPartial, d.Sections["homes"].Status)
+	assert.Contains(t, d.Sections["homes"].Gaps, Gap{Path: "/home/remote/carol/.ssh/authorized_keys", Reason: ReasonRemoteFSSkipped}, "the skip stays a gap")
+	assert.Equal(t, ReasonRemoteFSSkipped, d.Sections["nfs"].Reason)
+	require.NoError(t, testutil.CollectAndCompare(c, strings.NewReader(`
+# HELP topsrv_security_scan_errors_total Security sections that came out unknown, or with a gap, by reason; remote_fs_skipped is not counted.
+# TYPE topsrv_security_scan_errors_total counter
+topsrv_security_scan_errors_total{reason="permission_denied",section="denied"} 2
+topsrv_security_scan_errors_total{reason="permission_denied",section="homes"} 2
+`), "topsrv_security_scan_errors_total"), "a network filesystem skipped by design is not an error")
+}
+
 func TestRun(t *testing.T) {
 	c, _ := newTestCollector(t, hostFixture())
 	c.now, c.delay = time.Now, 0

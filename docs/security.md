@@ -69,7 +69,7 @@ Every section has the same shape:
 | `timeout` | The section ran out of its time budget (a read hung on NFS), or was not rebuilt for two intervals. A section stuck in a blocking read is not started again until it returns |
 | `container_env` | The agent runs in an app container (docker, podman, k8s) without the host root in view: host facts are not visible |
 | `budget_exceeded` | A file was larger than the section reads |
-| `remote_fs_skipped` | The path is on a network or automount filesystem and was not touched. FUSE counts as network (sshfs, s3fs), except the local drivers `snapfuse`, `squashfuse` (snap images in LXC/LXD) and `lxcfs` |
+| `remote_fs_skipped` | The path is on a network or automount filesystem and was not touched. FUSE counts as network (sshfs, s3fs), except the local drivers `snapfuse`, `squashfuse` (snap images in LXC/LXD) and `lxcfs`. A skip by design: not counted in `topsrv_security_scan_errors_total` |
 | `unsupported_platform` | Not Linux |
 | `dump_inconsistent` | The source changed while it was read |
 
