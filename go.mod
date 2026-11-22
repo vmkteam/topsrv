@@ -17,6 +17,7 @@ require (
 	github.com/stretchr/testify v1.12.1
 	github.com/vmkteam/appkit v0.1.2
 	github.com/vmkteam/embedlog v0.1.3
+	golang.org/x/mod v0.42.0
 	golang.org/x/sys v0.50.0
 	modernc.org/sqlite v1.62.0
 )
