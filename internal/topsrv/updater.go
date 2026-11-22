@@ -49,6 +49,15 @@ const (
 
 	// updateMaxRestarts is the crash count that triggers a rollback.
 	updateMaxRestarts = 3
+
+	// updateDirPrefix names the staging directory of an update, made next
+	// to the binary: that directory is executable, as the agent runs from
+	// it, and writable, as backup and replace write there — unlike a /tmp
+	// mounted noexec, where the new binary cannot run for verifyBinary.
+	updateDirPrefix = ".topsrv-update-"
+
+	// updateErrorMax bounds lastError, in runes.
+	updateErrorMax = 200
 )
 
 // UpdateConfig contains auto-update settings.
@@ -93,6 +102,11 @@ type Updater struct {
 	client    *http.Client
 	interval  time.Duration
 	hostname  string
+
+	// lastError is the stage and error of the last failed update, sent with
+	// the next check so the backend sees why the offer did not take. Cleared
+	// when no update is offered; a successful update restarts the agent.
+	lastError string
 }
 
 // NewUpdater creates a new auto-updater. Endpoint is derived from pushCfg.Endpoint.
@@ -235,44 +249,53 @@ func (u *Updater) check(ctx context.Context) {
 		return
 	}
 	if !resp.Update {
+		u.lastError = "" // the offer that failed is withdrawn
 		return
 	}
 
 	u.Printf("update: available %s → %s", u.version, resp.Version)
 
-	tmpDir, err := os.MkdirTemp("", "topsrv-update-*")
-	if err != nil {
-		u.Errorf("update: mktemp failed: %v", err)
+	if stage, err := u.apply(ctx, resp); err != nil {
+		u.lastError = updateErrorText(stage, err)
+		u.Error(ctx, "update: failed", "stage", stage, "error", err)
 		return
 	}
-	cleanup := func() { _ = os.RemoveAll(tmpDir) }
-	defer cleanup()
+
+	u.Printf("update: replaced %s → %s, restarting", u.version, resp.Version)
+	os.Exit(updateExitCode)
+}
+
+// apply downloads, verifies and installs the update offered in resp. On
+// failure it returns the stage that failed with its error.
+func (u *Updater) apply(ctx context.Context, resp *UpdateResponse) (string, error) {
+	dir := filepath.Dir(u.binPath)
+	removeStaleUpdateDirs(dir)
+	tmpDir, err := os.MkdirTemp(dir, updateDirPrefix+"*")
+	if err != nil {
+		return "mktemp", err
+	}
+	defer os.RemoveAll(tmpDir)
 
 	tarPath := filepath.Join(tmpDir, "topsrv.tar.gz")
 	if err := u.download(ctx, resp.URL, tarPath); err != nil {
-		u.Errorf("update: download failed: %v", err)
-		return
+		return "download", err
 	}
 
 	if err := verifyChecksum(tarPath, resp.Checksum); err != nil {
-		u.Errorf("update: checksum failed: %v", err)
-		return
+		return "checksum", err
 	}
 
 	newBinPath := filepath.Join(tmpDir, "topsrv")
 	if err := extractBinary(tarPath, newBinPath); err != nil {
-		u.Errorf("update: extract failed: %v", err)
-		return
+		return "extract", err
 	}
 
 	if err := verifyBinary(ctx, newBinPath); err != nil {
-		u.Errorf("update: verify binary failed: %v", err)
-		return
+		return "verify", err
 	}
 
 	if err := u.backup(); err != nil {
-		u.Errorf("update: backup failed: %v", err)
-		return
+		return "backup", err
 	}
 
 	u.saveState(updateState{
@@ -283,18 +306,56 @@ func (u *Updater) check(ctx context.Context) {
 	})
 
 	if err := u.replace(newBinPath); err != nil {
-		u.Errorf("update: replace failed: %v", err)
-		return
+		return "replace", err
 	}
+	return "", nil
+}
 
-	u.Printf("update: replaced %s → %s, restarting", u.version, resp.Version)
-	cleanup()
-	os.Exit(updateExitCode) //nolint:gocritic // cleanup called explicitly above
+// removeStaleUpdateDirs removes the staging directories an agent killed
+// mid-update left in dir. Updates run one at a time: none is in use.
+func removeStaleUpdateDirs(dir string) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return // MkdirTemp reports what is wrong with dir
+	}
+	for _, e := range entries {
+		if e.IsDir() && strings.HasPrefix(e.Name(), updateDirPrefix) {
+			os.RemoveAll(filepath.Join(dir, e.Name()))
+		}
+	}
+}
+
+// updateErrorText is lastError: "<stage>: <error>", with a file path cut
+// to its base name and the URL of a request left out, at most
+// updateErrorMax runes.
+func updateErrorText(stage string, err error) string {
+	var (
+		pe *os.PathError
+		le *os.LinkError
+		ue *url.Error
+	)
+	msg := err.Error()
+	switch {
+	case errors.As(err, &pe):
+		msg = pe.Op + " " + filepath.Base(pe.Path) + ": " + pe.Err.Error()
+	case errors.As(err, &le):
+		msg = le.Op + " " + filepath.Base(le.New) + ": " + le.Err.Error()
+	case errors.As(err, &ue):
+		msg = ue.Op + ": " + ue.Err.Error()
+	}
+	text := stage + ": " + msg
+	if r := []rune(text); len(r) > updateErrorMax {
+		text = string(r[:updateErrorMax])
+	}
+	return text
 }
 
 func (u *Updater) fetchUpdate(ctx context.Context) (*UpdateResponse, error) {
 	reqURL := fmt.Sprintf("%s?version=%s&os=%s&arch=%s&channel=%s",
 		u.endpoint, url.QueryEscape(u.version), runtime.GOOS, runtime.GOARCH, u.cfg.Channel)
+	if u.lastError != "" {
+		reqURL += "&lastError=" + url.QueryEscape(u.lastError)
+	}
 
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()

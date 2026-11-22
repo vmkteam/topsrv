@@ -7,12 +7,21 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"io/fs"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
+	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -478,4 +487,190 @@ func TestStateDir(t *testing.T) {
 	assert.Equal(t, "/var/lib/topsrv", StateDir(""))
 	assert.Equal(t, "/var/lib/topsrv", StateDir("/var/lib/topsrv/spool"))
 	assert.Equal(t, "spool", StateDir("spool"), "a bare relative dir is its own state dir")
+}
+
+// testRelease is a release archive with script as the topsrv binary, and its checksum.
+func testRelease(t *testing.T, script string) ([]byte, string) {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "topsrv.tar.gz")
+	createTestTarGz(t, path, "topsrv", []byte(script))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	h := sha256.Sum256(data)
+	return data, "sha256:" + hex.EncodeToString(h[:])
+}
+
+// newTestUpdater is an Updater whose binary, an old script, is in binDir.
+func newTestUpdater(t *testing.T, binDir string, client *http.Client) *Updater {
+	t.Helper()
+	binPath := filepath.Join(binDir, "topsrv")
+	require.NoError(t, os.WriteFile(binPath, []byte(oldTestBinary), 0o755))
+	return &Updater{
+		version:   "1.0.0",
+		binPath:   binPath,
+		backupDir: filepath.Join(binDir, ".topsrv-backup"),
+		stateDir:  t.TempDir(),
+		client:    client,
+	}
+}
+
+const oldTestBinary = "#!/bin/sh\necho old\n"
+
+// stagingDirs lists the update staging directories in dir.
+func stagingDirs(t *testing.T, dir string) []string {
+	t.Helper()
+	entries, err := os.ReadDir(dir)
+	assert.NoError(t, err)
+	var out []string
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), updateDirPrefix) {
+			out = append(out, e.Name())
+		}
+	}
+	return out
+}
+
+func TestApplyStagesNextToBinary(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test binary is a shell script")
+	}
+	const newBinary = "#!/bin/sh\nexit 0\n"
+	release, checksum := testRelease(t, newBinary)
+	binDir := t.TempDir()
+	staged := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		staged <- stagingDirs(t, binDir)
+		w.Write(release)
+	}))
+	defer srv.Close()
+	u := newTestUpdater(t, binDir, srv.Client())
+	stale := updateDirPrefix + "killed"
+	require.NoError(t, os.MkdirAll(filepath.Join(binDir, stale, "sub"), 0o750))
+
+	stage, err := u.apply(t.Context(), &UpdateResponse{Update: true, Version: "1.1.0", URL: srv.URL, Checksum: checksum})
+	require.NoError(t, err, stage)
+
+	inFlight := <-staged
+	assert.Len(t, inFlight, 1, "the download goes to a staging directory next to the binary")
+	assert.NotContains(t, inFlight, stale, "a directory left by a killed agent is removed")
+	assert.Empty(t, stagingDirs(t, binDir), "the staging directory is removed after the update")
+
+	got, err := os.ReadFile(u.binPath)
+	require.NoError(t, err)
+	assert.Equal(t, newBinary, string(got))
+	assert.FileExists(t, filepath.Join(u.backupDir, "topsrv-1.0.0"))
+	state, err := u.loadState()
+	require.NoError(t, err)
+	assert.Equal(t, "1.1.0", state.CurrentVersion)
+}
+
+func TestApplyFailedStage(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("the test binary is a shell script")
+	}
+	cases := []struct {
+		name        string
+		script      string
+		status      int
+		badChecksum bool
+		stage       string
+	}{
+		{name: "release not found", script: "#!/bin/sh\nexit 0\n", status: http.StatusNotFound, stage: "download"},
+		{name: "checksum mismatch", script: "#!/bin/sh\nexit 0\n", badChecksum: true, stage: "checksum"},
+		{name: "new binary does not run", script: "#!/bin/sh\nexit 3\n", stage: "verify"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			release, checksum := testRelease(t, tc.script)
+			if tc.badChecksum {
+				checksum = "sha256:" + strings.Repeat("0", 64)
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if tc.status != 0 {
+					w.WriteHeader(tc.status)
+					return
+				}
+				w.Write(release)
+			}))
+			defer srv.Close()
+			binDir := t.TempDir()
+			u := newTestUpdater(t, binDir, srv.Client())
+
+			stage, err := u.apply(t.Context(), &UpdateResponse{Update: true, Version: "1.1.0", URL: srv.URL, Checksum: checksum})
+			require.Error(t, err)
+			assert.Equal(t, tc.stage, stage)
+			assert.Empty(t, stagingDirs(t, binDir), "the staging directory is removed on failure")
+			assert.NoDirExists(t, u.backupDir, "nothing is backed up before the new binary runs")
+			got, err := os.ReadFile(u.binPath)
+			require.NoError(t, err)
+			assert.Equal(t, oldTestBinary, string(got), "the binary is not replaced")
+		})
+	}
+}
+
+func TestCheckReportsLastError(t *testing.T) {
+	var offer atomic.Bool
+	offer.Store(true)
+	queries := make(chan url.Values, 1)
+	mux := http.NewServeMux()
+	mux.HandleFunc("/v1/update", func(w http.ResponseWriter, r *http.Request) {
+		queries <- r.URL.Query()
+		json.NewEncoder(w).Encode(UpdateResponse{Update: offer.Load(), Version: "1.1.0",
+			URL: "http://" + r.Host + "/release.tar.gz", Checksum: "sha256:" + strings.Repeat("0", 64)})
+	})
+	mux.HandleFunc("/release.tar.gz", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusNotFound) })
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	u := newTestUpdater(t, t.TempDir(), srv.Client())
+	u.endpoint = srv.URL + "/v1/update"
+	const want = "download: download HTTP 404"
+
+	u.check(t.Context())
+	assert.False(t, (<-queries).Has("lastError"), "nothing failed before the first check")
+	assert.Equal(t, want, u.lastError)
+
+	u.check(t.Context())
+	assert.Equal(t, want, (<-queries).Get("lastError"), "the failure goes with the next check")
+
+	offer.Store(false)
+	u.check(t.Context())
+	assert.Equal(t, want, (<-queries).Get("lastError"))
+	assert.Empty(t, u.lastError, "a withdrawn offer clears the error")
+
+	u.check(t.Context())
+	assert.False(t, (<-queries).Has("lastError"))
+}
+
+func TestUpdateErrorText(t *testing.T) {
+	cases := []struct {
+		name  string
+		stage string
+		err   error
+		want  string
+	}{
+		{"exec from a noexec mount", "verify",
+			&os.PathError{Op: "fork/exec", Path: "/tmp/topsrv-update-123/topsrv", Err: fs.ErrPermission},
+			"verify: fork/exec topsrv: permission denied"},
+		{"wrapped path error", "backup",
+			fmt.Errorf("copy: %w", &os.PathError{Op: "open", Path: "/usr/local/bin/.topsrv-backup/topsrv-1.0.0", Err: fs.ErrPermission}),
+			"backup: open topsrv-1.0.0: permission denied"},
+		{"rename", "replace",
+			&os.LinkError{Op: "rename", Old: "/usr/local/bin/topsrv.new", New: "/usr/local/bin/topsrv", Err: fs.ErrPermission},
+			"replace: rename topsrv: permission denied"},
+		{"request without its URL", "download",
+			&url.Error{Op: "Get", URL: "https://example.com/topsrv_1.1.0_linux_amd64.tar.gz", Err: io.ErrUnexpectedEOF},
+			"download: Get: unexpected EOF"},
+		{"plain error", "download", errors.New("download HTTP 404"), "download: download HTTP 404"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, updateErrorText(tc.stage, tc.err))
+		})
+	}
+
+	t.Run("at most updateErrorMax runes", func(t *testing.T) {
+		got := updateErrorText("download", errors.New(strings.Repeat("ошибка ", 40)))
+		assert.Equal(t, updateErrorMax, utf8.RuneCountInString(got))
+		assert.True(t, utf8.ValidString(got))
+	})
 }

@@ -385,7 +385,7 @@ Health of the security collector. The snapshot itself ships to `/v1/inventory` a
 | Metric | Type | Labels | Description |
 |--------|------|--------|-------------|
 | `topsrv_security_scan_duration_seconds` | gauge | section | Duration of the last run of a section (`environment` included). Alert on growth |
-| `topsrv_security_scan_errors_total` | counter | section, reason | Sections that came out `unknown`, or with a gap, by reason (`permission_denied`, `timeout`, `container_env`, …). Rising `timeout` = a stuck read, see `section_inflight` |
+| `topsrv_security_scan_errors_total` | counter | section, reason | Sections that came out `unknown`, or with a gap, by reason (`permission_denied`, `timeout`, `container_env`, …). Rising `timeout` = a stuck read, see `section_inflight`. `remote_fs_skipped` is not counted: network filesystems are skipped by design, the gap is in the snapshot |
 | `topsrv_security_last_scan_timestamp_seconds` | gauge | — | Unix time of the last pass. Alert: `time() - X > 13h` (Interval=6h default + slack) = collector stuck |
 | `topsrv_security_last_push_timestamp_seconds` | gauge | — | Unix time of the last snapshot accepted by `/v1/inventory` |
 | `topsrv_security_snapshot_bytes` | gauge | — | JSON size of the last snapshot (10–60 KB expected) |

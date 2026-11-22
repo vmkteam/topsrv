@@ -85,7 +85,7 @@ func NewCollector(logger embedlog.Logger, cfg Config, stateDir string) *Collecto
 		scanDuration: prometheus.NewDesc("topsrv_security_scan_duration_seconds",
 			"Duration of the last run of a security section.", []string{labelSection}, nil),
 		scanErrors: prometheus.NewDesc("topsrv_security_scan_errors_total",
-			"Security sections that came out unknown, or with a gap, by reason.", []string{labelSection, "reason"}, nil),
+			"Security sections that came out unknown, or with a gap, by reason; remote_fs_skipped is not counted.", []string{labelSection, "reason"}, nil),
 		lastScanTS: prometheus.NewDesc("topsrv_security_last_scan_timestamp_seconds",
 			"Unix time of the last security snapshot built for sending; an unscheduled pass that changed nothing does not count.", nil, nil),
 		lastPushTS: prometheus.NewDesc("topsrv_security_last_push_timestamp_seconds",
@@ -282,16 +282,20 @@ func (c *Collector) loadKey(ctx context.Context) tokenKey {
 }
 
 // recordMetrics keeps the duration of the section and counts unknown
-// results and gaps by reason.
+// results and gaps by reason. remote_fs_skipped is not counted: network
+// filesystems are left alone by design, and a host with homes on NFS
+// would raise the counter on every pass. The gap stays in the snapshot.
 func (c *Collector) recordMetrics(name string, sec Section) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.durations[name] = float64(sec.DurationMs) / 1000
-	if sec.Status == StatusUnknown {
+	if sec.Status == StatusUnknown && sec.Reason != ReasonRemoteFSSkipped {
 		c.errCounts[[2]string{name, string(sec.Reason)}]++
 	}
 	for _, g := range sec.Gaps {
-		c.errCounts[[2]string{name, string(g.Reason)}]++
+		if g.Reason != ReasonRemoteFSSkipped {
+			c.errCounts[[2]string{name, string(g.Reason)}]++
+		}
 	}
 }
 

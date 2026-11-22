@@ -165,6 +165,9 @@ func (c *Client) Info(ctx context.Context) (Info, error) {
 // Container is the part of a /containers/json entry read.
 type Container struct {
 	Names      []string
+	Image      string // the reference as created, or the image ID once its tag is moved or removed
+	ImageID    string // sha256:<hex>
+	Labels     map[string]string
 	Ports      []Port
 	HostConfig struct{ NetworkMode string } // "host": the host's network namespace
 	Mounts     []Mount
