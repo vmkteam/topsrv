@@ -139,6 +139,8 @@ func TestDocker(t *testing.T) {
 		{Container: "web", IP: "127.0.0.1", PublicPort: 9000, PrivatePort: 9000, Type: "tcp"},
 	}, d.Published, "internal publishes nothing")
 	assert.False(t, d.PublishedTruncated)
+	assert.Equal(t, []dockerContainer{{Name: "v6only", Image: "busybox"}, {Name: "web", Image: "busybox"}}, d.Containers,
+		"the containers that publish; internal publishes nothing")
 
 	t.Run("before API 1.49: no firewall backend", func(t *testing.T) {
 		sc := fixture(t, dockerFixture())
@@ -320,8 +322,9 @@ func TestDockerAPIValues(t *testing.T) {
 		ports = append(ports, fmt.Sprintf(`{"IP": "0.0.0.0", "PrivatePort": 80, "PublicPort": %d, "Type": "tcp"}`, 1000+i))
 	}
 	containers := `[
-		{"Names": ["/SENTINEL web"], "Image": "registry.example.com/SENTINEL", "Command": "/bin/SENTINEL --token SENTINELSECRET",
-		 "Labels": {"secret": "SENTINELSECRET"}, "Ports": [{"IP": "SENTINEL", "PrivatePort": 1, "PublicPort": 2, "Type": "SENTINEL"}]},
+		{"Names": ["/SENTINEL web"], "Image": "registry.example.com/app:SENTINEL@sha256:SENTINEL", "Command": "/bin/SENTINEL --token SENTINELSECRET",
+		 "Labels": {"secret": "SENTINELSECRET", "com.gitlab.gitlab-runner.job.ref": "SENTINEL", "com.gitlab.gitlab-runner.type": "SENTINEL TYPE"},
+		 "Ports": [{"IP": "SENTINEL", "PrivatePort": 1, "PublicPort": 2, "Type": "SENTINEL"}]},
 		{"Names": ["/exposed"], "Ports": [{"IP": "", "PrivatePort": 9009, "Type": "tcp"}]},
 		{"Names": ["/many"], "Ports": [` + strings.Join(ports, ",") + `]}
 	]`
@@ -337,6 +340,11 @@ func TestDockerAPIValues(t *testing.T) {
 		"sorted first; an EXPOSE without -p (\"exposed\") is not published")
 	assert.Len(t, d.Published, maxPublished)
 	assert.True(t, d.PublishedTruncated)
+	assert.Equal(t, []dockerContainer{
+		{Name: valueInvalid, Image: "registry.example.com/app",
+			CILabels: map[string]string{"com.gitlab.gitlab-runner.job.ref": "", "com.gitlab.gitlab-runner.type": valueInvalid}},
+		{Name: "many"},
+	}, d.Containers, "the tag, digest and label values are not sent; \"exposed\" publishes nothing")
 	assert.NotContains(t, strings.ToUpper(toJSON(t, d)), "SENTINEL")
 }
 
@@ -396,9 +404,10 @@ func TestDockerPostureFromAPI(t *testing.T) {
 		ports = append(ports, fmt.Sprintf(`{"IP": "0.0.0.0", "PrivatePort": %d, "PublicPort": %d, "Type": "udp"}`, p, p),
 			fmt.Sprintf(`{"IP": "::", "PrivatePort": %d, "PublicPort": %d, "Type": "udp"}`, p, p))
 	}
-	containers := `[{"Names": ["/coturn"], "Ports": [` + strings.Join(ports[1:], ",") + `]},
+	containers := `[{"Names": ["/coturn"], "Image": "coturn/coturn:4.6", "Ports": [` + strings.Join(ports[1:], ",") + `]},
 		{"Names": ["/postgres"], "Ports": [` + ports[0] + `]},
-		{"Names": ["/agent"], "HostConfig": {"NetworkMode": "host"}, "Mounts": [{"Type": "bind", "Source": "/var/run/"}]},
+		{"Names": ["/agent"], "Image": "busybox", "Labels": {"com.gitlab.gitlab-runner.type": "build"},
+		 "HostConfig": {"NetworkMode": "host"}, "Mounts": [{"Type": "bind", "Source": "/var/run/"}]},
 		{"Names": ["/web"], "HostConfig": {"NetworkMode": "bridge"}, "Mounts": [{"Type": "volume", "Source": "/var/lib/docker/volumes/x"}]}]`
 	info := `{"ServerVersion": "28.5.2", "SecurityOptions": ["name=seccomp,profile=/etc/SENTINEL.json", "name=userns"],
 		"Swarm": {"LocalNodeState": "active", "ControlAvailable": true}, "Plugins": {"Authorization": ["SENTINEL-authz"]},
@@ -414,7 +423,11 @@ func TestDockerPostureFromAPI(t *testing.T) {
 		{Container: "postgres", IP: "0.0.0.0", PublicPort: 5432, PrivatePort: 5432, Type: "tcp"},
 	}, d.Published, "a range is one entry: postgres is not pushed out")
 	assert.False(t, d.PublishedTruncated)
-	assert.Equal(t, []dockerContainer{{Name: "agent", HostNetwork: true, DockerSocket: true}}, d.Containers)
+	assert.Equal(t, []dockerContainer{
+		{Name: "agent", Image: "busybox", CILabels: map[string]string{"com.gitlab.gitlab-runner.type": "build"}, HostNetwork: true, DockerSocket: true},
+		{Name: "coturn", Image: "coturn/coturn"},
+		{Name: "postgres"},
+	}, d.Containers, "host network and the socket first, then those that publish; web does neither")
 	assert.Equal(t, "custom", *d.SeccompProfile, "the path is not sent")
 	assert.Equal(t, &dockerSwarm{State: "active", Manager: true}, d.Swarm)
 	assert.True(t, *d.AuthorizationPlugin)
@@ -431,4 +444,112 @@ func TestDockerBridgeOptions(t *testing.T) {
 	assert.Equal(t, "127.0.0.1", *d.Config.BridgeHostBindingIP)
 	assert.Equal(t, "nat-unprotected", *d.Config.BridgeGatewayModeIPv4, "unpublished ports routable")
 	assert.Equal(t, valueInvalid, *d.Config.BridgeGatewayModeIPv6)
+}
+
+func TestContainerImage(t *testing.T) {
+	digest := "@sha256:" + strings.Repeat("0f", 32)
+	id := "sha256:abcdef" + strings.Repeat("0", 58)
+	cases := []struct {
+		ref  string
+		want string
+	}{
+		{"abcdef", ""},                   // created by an ID as short as typed
+		{"abcdef0000", ""},               // or longer
+		{id, ""},                         // the tag was moved or removed
+		{"0123456789ab", "0123456789ab"}, // a repository of hex digits, not the ID
+		{"nginx", "nginx"},
+		{"nginx:1.27", "nginx"},
+		{"nginx:1.27" + digest, "nginx"},
+		{"docker.io/library/nginx:latest", "nginx"}, // podman
+		{"library/nginx", "nginx"},
+		{"index.docker.io/library/nginx", "nginx"},
+		{"docker.io/tecnativa/docker-socket-proxy:latest", "tecnativa/docker-socket-proxy"},
+		{"ghcr.io/tecnativa/docker-socket-proxy:edge", "ghcr.io/tecnativa/docker-socket-proxy"},
+		{"lscr.io/linuxserver/socket-proxy", "lscr.io/linuxserver/socket-proxy"},
+		{"localhost:5000/team/app:v1" + digest, "localhost:5000/team/app"},
+		{"localhost:5000/team/app", "localhost:5000/team/app"},
+		{"registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper" + digest, "registry.gitlab.com/gitlab-org/gitlab-runner/gitlab-runner-helper"},
+		{"a1b2c3:" + strings.Repeat("9", 32), "a1b2c3"}, // a Dockerfile action of GitHub's runner
+		{"app-web", "app-web"},                     // a compose service built locally
+		{"sha256:" + strings.Repeat("ab", 32), ""}, // an ID, whatever ImageID says
+		{"", ""},
+		{"registry.example.com/App", valueInvalid},
+		{"web app", valueInvalid},
+		{"registry.example.com/" + strings.Repeat("a", maxImageName), valueInvalid},
+	}
+	for _, tc := range cases {
+		assert.Equal(t, tc.want, containerImage(tc.ref, id), tc.ref)
+	}
+}
+
+func TestCILabels(t *testing.T) {
+	cases := []struct {
+		name   string
+		labels map[string]string
+		want   map[string]string
+	}{
+		{"no labels", nil, nil},
+		{"compose and traefik are not CI", map[string]string{"com.docker.compose.project": "app", "traefik.enable": "true"}, nil},
+		{"GitLab Runner: the role only", map[string]string{"com.gitlab.gitlab-runner.type": "service",
+			"com.gitlab.gitlab-runner.runner.id": "t0k3n1234", "com.gitlab.gitlab-runner.job.ref": "feature/x"},
+			map[string]string{"com.gitlab.gitlab-runner.type": "service", "com.gitlab.gitlab-runner.runner.id": "",
+				"com.gitlab.gitlab-runner.job.ref": ""}},
+		{"GitLab Runner's suspended environment", map[string]string{"environment.runner.gitlab.com/runner-id": "42"},
+			map[string]string{"environment.runner.gitlab.com/runner-id": ""}},
+		{"an odd GitLab role", map[string]string{"com.gitlab.gitlab-runner.type": "Build Job"},
+			map[string]string{"com.gitlab.gitlab-runner.type": valueInvalid}},
+		{"Woodpecker", map[string]string{"wp_uuid": "1", "wp_step": "deploy"}, map[string]string{"wp_uuid": "", "wp_step": ""}},
+		{"wp_ of someone else is not Woodpecker", map[string]string{"wp_theme": "dark"}, nil},
+		{"Drone", map[string]string{"io.drone": "true", "io.drone.repo.slug": "team/app"},
+			map[string]string{"io.drone": "", "io.drone.repo.slug": ""}},
+		{"Jenkins docker-plugin", map[string]string{"com.nirima.jenkins.plugins.docker.JenkinsServerUrl": "https://ci.example.com"},
+			map[string]string{"com.nirima.jenkins.plugins.docker.JenkinsServerUrl": ""}},
+		{"GitHub's bare key", map[string]string{"a1b2c3": ""}, map[string]string{"a1b2c3": ""}},
+		{"six hex with a value is not GitHub's", map[string]string{"a1b2c3": "x"}, nil},
+		{"a key of an odd form", map[string]string{"com.buildkite.job id": ""}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equal(t, tc.want, ciLabels(tc.labels))
+		})
+	}
+
+	t.Run("GitLab's role is kept past the user's container_labels", func(t *testing.T) {
+		labels := map[string]string{gitlabRunnerType: "build"}
+		for i := range maxCILabels + 5 {
+			labels[fmt.Sprintf("com.gitlab.gitlab-runner.a%02d", i)] = "SENTINEL"
+		}
+		got := ciLabels(labels)
+		assert.Len(t, got, maxCILabels)
+		assert.Equal(t, "build", got[gitlabRunnerType])
+	})
+
+	t.Run("at most maxCILabels, the same ones every pass", func(t *testing.T) {
+		many := map[string]string{}
+		for i := range maxCILabels + 5 {
+			many[fmt.Sprintf("com.buildkite.k%02d", i)] = "SENTINEL"
+		}
+		got := ciLabels(many)
+		assert.Len(t, got, maxCILabels)
+		assert.Contains(t, got, "com.buildkite.k00")
+		assert.NotContains(t, got, fmt.Sprintf("com.buildkite.k%02d", maxCILabels))
+		assert.NotContains(t, toJSON(t, got), "SENTINEL")
+	})
+}
+
+func TestListedContainersLimit(t *testing.T) {
+	list := make([]dockerapi.Container, 0, maxContainers+1)
+	for i := range maxContainers {
+		list = append(list, dockerapi.Container{Names: []string{fmt.Sprintf("/web%04d", i)},
+			Ports: []dockerapi.Port{{IP: "0.0.0.0", PrivatePort: 80, PublicPort: 10000 + i, Type: "tcp"}}})
+	}
+	proxy := dockerapi.Container{Names: []string{"/zz-socket-proxy"}, Image: "tecnativa/docker-socket-proxy:latest",
+		Mounts: []dockerapi.Mount{{Type: "bind", Source: "/var/run/docker.sock"}}}
+	list = append(list, proxy)
+
+	got, truncated := listedContainers(list, "/var/run/docker.sock")
+	assert.True(t, truncated)
+	assert.Len(t, got, maxContainers)
+	assert.Equal(t, dockerContainer{Name: "zz-socket-proxy", Image: "tecnativa/docker-socket-proxy", DockerSocket: true}, got[0],
+		"the limit cuts a container that only publishes, not the one with the socket")
 }

@@ -19,14 +19,16 @@ import (
 
 // Limits of the docker section.
 const (
-	dockerEngine         = "docker"
-	dockerSocketUnit     = "docker.socket"
-	dockerCmdlineMax     = 64 << 10
-	dockerConfigLimit    = 1 << 20
-	dockerAPIBudget      = 5 * time.Second // the whole conversation with dockerd
-	maxPublished         = 1000            // port ranges merged first
-	maxFlaggedContainers = 200
-	maxExposed           = 16
+	dockerEngine      = "docker"
+	dockerSocketUnit  = "docker.socket"
+	dockerCmdlineMax  = 64 << 10
+	dockerConfigLimit = 1 << 20
+	dockerAPIBudget   = 5 * time.Second // the whole conversation with dockerd
+	maxPublished      = 1000            // port ranges merged first
+	maxContainers     = 1000
+	maxExposed        = 16
+	maxCILabels       = 32 // per container
+	maxImageName      = 255
 )
 
 // Forms of what dockerd answers and of daemon.json values: anything else is
@@ -39,7 +41,25 @@ var (
 	dockerProtocolsRe = regexp.MustCompile(`^(tcp|udp|sctp)$`)
 	dockerGatewayRe   = regexp.MustCompile(`^(nat|nat-unprotected|routed|isolated)$`)
 	dockerSwarmRe     = regexp.MustCompile(`^(inactive|pending|active|error|locked)$`)
+
+	imageRepoRe = regexp.MustCompile(`^([a-zA-Z0-9][a-zA-Z0-9.-]*(:[0-9]{1,5})?/)?` +
+		`[a-z0-9]+([._-]+[a-z0-9]+)*(/[a-z0-9]+([._-]+[a-z0-9]+)*)*$`) // [registry[:port]/]path, lowercase
+	ciLabelKeyRe      = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._/-]{0,127}$`)
+	githubRunnerKeyRe = regexp.MustCompile(`^[0-9a-f]{6}$`)
 )
+
+// ciLabelPrefixes are the label namespaces (and Woodpecker's two keys) CI
+// runners put on the containers they start: GitLab Runner, Woodpecker,
+// Drone, Buildkite's docker plugins, Jenkins' docker-plugin. act_runner and Forgejo's runner
+// label none: their containers are known by name.
+var ciLabelPrefixes = []string{"com.gitlab.gitlab-runner.", "environment.runner.gitlab.com/", "wp_uuid", "wp_step", "io.drone",
+	"com.buildkite.", "com.nirima.jenkins.plugins.docker."}
+
+// gitlabRunnerType is the one CI label whose value is sent: the role of a
+// GitLab Runner container (build, predefined, service, wait, …). The
+// values of the others carry branches, project URLs, part of the runner
+// token.
+const gitlabRunnerType = "com.gitlab.gitlab-runner.type"
 
 // dockerSocketMounts are host paths whose bind mount gives a container the
 // Docker socket: the socket itself or a directory holding it.
@@ -73,8 +93,9 @@ type dockerData struct {
 	// null when the API did not answer.
 	Published          []dockerPort `json:"published"`
 	PublishedTruncated bool         `json:"publishedTruncated,omitempty"`
-	// Containers are the running containers with host networking or the
-	// Docker socket mounted; null when the API did not answer.
+	// Containers are the running containers that publish a port, use host
+	// networking or have the Docker socket mounted; null when the API did
+	// not answer.
 	Containers          []dockerContainer `json:"containers"`
 	ContainersTruncated bool              `json:"containersTruncated,omitempty"`
 }
@@ -150,9 +171,11 @@ type dockerExposure struct {
 }
 
 type dockerContainer struct {
-	Name         string `json:"name"`
-	HostNetwork  bool   `json:"hostNetwork"`
-	DockerSocket bool   `json:"dockerSocket"` // the socket, or a directory holding it, bind-mounted
+	Name         string            `json:"name"`
+	Image        string            `json:"image,omitempty"`
+	CILabels     map[string]string `json:"ciLabels,omitempty"`
+	HostNetwork  bool              `json:"hostNetwork"`
+	DockerSocket bool              `json:"dockerSocket"` // the socket, or a directory holding it, bind-mounted
 }
 
 func collectDocker(ctx context.Context, sc *scanCtx) Section {
@@ -339,7 +362,7 @@ func (d *dockerData) readAPI(ctx context.Context, c *dockerapi.Client, socket st
 		return err
 	}
 	d.Published, d.PublishedTruncated = publishedPorts(list)
-	d.Containers, d.ContainersTruncated = flaggedContainers(list, socket)
+	d.Containers, d.ContainersTruncated = listedContainers(list, socket)
 	if skipped > 0 {
 		return errSkipped
 	}
@@ -442,8 +465,8 @@ func publishedPorts(list []dockerapi.Container) ([]dockerPort, bool) {
 	for _, c := range list {
 		name := containerName(c)
 		for _, p := range c.Ports {
-			if p.PublicPort < 1 || p.PublicPort > 65535 {
-				continue // exposed, not published
+			if !published(p) {
+				continue
 			}
 			if !dockerProtocolsRe.MatchString(p.Type) {
 				p.Type = valueInvalid
@@ -480,9 +503,14 @@ func extendsRange(r, p dockerPort) bool {
 		cmp.Or(r.PublicPortEnd, r.PublicPort)+1 == p.PublicPort && cmp.Or(r.PrivatePortEnd, r.PrivatePort)+1 == p.PrivatePort
 }
 
-// flaggedContainers are the containers with host networking or the Docker
-// socket bind-mounted, from the list (no request per container), sorted.
-func flaggedContainers(list []dockerapi.Container, socket string) ([]dockerContainer, bool) {
+// published: the port is bound on the host, not only exposed.
+func published(p dockerapi.Port) bool { return p.PublicPort >= 1 && p.PublicPort <= 65535 }
+
+// listedContainers are the containers that publish a port, use host
+// networking or have the Docker socket bind-mounted, from the list (no
+// request per container): those with host networking or the socket first,
+// so the limit cuts the others, then by name.
+func listedContainers(list []dockerapi.Container, socket string) ([]dockerContainer, bool) {
 	out := []dockerContainer{}
 	for _, c := range list {
 		f := dockerContainer{Name: containerName(c), HostNetwork: c.HostConfig.NetworkMode == "host"}
@@ -490,15 +518,26 @@ func flaggedContainers(list []dockerapi.Container, socket string) ([]dockerConta
 			src := path.Clean(m.Source)
 			f.DockerSocket = f.DockerSocket || m.Type == "bind" && (src == socket || slices.Contains(dockerSocketMounts, src))
 		}
-		if f.HostNetwork || f.DockerSocket {
+		if f.HostNetwork || f.DockerSocket || slices.ContainsFunc(c.Ports, published) {
+			f.Image, f.CILabels = containerImage(c.Image, c.ImageID), ciLabels(c.Labels)
 			out = append(out, f)
 		}
 	}
-	slices.SortFunc(out, func(a, b dockerContainer) int { return cmp.Compare(a.Name, b.Name) })
-	if len(out) > maxFlaggedContainers {
-		return out[:maxFlaggedContainers], true
+	slices.SortFunc(out, func(a, b dockerContainer) int {
+		return cmp.Or(cmp.Compare(rank(a), rank(b)), cmp.Compare(a.Name, b.Name))
+	})
+	if len(out) > maxContainers {
+		return out[:maxContainers], true
 	}
 	return out, false
+}
+
+// rank orders containers with host networking or the socket before the rest.
+func rank(c dockerContainer) int {
+	if c.HostNetwork || c.DockerSocket {
+		return 0
+	}
+	return 1
 }
 
 // containerName is the first name without "/", or "invalid".
@@ -511,6 +550,72 @@ func containerName(c dockerapi.Container) string {
 		return valueInvalid
 	}
 	return name
+}
+
+// containerImage is the repository of the image a container runs: the
+// tag and digest dropped, and Docker Hub's docker.io/ and library/ — dockerd
+// lists the reference as the container was created with, podman the full
+// name (docker.io/library/nginx:latest for nginx). "" for an image ID,
+// full or as short as typed — a prefix of imageID: dockerd lists the ID
+// once the tag is moved or removed, and GitLab Runner starts jobs by ID.
+// "invalid" for anything else.
+func containerImage(ref, imageID string) string {
+	id := strings.TrimPrefix(imageID, "sha256:")
+	if ref == "" || strings.HasPrefix(ref, "sha256:") || id != "" && strings.HasPrefix(id, ref) {
+		return ""
+	}
+	name, _, _ := strings.Cut(ref, "@")
+	if i := strings.LastIndexByte(name, ':'); i > strings.LastIndexByte(name, '/') {
+		name = name[:i]
+	}
+	if rest, ok := strings.CutPrefix(name, "docker.io/"); ok {
+		name = rest
+	} else if rest, ok := strings.CutPrefix(name, "index.docker.io/"); ok {
+		name = rest
+	}
+	if rest, ok := strings.CutPrefix(name, "library/"); ok && !strings.Contains(rest, "/") {
+		name = rest
+	}
+	if len(name) > maxImageName || !imageRepoRe.MatchString(name) {
+		return valueInvalid
+	}
+	return name
+}
+
+// ciLabels are the CI runner labels of a container, at most maxCILabels:
+// gitlabRunnerType first — GitLab Runner puts its prefix on the user's
+// container_labels too, which must not push the role out — then in key
+// order. Keys of ciLabelPrefixes, and the bare six-hex key GitHub's runner
+// labels its containers with. Values are "", but for gitlabRunnerType.
+// nil without any.
+func ciLabels(labels map[string]string) map[string]string {
+	var keys []string
+	for k, v := range labels {
+		github := len(k) == 6 && v == "" && githubRunnerKeyRe.MatchString(k)
+		if (github || hasAnyPrefix(k, ciLabelPrefixes)) && ciLabelKeyRe.MatchString(k) {
+			keys = append(keys, k)
+		}
+	}
+	if len(keys) == 0 {
+		return nil
+	}
+	slices.SortFunc(keys, func(a, b string) int {
+		switch {
+		case a == gitlabRunnerType:
+			return -1
+		case b == gitlabRunnerType:
+			return 1
+		}
+		return cmp.Compare(a, b)
+	})
+	out := make(map[string]string, min(len(keys), maxCILabels))
+	for _, k := range keys[:min(len(keys), maxCILabels)] {
+		out[k] = ""
+		if k == gitlabRunnerType {
+			out[k] = checkedBy(labels[k], dockerWordRe.MatchString)
+		}
+	}
+	return out
 }
 
 // portIP is the address a port is bound to, canonical, or "invalid".
