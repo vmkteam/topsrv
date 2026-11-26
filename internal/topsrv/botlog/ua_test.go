@@ -264,7 +264,73 @@ func TestMatchUA(t *testing.T) {
 			family: "archive",
 			name:   "ia-archiver",
 		},
+		// Other Google crawlers, fetchers and agents.
+		{
+			ua:     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; GoogleOther) Chrome/157.0.8103.78 Safari/537.36",
+			family: "google",
+			name:   "googleother",
+		},
+		{
+			ua:     "GoogleOther-Image/1.0",
+			family: "google",
+			name:   "googleother-image",
+		},
+		{
+			ua:     "Mozilla/5.0 (X11; Linux x86_64; Storebot-Google/1.0) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+			family: "google",
+			name:   "storebot-google",
+		},
+		{
+			ua:     "Mozilla/5.0 (compatible; Google-InspectionTool/1.0)",
+			family: "google",
+			name:   "google-inspectiontool",
+		},
+		{
+			ua:     "Mozilla/5.0 (Linux; Android 10; K) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/138.0.0.0 Mobile Safari/537.36 (compatible; Google-Read-Aloud; +https://support.google.com/webmasters/answer/1061943)",
+			family: "google",
+			name:   "google-read-aloud",
+		},
+		{
+			ua:     "Mozilla/5.0 (compatible; GoogleDocs; apps-spreadsheets; +http://docs.google.com)",
+			family: "google",
+			name:   "googledocs",
+		},
+		{
+			ua:     "Mozilla/5.0 (Windows NT 5.1; rv:11.0) Gecko Firefox/11.0 (via ggpht.com GoogleImageProxy)",
+			family: "google",
+			name:   "googleimageproxy",
+		},
+		{
+			ua:     "Google-Agent",
+			family: "google",
+			name:   "google-agent",
+		},
+		{
+			ua:     "GoogleAgent-URLContext",
+			family: "google",
+			name:   "googleagent-urlcontext",
+		},
+		{
+			ua:     "Mozilla/5.0 AppleWebKit/537.36 (KHTML, like Gecko; compatible; Gemini-Deep-Research; +https://gemini.google/overview/deep-research/) Chrome/135.0.0.0 Safari/537.36",
+			family: "google",
+			name:   "gemini-deep-research",
+		},
+		{
+			ua:     "Mozilla/5.0 (compatible; DeepSeekBot/1.0; +https://www.deepseek.com/)",
+			family: "deepseek",
+			name:   "deepseekbot",
+		},
+		// A phone building a link preview: meta, not google.
+		{
+			ua:     "GoogleMessages/20.2 facebookexternalhit/1.1 Facebot",
+			family: "meta",
+			name:   "facebookexternalhit",
+		},
 		// Non-bots.
+		// Look like Google, but not sent by Google alone.
+		{ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36 Chrome-Lighthouse"},
+		{ua: "Mozilla/5.0 (compatible; Google-Apps-Script; beanserver; +https://script.google.com; id: UAEmdDd8)"},
+		{ua: "AppEngine-Google; (+http://code.google.com/appengine; appid: s~example)"},
 		{ua: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15"},
 		{ua: "curl/8.4.0"},
 		{ua: ""},
@@ -276,6 +342,22 @@ func TestMatchUA(t *testing.T) {
 			assert.Equal(t, tc.family, gotFamily, "ua=%q", tc.ua)
 			assert.Equal(t, tc.name, gotName, "ua=%q", tc.ua)
 		})
+	}
+}
+
+// A pattern declared after a more general one never matches, and its subtype
+// silently turns into the general one. Subtypes are labels on the receiver,
+// so two patterns sharing one would merge two bots.
+func TestKnownBots_EachPatternReachable(t *testing.T) {
+	seen := make(map[string]string, len(knownBots))
+	for _, b := range knownBots {
+		family, name := MatchUA(b.Pat, nil)
+		assert.Equal(t, b.Family, family, "pattern %q", b.Pat)
+		assert.Equal(t, refineSubtype(b.Family, b.Name, b.Pat), name, "pattern %q is shadowed by an earlier one", b.Pat)
+		if prev, ok := seen[b.Name]; ok {
+			t.Errorf("subtype %q used by both %q and %q", b.Name, prev, b.Pat)
+		}
+		seen[b.Name] = b.Pat
 	}
 }
 

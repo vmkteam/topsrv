@@ -465,14 +465,19 @@ Metrics: `topsrv_security_scan_duration_seconds{section}`,
 ## Bot-logs (optional)
 
 When `[BotLogs].Enabled = true`, every parsed nginx access-log line is matched
-against a built-in UA fingerprint table (38 families, 100+ patterns) covering:
+against a built-in UA fingerprint table (44 families, 120+ patterns) covering:
 
-- **Search engines** — Googlebot, Bingbot, DuckDuckBot, Applebot, YandexBot
-  (10 subtypes), Mail.RU_Bot, StackRambler, SputnikBot, Baiduspider, Sogou,
-  360Spider, PetalBot, Naver Yeti, Daum
+- **Search engines** — Googlebot (+ Image/News/Video), Bingbot, DuckDuckBot,
+  Applebot, YandexBot (10 subtypes), Mail.RU_Bot, StackRambler, SputnikBot,
+  Baiduspider, Sogou, 360Spider, PetalBot, Naver Yeti, Daum
+- **Other Google crawlers and fetchers** — GoogleOther, Storebot-Google,
+  AdsBot-Google, Mediapartners-Google, Google-InspectionTool, FeedFetcher,
+  Google-Read-Aloud, GoogleImageProxy, Google-Calendar-Importer, GoogleDocs
+  and other documented Google user agents
 - **AI / LLM** — GPTBot / OAI-SearchBot / ChatGPT-User, ClaudeBot /
   Claude-User / Claude-SearchBot, PerplexityBot / Perplexity-User,
-  MistralAI-User, cohere-ai, Amazonbot, Diffbot, AI2Bot, YouBot, Timpibot,
+  Google-Agent / Gemini-Deep-Research / Google-GeminiNotebook, MistralAI-User,
+  cohere-ai, DeepSeekBot, Amazonbot, Diffbot, AI2Bot, YouBot, Timpibot,
   Meta-ExternalAgent / Fetcher, Bytespider, TikTokSpider, CCBot
 - **SEO crawlers** — AhrefsBot, SemrushBot (+ subtypes), MJ12bot, DotBot,
   rogerbot, BLEXBot, DataForSeoBot
