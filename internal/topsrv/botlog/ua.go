@@ -17,7 +17,7 @@ type botPattern struct {
 // bot-log line for the same user agent. Bump it whenever knownBots changes —
 // without it the receiver cannot tell "not a bot" from "the list did not know
 // it yet", and both look like an empty botFamily.
-const UAListVersion = "2026-09-08"
+const UAListVersion = "2026-11-26"
 
 // knownBots is a snapshot of UA patterns kept in sync with the topsrv.io
 // bot-verifier. Update this list whenever a new family is added upstream.
@@ -32,6 +32,44 @@ var knownBots = []botPattern{
 	{"google", "Mediapartners-Google", "mediapartners-google"},
 	{"google", "FeedFetcher-Google", "feedfetcher-google"},
 	{"google", "Googlebot", "googlebot"}, // refined to smartphone/desktop in refineSubtype
+	// Other Google crawlers and fetchers, per developers.google.com/crawling.
+	// They follow the generic Googlebot on purpose: none of them contains
+	// "Googlebot", and the most frequent bot keeps its short scan.
+	// Left out on purpose: Chrome-Lighthouse (also sent by local and CI
+	// Lighthouse runs), GoogleMessages (link previews built on the phone,
+	// carry "facebookexternalhit" and belong to meta), and AppEngine-Google,
+	// Google-Apps-Script, Google-Cloud-Tasks, APIs-Google (requests made by
+	// Google Cloud customers, not by Google).
+	{"google", "GoogleOther-Image", "googleother-image"},
+	{"google", "GoogleOther-Video", "googleother-video"},
+	{"google", "GoogleOther", "googleother"},
+	{"google", "Storebot-Google", "storebot-google"},
+	{"google", "Google-InspectionTool", "google-inspectiontool"},
+	{"google", "Google-CloudVertexBot", "google-cloudvertexbot"},
+	{"google", "Google-Safety", "google-safety"},
+	{"google", "PlayStore-Google", "playstore-google"},
+	{"google", "pageburst", "pageburst"},
+	{"google", "Google-Calendar-Importer", "google-calendar-importer"},
+	{"google", "GoogleDocs", "googledocs"},
+	{"google", "Google-Edu", "google-edu"},
+	{"google", "Google-analytics-postbacks", "google-analytics-postbacks"},
+	{"google", "Google-Read-Aloud", "google-read-aloud"},
+	{"google", "Google-Site-Verification", "google-site-verification"},
+	{"google", "GoogleImageProxy", "googleimageproxy"},
+	{"google", "Google Web Preview", "google-web-preview"},
+	{"google", "GoogleAssociationService", "googleassociationservice"},
+	{"google", "Google-Lens", "google-lens"},
+	// AI agents and research tools acting on a user's request.
+	// Gemini-Deep-Research comes from Google addresses outside every
+	// published range, so the receiver can label it but not verify it.
+	{"google", "Google-Agent", "google-agent"},
+	{"google", "GoogleAgent-URLContext", "googleagent-urlcontext"},
+	{"google", "Gemini-Deep-Research", "gemini-deep-research"},
+	{"google", "Google-GeminiNotebook", "google-gemininotebook"},
+	{"google", "Google-NotebookLM", "google-notebooklm"}, // pre-2026-07 name of GeminiNotebook
+	{"google", "Google-Pinpoint", "google-pinpoint"},
+	{"google", "Google-CWS", "google-cws"},
+	{"google", "GoogleProducer", "googleproducer"},
 
 	{"bing", "BingPreview", "bingpreview"},
 	{"bing", "adidxbot", "adidxbot"},
@@ -103,6 +141,8 @@ var knownBots = []botPattern{
 	{"perplexity", "Perplexity-User", "perplexity-user"},
 
 	{"mistral", "MistralAI-User", "mistral-user"},
+
+	{"deepseek", "DeepSeekBot", "deepseekbot"},
 
 	{"cohere", "cohere-training-data-crawler", "cohere-training"},
 	{"cohere", "cohere-ai", "cohere"},
